@@ -175,6 +175,9 @@ impl FuseFileSystem for WindowsFuseFileSystem {
             self.version
         );
 
+		let username_string = username.to_string();
+		let password_string = password.to_string();
+
         let executor = move || {
             let mut handler = WindowsFileSystemHandler::new(filestation);
             let options = MountOptions {
@@ -183,7 +186,7 @@ impl FuseFileSystem for WindowsFuseFileSystem {
                 ..Default::default()
             };
 
-			handler.login(username, password);
+			handler.login(username_string.as_str(), password_string.as_str());
             let mut mounter = FileSystemMounter::new(&handler, &cstr_mount, &options);
             let _ = mounter.mount().unwrap();
         };
