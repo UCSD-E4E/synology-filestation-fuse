@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use serde::de::DeserializeOwned;
 
-use crate::synology_api::responses::{SynologyResult, LoginResult};
+use crate::synology_api::responses::{SynologyResult, LoginResult, GetSharesResult};
 
 pub struct FileStation {
     pub hostname: String,
@@ -15,6 +16,12 @@ impl FileStation {
         let base_url = format!("{}://{}:{}", protocol, hostname, port);
 
         FileStation { hostname, base_url: base_url.to_string(), version, sid: Default::default() }
+    }
+
+    pub fn get_shares(&self) -> Result<GetSharesResult, i32> {
+        let mut additional = HashMap::new();
+        additional.insert("additional", "%5B%22volume_status%22%5D");
+        self.get("SYNO.FileStation.List", 2, "list_share", &additional)
     }
 
     pub fn login(&mut self, username: &str, password: &str) -> Result<(), i32> {
@@ -47,24 +54,26 @@ impl FileStation {
         }
     }
 
-    pub fn logout(&self) {
+    pub fn logout(&self) -> Result<(), i32> {
         let mut additional = HashMap::new();
         additional.insert("session", "FileStation");
 
-        let result = self.get("SYN.API.Auth", 1, "logout", &additional);
+        self.get("SYN.API.Auth", 1, "logout", &additional)
     }
 
-    fn get(&self, api: &str, version: u8, method: &str, additional: &HashMap<&str, &str>) -> Result<(), i32> {
+    fn get<T: DeserializeOwned>(&self, api: &str, version: u8, method: &str, additional: &HashMap<&str, &str>) -> Result<T, i32> {
         match &self.sid {
             Some(sid) => {
                 let mut url = format!(
-                    "{}/webapi/entry.cgi?=api={}&version={}&method={}&_sid={}",
+                    "{}/webapi/entry.cgi?api={}&version={}&method={}&_sid={}",
                     self.base_url,
                     api,
                     version,
                     method,
                     sid
                 );
+
+                println!("url: {}", url);
 
                 for (key, value) in &*additional {
                     url += format!("&{}={}", key, value).as_ref();
@@ -74,7 +83,31 @@ impl FileStation {
 
                 let result = reqwest::blocking::get(url);
 
-                Ok(())
+                match result {
+                    Ok(res) => {
+                        if res.status() == 200 {
+                            let parsed_result = res.json::<SynologyResult<T>>();
+
+                            match parsed_result {
+                                Ok(res) => {
+                                    if !res.success {
+                                        Err(-1)
+                                    } else {
+                                        Ok(res.data)
+                                    }
+                                },
+                                Err(_error) => {
+                                    println!("err: {}", _error);
+                                    Err(-1)
+                                }
+                            }
+                        }
+                        else {
+                            Err(res.status().as_u16() as i32)
+                        }
+                    },
+                    Err(_error) => Err(-1)
+                }
             },
             None => Err(403)
         }

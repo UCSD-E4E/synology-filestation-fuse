@@ -70,11 +70,30 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		&'h self,
 		_info: &OperationInfo<'c, 'h, Self>,
 	) -> OperationResult<DiskSpaceInfo> {
-		Ok(DiskSpaceInfo {
-			byte_count: 1024 * 1024 * 1024,
-			free_byte_count: 512 * 1024 * 1024,
-			available_byte_count: 512 * 1024 * 1024,
-		})
+		let shares = self.filestation.get_shares();
+
+		match shares {
+			Ok(res) => {
+				let mut totalspace: u64 = 0;
+				let mut freespace: u64 = 0;
+
+				for share in res.shares.iter() {
+					if totalspace < share.additional.volume_status.totalspace {
+						totalspace = share.additional.volume_status.totalspace;
+						freespace = share.additional.volume_status.freespace;
+					}
+				}
+
+				Ok(DiskSpaceInfo {
+					byte_count: totalspace,
+					free_byte_count: freespace,
+					available_byte_count: freespace,
+				})
+			},
+			Err(_error) => {
+				Err(_error)
+			}
+		}
 	}
 
 	fn get_file_information(
@@ -136,9 +155,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 	}
 
     fn unmounted(&'h self, _info: &OperationInfo<'c, 'h, Self>) -> OperationResult<()> {
-        self.filestation.logout();
-
-		Ok(())
+        self.filestation.logout()
 	}
 }
 
@@ -148,16 +165,18 @@ pub struct WindowsFuseFileSystem {
     secured: bool,
     version: u8,
     mount_point: Option<UCString<u16>>,
+	debug: bool,
 }
 
 impl FuseFileSystem for WindowsFuseFileSystem {
-    fn new(hostname: &str, port: u16, secured: bool, version: u8) -> WindowsFuseFileSystem {
+    fn new(hostname: &str, port: u16, secured: bool, version: u8, debug: bool) -> WindowsFuseFileSystem {
         WindowsFuseFileSystem {
             hostname: hostname.to_string(),
             port,
             secured,
             version,
-            mount_point: Default::default()
+            mount_point: Default::default(),
+			debug
         }
     }
 
@@ -191,8 +210,11 @@ impl FuseFileSystem for WindowsFuseFileSystem {
             let _ = mounter.mount().unwrap();
         };
 
-        // executor();
-        thread::spawn(executor);
+		if self.debug {
+        	executor();
+		} else {
+        	thread::spawn(executor);
+		}
     }
 
     fn unmount(&self) {

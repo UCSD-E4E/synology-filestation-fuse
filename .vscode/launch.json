@@ -10,7 +10,9 @@
             "name": "Debug",
             "preLaunchTask": "cargo build",
             "program": "${workspaceRoot}/target/debug/synology-filestation-fuse.exe",
-            "args": [],
+            "args": [
+                "--debug"
+            ],
             "cwd": "${workspaceRoot}"
         }
     ]
