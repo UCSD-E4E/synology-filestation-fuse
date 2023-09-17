@@ -20,7 +20,7 @@ impl FileStation {
 
     pub fn get_shares(&self) -> Result<GetSharesResult, i32> {
         let mut additional = HashMap::new();
-        additional.insert("additional", "%5B%22volume_status%22%5D");
+        additional.insert("additional", "%5B%22volume_status%22%2C%22time%22%5D");
         self.get("SYNO.FileStation.List", 2, "list_share", &additional)
     }
 

@@ -1,13 +1,15 @@
 use crate::filesystems::FuseFileSystem;
 use crate::synology_api::FileStation;
 
-use std::{time::SystemTime, thread};
+use std::{time::SystemTime, time::Duration, thread};
 use dokan::{
     init,
     shutdown,
     unmount,
+	is_name_in_expression,
     FileSystemMounter,
     FileSystemHandler,
+	FindData,
     CreateFileInfo,
     MountOptions,
     OperationInfo,
@@ -19,8 +21,8 @@ use dokan::{
 };
 use widestring::{U16CString, UCString, U16CStr};
 use winapi::{
-	shared::{ntdef, ntstatus::*},
 	um::winnt,
+	um::winnt::FILE_ATTRIBUTE_DIRECTORY
 };
 
 #[derive(Debug)]
@@ -65,6 +67,54 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 	) -> OperationResult<CreateFileInfo<Self::Context>> {
         Ok(CreateFileInfo { context: EntryHandle {}, is_dir: true, new_file_created: false } )
     }
+
+	fn find_files_with_pattern(
+			&'h self,
+			file_name: &U16CStr,
+			pattern: &U16CStr,
+			mut fill_find_data: impl FnMut(&dokan::FindData) -> dokan::FillDataResult,
+			info: &OperationInfo<'c, 'h, Self>,
+			context: &'c Self::Context,
+		) -> OperationResult<()> {
+		
+		if file_name.to_string().unwrap() == "\\" {
+			let shares = self.filestation.get_shares();
+
+			return match shares {
+				Ok(res) => {	
+					for share in res.shares.iter() {
+						let name = U16CString::from_str(share.name.as_str()).unwrap();
+						if is_name_in_expression(pattern, name, true) {
+							let result = fill_find_data(&FindData {
+								attributes: winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY,
+								creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.crtime),
+								last_access_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.atime),
+								last_write_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.mtime),
+								file_size: 0,
+								file_name: U16CString::from_str(share.name.as_str()).unwrap()
+							});
+
+							return match result {
+								Ok(_) => {
+									Ok(())
+								},
+								Err(_error) => {
+									Err(-1)
+								}
+							}
+						}
+					}
+
+					return Err(-1)
+				},
+				Err(_error) => {
+					Err(_error)
+				}
+			}
+		}
+
+		return Err(-1);
+	}
 
     fn get_disk_free_space(
 		&'h self,

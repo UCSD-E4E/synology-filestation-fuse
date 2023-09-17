@@ -25,6 +25,7 @@ pub struct Share {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ShareAdditional {
+    pub time: Time,
     pub volume_status: VolumeStatus
 }
 
@@ -34,6 +35,15 @@ pub struct VolumeStatus {
     pub freespace: u64,
     pub readonly: bool,
     pub totalspace: u64
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Time {
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub crtime: u64
 }
 
 #[derive(Debug, Serialize, Deserialize)]
