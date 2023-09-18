@@ -76,13 +76,12 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		
 		if file_name.to_string().unwrap() == "\\" {
 			let shares = self.filestation.list_shares();
-
 			return match shares {
 				Ok(res) => {
 					for share in res.shares.iter() {
 						let name = U16CString::from_str(share.name.as_str()).unwrap();
 
-						if is_name_in_expression(pattern, name, true) {
+						if is_name_in_expression(pattern, name, false) {
 							let result = fill_find_data(&FindData {
 								attributes: winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY,
 								creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.crtime),
@@ -107,14 +106,13 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		}
 		
 		let files = self.filestation.list_files(&file_name.to_string().unwrap().replace("\\", "/"));
-
 		match files {
 			Ok(res) => {
 				for file in res.files.iter() {
 					let name = U16CString::from_str(file.name.as_str()).unwrap();
+
 					let attributes: u32;
 					let mut file_size: u64 = 0;
-
 					if file.isdir {
 						attributes = winnt::FILE_ATTRIBUTE_DIRECTORY;
 					} else {
@@ -122,7 +120,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 						file_size = file.additional.size;
 					}
 
-					if is_name_in_expression(pattern, name, true) {
+					if is_name_in_expression(pattern, name, false) {
 						let result = fill_find_data(&FindData {
 							attributes,
 							creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.crtime),
@@ -178,21 +176,114 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 
 	fn get_file_information(
 		&'h self,
-		_file_name: &U16CStr,
+		file_name: &U16CStr,
 		_info: &OperationInfo<'c, 'h, Self>,
-		context: &'c Self::Context,
+		_context: &'c Self::Context,
 	) -> OperationResult<FileInfo> {
-        let now = SystemTime::now();
+		println!("file_name: {}", file_name.to_string().unwrap());
+		let now = SystemTime::now();
 
-		Ok(FileInfo {
-			attributes: 0,
-			creation_time: now,
-			last_access_time: now,
-			last_write_time: now,
-			file_size: 5,
-			number_of_links: 1,
-			file_index: 0,
-		})
+		let mut file_name_str = file_name.to_string().unwrap();
+		if file_name_str == "\\" {
+			let shares = self.filestation.list_shares();
+
+			return match shares {
+				Ok(res) => {
+					let mut totalspace: u64 = 0;
+					let mut crtime: u64 = 0;
+					let mut atime: u64 = 0;
+					let mut mtime: u64 = 0;
+
+					for share in res.shares.iter() {
+						if totalspace < share.additional.volume_status.totalspace {
+							totalspace = share.additional.volume_status.totalspace;
+
+							crtime = share.additional.time.crtime;
+							atime = share.additional.time.atime;
+							mtime = share.additional.time.mtime;
+						}
+					}
+
+					let size: u64 = res.shares.len() as u64;
+
+					Ok(FileInfo {
+						attributes: winnt::FILE_ATTRIBUTE_DIRECTORY,
+						creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(crtime),
+						last_access_time: SystemTime::UNIX_EPOCH + Duration::from_secs(atime),
+						last_write_time: SystemTime::UNIX_EPOCH + Duration::from_secs(mtime),
+						file_size: size,
+						number_of_links: 0,
+						file_index: 0,
+					})
+				},
+				Err(error) => {
+					return Err(error);
+				}
+			}
+		} else if file_name_str == "\\desktop.ini" {
+			return Ok(FileInfo {
+				attributes: winnt::FILE_ATTRIBUTE_NORMAL,
+				creation_time: now,
+				last_access_time: now,
+				last_write_time: now,
+				file_size: 0,
+				number_of_links: 0,
+				file_index: 0 
+			});
+		} else if file_name_str.matches("\\").count() == 1 {
+			let shares = self.filestation.list_shares();
+			return match shares {
+				Ok(res) => {
+					file_name_str = file_name_str.replace("\\", "/");
+
+					for share in res.shares.iter() {
+						if share.path == file_name_str {
+							return Ok(FileInfo {
+								attributes: winnt::FILE_ATTRIBUTE_DIRECTORY,
+								creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.crtime),
+								last_access_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.atime),
+								last_write_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.mtime),
+								file_size: 0,
+								number_of_links: 0,
+								file_index: 0
+							});
+						}
+					}
+
+					return Err(-1);
+				},
+				Err(error) => Err(error)
+			}
+		} else {
+			file_name_str = file_name_str.replace("\\", "/");
+
+			let files_result = self.filestation.get_info_for_path(&file_name_str);
+			return match files_result {
+				Ok(files) => {
+					let file = files.files.first().unwrap();
+
+					let attributes: u32;
+					let mut file_size: u64 = 0;
+					if file.isdir {
+						attributes = winnt::FILE_ATTRIBUTE_DIRECTORY;
+					} else {
+						attributes = winnt::FILE_ATTRIBUTE_NORMAL;
+						file_size = file.additional.size;
+					}
+
+					return Ok(FileInfo {
+						attributes,
+						creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.crtime),
+						last_access_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.atime),
+						last_write_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.mtime),
+						file_size,
+						number_of_links: 0,
+						file_index: 0
+					});
+				},
+				Err(error) => Err(error)
+			}
+		}
 	}
 
     fn get_file_security(
@@ -232,6 +323,17 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		_info: &OperationInfo<'c, 'h, Self>,
 	) -> OperationResult<()> {
         Ok(())
+	}
+
+	fn read_file(
+			&'h self,
+			file_name: &U16CStr,
+			offset: i64,
+			buffer: &mut [u8],
+			info: &OperationInfo<'c, 'h, Self>,
+			context: &'c Self::Context,
+		) -> OperationResult<u32> {
+		return Ok(0);
 	}
 
     fn unmounted(&'h self, _info: &OperationInfo<'c, 'h, Self>) -> OperationResult<()> {

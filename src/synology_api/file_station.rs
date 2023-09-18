@@ -19,6 +19,31 @@ impl FileStation {
         FileStation { hostname, base_url: base_url.to_string(), version, sid: Default::default() }
     }
 
+    pub fn get_info_for_path(&self, path: &str) -> Result<ListFilesResult, i32> {
+        self.get_info_for_paths(vec!(path))
+    }
+
+    pub fn get_info_for_paths(&self, paths: Vec<&str>) -> Result<ListFilesResult, i32> {
+        let mut paths_str = "".to_string();
+        paths_str += paths.first().unwrap();
+
+        if paths_str.len() > 1 {
+            for file in paths.iter().skip(1) {
+                paths_str += format!(",{}", file).as_ref();
+            }
+        }
+
+        let mut additional = HashMap::new();
+
+        let encoded_path = encode(paths_str.as_str()).to_string();
+        additional.insert("path", encoded_path.as_str());
+        
+        let encoded_additional = encode("[\"size\",\"time\"]").to_string();
+        additional.insert("additional", encoded_additional.as_str());
+
+        self.get("SYNO.FileStation.List", 2, "getinfo", &additional)
+    }
+
     pub fn list_files(&self, path: &str) -> Result<ListFilesResult, i32> {
         let mut additional = HashMap::new();
 
