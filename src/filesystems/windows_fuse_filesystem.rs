@@ -62,6 +62,8 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		create_options: u32,
 		info: &mut OperationInfo<'c, 'h, Self>,
 	) -> OperationResult<CreateFileInfo<Self::Context>> {
+		let file_name_str = file_name.to_string().unwrap();
+
         Ok(CreateFileInfo { context: EntryHandle {}, is_dir: true, new_file_created: false } )
     }
 
@@ -139,6 +141,10 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 				return Ok(());
 			},
 			Err(error) => {
+				if error == 408 {
+					return Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)
+				}
+				
 				return Err(error);
 			}
 		}
@@ -252,16 +258,20 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 
 					return Err(-1);
 				},
-				Err(error) => Err(error)
+				Err(error) => {
+					if error == 408 {
+						Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)
+					} else {
+						Err(error)
+					}
+				}
 			}
 		} else {
 			file_name_str = file_name_str.replace("\\", "/");
 
 			let files_result = self.filestation.get_info_for_path(&file_name_str);
 			return match files_result {
-				Ok(files) => {
-					let file = files.files.first().unwrap();
-
+				Ok(file) => {
 					let attributes: u32;
 					let mut file_size: u64 = 0;
 					if file.isdir {

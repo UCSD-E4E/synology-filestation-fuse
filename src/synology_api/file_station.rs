@@ -4,6 +4,8 @@ use urlencoding::encode;
 
 use crate::synology_api::responses::{SynologyResult, LoginResult, ListSharesResult, ListFilesResult};
 
+use super::responses::{FileStationItem, FileAdditional};
+
 pub struct FileStation {
     pub hostname: String,
     base_url: String,
@@ -19,8 +21,11 @@ impl FileStation {
         FileStation { hostname, base_url: base_url.to_string(), version, sid: Default::default() }
     }
 
-    pub fn get_info_for_path(&self, path: &str) -> Result<ListFilesResult, i32> {
-        self.get_info_for_paths(vec!(path))
+    pub fn get_info_for_path(&self, path: &str) -> Result<FileStationItem<FileAdditional>, i32> {
+        match self.get_info_for_paths(vec!(path)) {
+            Ok(result) => Ok(result.files.first().unwrap().clone()),
+            Err(error) => Err(error)
+        }
     }
 
     pub fn get_info_for_paths(&self, paths: Vec<&str>) -> Result<ListFilesResult, i32> {
@@ -41,7 +46,24 @@ impl FileStation {
         let encoded_additional = encode("[\"size\",\"time\"]").to_string();
         additional.insert("additional", encoded_additional.as_str());
 
-        self.get("SYNO.FileStation.List", 2, "getinfo", &additional)
+        let result: Result<serde_json::Value, i32> = self.get("SYNO.FileStation.List", 2, "getinfo", &additional);
+        match result {
+            Ok(value) => {
+                for item in value["files"].as_array().unwrap().iter() {
+                    if item["code"].is_number() {
+                        return Err(item["code"].as_i64().unwrap() as i32);
+                    }
+                }
+
+                let parsed_result = serde_json::from_value::<ListFilesResult>(value);
+
+                return match parsed_result {
+                    Ok(parsed) => Ok(parsed),
+                    Err(_error) => Err(-1)
+                }
+            },
+            Err(error) => Err(error)
+        }
     }
 
     pub fn list_files(&self, path: &str) -> Result<ListFilesResult, i32> {
@@ -132,18 +154,30 @@ impl FileStation {
 
                             match text_result {
                                 Ok(text) => {
-                                    let parsed_result = serde_json::from_str::<SynologyResult<T>>(text.as_str());
+                                    let value_result = serde_json::from_str::<serde_json::Value>(text.as_str());
 
-                                    match parsed_result {
-                                        Ok(parsed) => {
-                                            if !parsed.success {
-                                                Err(-1)
+                                    match value_result {
+                                        Ok(value) => {
+                                            if !value["success"].as_bool().unwrap() {
+                                                println!("success: false with json '{}'.", text);
+
+                                                Err(value["error"].as_object().unwrap()["code"].as_i64().unwrap() as i32)
                                             } else {
-                                                Ok(parsed.data)
+                                                let parsed_result = serde_json::from_value::<SynologyResult<T>>(value);
+
+                                                match parsed_result {
+                                                    Ok(parsed) => Ok(parsed.data),
+                                                    Err(error) => {
+                                                        println!("err: {} with json '{}'.", error, text);
+
+                                                        Err(-1)
+                                                    } 
+                                                }
                                             }
                                         },
                                         Err(error) => {
                                             println!("err: {} with json '{}'.", error, text);
+
                                             Err(-1)
                                         }
                                     }
