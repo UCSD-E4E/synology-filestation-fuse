@@ -117,14 +117,14 @@ impl FileStation {
                                                 Ok(parsed.data)
                                             }
                                         },
-                                        Err(_error) => {
-                                            println!("err: {} with json '{}'.", _error, text);
+                                        Err(error) => {
+                                            println!("err: {} with json '{}'.", error, text);
                                             Err(-1)
                                         }
                                     }
                                 },
-                                Err(_error) => {
-                                    println!("err: {}", _error);
+                                Err(error) => {
+                                    println!("err: {}", error);
                                     Err(-1)
                                 }
                             }

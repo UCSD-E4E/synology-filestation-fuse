@@ -20,10 +20,7 @@ use dokan::{
     IO_SECURITY_CONTEXT, MountFlags
 };
 use widestring::{U16CString, UCString, U16CStr};
-use winapi::{
-	um::winnt,
-	um::winnt::FILE_ATTRIBUTE_DIRECTORY
-};
+use winapi::um::winnt;
 
 #[derive(Debug)]
 struct EntryHandle {
@@ -73,8 +70,8 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 			file_name: &U16CStr,
 			pattern: &U16CStr,
 			mut fill_find_data: impl FnMut(&dokan::FindData) -> dokan::FillDataResult,
-			info: &OperationInfo<'c, 'h, Self>,
-			context: &'c Self::Context,
+			_info: &OperationInfo<'c, 'h, Self>,
+			_context: &'c Self::Context,
 		) -> OperationResult<()> {
 		
 		if file_name.to_string().unwrap() == "\\" {
@@ -103,8 +100,8 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 
 					return Ok(());
 				},
-				Err(_error) => {
-					Err(_error)
+				Err(error) => {
+					Err(error)
 				}
 			}
 		}
@@ -119,9 +116,9 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 					let mut file_size: u64 = 0;
 
 					if file.isdir {
-						attributes = winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY;
+						attributes = winnt::FILE_ATTRIBUTE_DIRECTORY;
 					} else {
-						attributes = winapi::um::winnt::FILE_ATTRIBUTE_NORMAL;
+						attributes = winnt::FILE_ATTRIBUTE_NORMAL;
 						file_size = file.additional.size;
 					}
 
@@ -143,8 +140,8 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 
 				return Ok(());
 			},
-			Err(_error) => {
-				return Err(_error);
+			Err(error) => {
+				return Err(error);
 			}
 		}
 	}
@@ -173,8 +170,8 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 					available_byte_count: freespace,
 				})
 			},
-			Err(_error) => {
-				Err(_error)
+			Err(error) => {
+				Err(error)
 			}
 		}
 	}
