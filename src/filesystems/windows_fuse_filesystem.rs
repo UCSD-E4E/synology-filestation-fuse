@@ -42,12 +42,12 @@ struct WindowsFileSystemHandler {
 }
 
 impl WindowsFileSystemHandler {
-    fn new(mut filestation: FileStation) -> WindowsFileSystemHandler {
+    fn new(filestation: FileStation) -> WindowsFileSystemHandler {
         WindowsFileSystemHandler { filestation }
     }
 
-	fn login(& mut self, username: &str, password: &str) {
-		self.filestation.login(username, password);
+	fn login(& mut self, username: &str, password: &str) -> Result<(), i32> {
+		self.filestation.login(username, password)
 	}
 }
 
@@ -78,12 +78,13 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		) -> OperationResult<()> {
 		
 		if file_name.to_string().unwrap() == "\\" {
-			let shares = self.filestation.get_shares();
+			let shares = self.filestation.list_shares();
 
 			return match shares {
-				Ok(res) => {	
+				Ok(res) => {
 					for share in res.shares.iter() {
 						let name = U16CString::from_str(share.name.as_str()).unwrap();
+
 						if is_name_in_expression(pattern, name, true) {
 							let result = fill_find_data(&FindData {
 								attributes: winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY,
@@ -94,33 +95,65 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 								file_name: U16CString::from_str(share.name.as_str()).unwrap()
 							});
 
-							return match result {
-								Ok(_) => {
-									Ok(())
-								},
-								Err(_error) => {
-									Err(-1)
-								}
+							if result.is_err() {
+								return Err(-1);
 							}
 						}
 					}
 
-					return Err(-1)
+					return Ok(());
 				},
 				Err(_error) => {
 					Err(_error)
 				}
 			}
 		}
+		
+		let files = self.filestation.list_files(&file_name.to_string().unwrap().replace("\\", "/"));
 
-		return Err(-1);
+		match files {
+			Ok(res) => {
+				for file in res.files.iter() {
+					let name = U16CString::from_str(file.name.as_str()).unwrap();
+					let attributes: u32;
+					let mut file_size: u64 = 0;
+
+					if file.isdir {
+						attributes = winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY;
+					} else {
+						attributes = winapi::um::winnt::FILE_ATTRIBUTE_NORMAL;
+						file_size = file.additional.size;
+					}
+
+					if is_name_in_expression(pattern, name, true) {
+						let result = fill_find_data(&FindData {
+							attributes,
+							creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.crtime),
+							last_access_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.atime),
+							last_write_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.mtime),
+							file_size,
+							file_name: U16CString::from_str(file.name.as_str()).unwrap()
+						});
+
+						if result.is_err() {
+							return Err(-1);
+						}
+					}
+				}
+
+				return Ok(());
+			},
+			Err(_error) => {
+				return Err(_error);
+			}
+		}
 	}
 
     fn get_disk_free_space(
 		&'h self,
 		_info: &OperationInfo<'c, 'h, Self>,
 	) -> OperationResult<DiskSpaceInfo> {
-		let shares = self.filestation.get_shares();
+		let shares = self.filestation.list_shares();
 
 		match shares {
 			Ok(res) => {
@@ -255,7 +288,7 @@ impl FuseFileSystem for WindowsFuseFileSystem {
                 ..Default::default()
             };
 
-			handler.login(username_string.as_str(), password_string.as_str());
+			handler.login(username_string.as_str(), password_string.as_str()).unwrap();
             let mut mounter = FileSystemMounter::new(&handler, &cstr_mount, &options);
             let _ = mounter.mount().unwrap();
         };

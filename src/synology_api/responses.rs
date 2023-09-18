@@ -15,11 +15,18 @@ pub struct LoginResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct Share {
+pub struct FileStationItem<T> {
     pub isdir: bool,
     pub name: String,
     pub path: String,
-    pub additional: ShareAdditional
+    pub additional: T
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FileAdditional {
+    pub size: u64,
+    pub time: Time
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,8 +55,16 @@ pub struct Time {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct GetSharesResult {
+pub struct ListSharesResult {
     pub offset: i32,
-    pub shares: Vec<Share>,
+    pub shares: Vec<FileStationItem<ShareAdditional>>,
+    pub total: i32
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ListFilesResult {
+    pub offset: i32,
+    pub files: Vec<FileStationItem<FileAdditional>>,
     pub total: i32
 }

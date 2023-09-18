@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use serde::de::DeserializeOwned;
+use urlencoding::encode;
 
-use crate::synology_api::responses::{SynologyResult, LoginResult, GetSharesResult};
+use crate::synology_api::responses::{SynologyResult, LoginResult, ListSharesResult, ListFilesResult};
 
 pub struct FileStation {
     pub hostname: String,
@@ -18,9 +19,25 @@ impl FileStation {
         FileStation { hostname, base_url: base_url.to_string(), version, sid: Default::default() }
     }
 
-    pub fn get_shares(&self) -> Result<GetSharesResult, i32> {
+    pub fn list_files(&self, path: &str) -> Result<ListFilesResult, i32> {
         let mut additional = HashMap::new();
-        additional.insert("additional", "%5B%22volume_status%22%2C%22time%22%5D");
+
+        let encoded_path = encode(path).to_string();
+        additional.insert("folder_path", encoded_path.as_str());
+
+        
+        let encoded_additional = encode("[\"size\",\"time\"]").to_string();
+        additional.insert("additional", encoded_additional.as_str());
+
+        self.get("SYNO.FileStation.List", 2, "list", &additional)
+    }
+
+    pub fn list_shares(&self) -> Result<ListSharesResult, i32> {
+        let mut additional = HashMap::new();
+
+        let encoded_additional = encode("[\"volume_status\",\"time\"]").to_string();
+        additional.insert("additional", encoded_additional.as_str());
+
         self.get("SYNO.FileStation.List", 2, "list_share", &additional)
     }
 
@@ -86,14 +103,24 @@ impl FileStation {
                 match result {
                     Ok(res) => {
                         if res.status() == 200 {
-                            let parsed_result = res.json::<SynologyResult<T>>();
+                            let text_result = res.text();
 
-                            match parsed_result {
-                                Ok(res) => {
-                                    if !res.success {
-                                        Err(-1)
-                                    } else {
-                                        Ok(res.data)
+                            match text_result {
+                                Ok(text) => {
+                                    let parsed_result = serde_json::from_str::<SynologyResult<T>>(text.as_str());
+
+                                    match parsed_result {
+                                        Ok(parsed) => {
+                                            if !parsed.success {
+                                                Err(-1)
+                                            } else {
+                                                Ok(parsed.data)
+                                            }
+                                        },
+                                        Err(_error) => {
+                                            println!("err: {} with json '{}'.", _error, text);
+                                            Err(-1)
+                                        }
                                     }
                                 },
                                 Err(_error) => {
