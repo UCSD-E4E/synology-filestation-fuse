@@ -55,11 +55,16 @@ impl FileStation {
                     }
                 }
 
+                let value_str = value.to_string();
                 let parsed_result = serde_json::from_value::<ListFilesResult>(value);
 
                 return match parsed_result {
                     Ok(parsed) => Ok(parsed),
-                    Err(_error) => Err(-1)
+                    Err(error) => {
+                        println!("Error: {} with json: {}", error, value_str);
+
+                        Err(-4)
+                    }
                 }
             },
             Err(error) => Err(error)
@@ -107,14 +112,14 @@ impl FileStation {
                         Ok(())
                     }
                     else {
-                        Err(-1)
+                        Err(-5)
                     }
                 }
                 else {
                     Err(res.status().as_u16() as i32)
                 }
             },
-            Err(_error) => Err(-1)
+            Err(_error) => Err(-6)
         }
     }
 
@@ -170,7 +175,7 @@ impl FileStation {
                                                     Err(error) => {
                                                         println!("err: {} with json '{}'.", error, text);
 
-                                                        Err(-1)
+                                                        Err(-7)
                                                     } 
                                                 }
                                             }
@@ -178,13 +183,13 @@ impl FileStation {
                                         Err(error) => {
                                             println!("err: {} with json '{}'.", error, text);
 
-                                            Err(-1)
+                                            Err(-8)
                                         }
                                     }
                                 },
                                 Err(error) => {
                                     println!("err: {}", error);
-                                    Err(-1)
+                                    Err(-9)
                                 }
                             }
                         }
@@ -192,7 +197,7 @@ impl FileStation {
                             Err(res.status().as_u16() as i32)
                         }
                     },
-                    Err(_error) => Err(-1)
+                    Err(error) => Err(error.status().unwrap().as_u16() as i32)
                 }
             },
             None => Err(403)

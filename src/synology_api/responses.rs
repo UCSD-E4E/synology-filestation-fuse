@@ -64,7 +64,7 @@ pub struct ListSharesResult {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct ListFilesResult {
-    pub offset: i32,
+    pub offset: Option<i32>,
     pub files: Vec<FileStationItem<FileAdditional>>,
-    pub total: i32
+    pub total: Option<i32>
 }

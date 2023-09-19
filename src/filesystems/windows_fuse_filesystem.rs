@@ -23,7 +23,7 @@ use widestring::{U16CString, UCString, U16CStr};
 use winapi::um::winnt;
 
 #[derive(Debug)]
-struct EntryHandle {
+struct WindowsFileSystemEntry {
 	// entry: Entry,
 	// alt_stream: RwLock<Option<Arc<RwLock<AltStream>>>>,
 	// delete_on_close: bool,
@@ -32,10 +32,21 @@ struct EntryHandle {
 	// ctime_enabled: AtomicBool,
 	// mtime_enabled: AtomicBool,
 	// atime_enabled: AtomicBool,
+
+	attributes: u32,
+	creation_time: SystemTime,
+	last_access_time: SystemTime,
+	last_write_time: SystemTime,
+	file_size: u64,
+	is_dir: bool,
 }
 
 struct WindowsFileSystemHandler {
     filestation: FileStation,
+}
+
+fn epoch_from_seconds(seconds: u64) -> SystemTime {
+	SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
 }
 
 impl WindowsFileSystemHandler {
@@ -46,10 +57,110 @@ impl WindowsFileSystemHandler {
 	fn login(& mut self, username: &str, password: &str) -> Result<(), i32> {
 		self.filestation.login(username, password)
 	}
+
+	fn get_filesystem_entry(&self, file_name: &str) -> Result<WindowsFileSystemEntry, i32> {
+		let mut file_name_str = file_name.to_string();
+
+		if file_name_str == "\\" {
+			let shares = self.filestation.list_shares();
+
+			return match shares {
+				Ok(res) => {
+					let mut totalspace: u64 = 0;
+					let mut crtime: u64 = 0;
+					let mut atime: u64 = 0;
+					let mut mtime: u64 = 0;
+
+					for share in res.shares.iter() {
+						if totalspace < share.additional.volume_status.totalspace {
+							totalspace = share.additional.volume_status.totalspace;
+
+							crtime = share.additional.time.crtime;
+							atime = share.additional.time.atime;
+							mtime = share.additional.time.mtime;
+						}
+					}
+
+					let size: u64 = res.shares.len() as u64;
+
+					Ok(WindowsFileSystemEntry {
+						attributes: winnt::FILE_ATTRIBUTE_DIRECTORY,
+						creation_time: epoch_from_seconds(crtime),
+						last_access_time: epoch_from_seconds(atime),
+						last_write_time: epoch_from_seconds(mtime),
+						file_size: size,
+						is_dir: true
+					})
+				},
+				Err(error) => {
+					return Err(error);
+				}
+			}
+		} else if file_name_str.to_lowercase().contains("desktop.ini") {
+			return Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+		} else if file_name_str == "\\AutoRun.inf" {
+			return Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+		} else if file_name_str.matches("\\").count() == 1 {
+			let shares = self.filestation.list_shares();
+			return match shares {
+				Ok(res) => {
+					file_name_str = file_name_str.replace("\\", "/");
+
+					for share in res.shares.iter() {
+						if share.path == file_name_str {
+							return Ok(WindowsFileSystemEntry {
+								attributes: winnt::FILE_ATTRIBUTE_DIRECTORY,
+								creation_time: epoch_from_seconds(share.additional.time.crtime),
+								last_access_time: epoch_from_seconds(share.additional.time.atime),
+								last_write_time: epoch_from_seconds(share.additional.time.mtime),
+								file_size: 0,
+								is_dir: true
+							});
+						}
+					}
+
+					return Err(-1);
+				},
+				Err(error) => {
+					if error == 408 {
+						Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)
+					} else {
+						Err(error)
+					}
+				}
+			}
+		} else {
+			file_name_str = file_name_str.replace("\\", "/");
+
+			let files_result = self.filestation.get_info_for_path(&file_name_str);
+			return match files_result {
+				Ok(file) => {
+					let attributes: u32;
+					let mut file_size: u64 = 0;
+					if file.isdir {
+						attributes = winnt::FILE_ATTRIBUTE_DIRECTORY;
+					} else {
+						attributes = winnt::FILE_ATTRIBUTE_NORMAL;
+						file_size = file.additional.size;
+					}
+
+					return Ok(WindowsFileSystemEntry {
+							attributes,
+							creation_time: epoch_from_seconds(file.additional.time.crtime),
+							last_access_time: epoch_from_seconds(file.additional.time.atime),
+							last_write_time: epoch_from_seconds(file.additional.time.mtime),
+							file_size,
+							is_dir: file.isdir
+					});
+				},
+				Err(error) => Err(error)
+			}
+		}
+	}
 }
 
 impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
-    type Context = EntryHandle;
+    type Context = WindowsFileSystemEntry;
 
     fn create_file(
 		&'h self,
@@ -63,8 +174,20 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		info: &mut OperationInfo<'c, 'h, Self>,
 	) -> OperationResult<CreateFileInfo<Self::Context>> {
 		let file_name_str = file_name.to_string().unwrap();
+		println!("file_name: {}", file_name_str);
 
-        Ok(CreateFileInfo { context: EntryHandle {}, is_dir: true, new_file_created: false } )
+		match self.get_filesystem_entry(file_name_str.as_str()) {
+			Ok(file_entry) => Ok(CreateFileInfo {
+				is_dir: file_entry.is_dir,
+				context: file_entry,
+				new_file_created: false
+			}),
+			Err(error) => {
+				println!("Error: {}", error);
+
+				Err(error)
+			}
+		}
     }
 
 	fn find_files_with_pattern(
@@ -86,15 +209,15 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 						if is_name_in_expression(pattern, name, false) {
 							let result = fill_find_data(&FindData {
 								attributes: winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY,
-								creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.crtime),
-								last_access_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.atime),
-								last_write_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.mtime),
+								creation_time: epoch_from_seconds(share.additional.time.crtime),
+								last_access_time: epoch_from_seconds(share.additional.time.atime),
+								last_write_time: epoch_from_seconds(share.additional.time.mtime),
 								file_size: 0,
 								file_name: U16CString::from_str(share.name.as_str()).unwrap()
 							});
 
 							if result.is_err() {
-								return Err(-1);
+								return Err(-2);
 							}
 						}
 					}
@@ -125,15 +248,15 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 					if is_name_in_expression(pattern, name, false) {
 						let result = fill_find_data(&FindData {
 							attributes,
-							creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.crtime),
-							last_access_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.atime),
-							last_write_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.mtime),
+							creation_time: epoch_from_seconds(file.additional.time.crtime),
+							last_access_time: epoch_from_seconds(file.additional.time.atime),
+							last_write_time: epoch_from_seconds(file.additional.time.mtime),
 							file_size,
 							file_name: U16CString::from_str(file.name.as_str()).unwrap()
 						});
 
 						if result.is_err() {
-							return Err(-1);
+							return Err(-3);
 						}
 					}
 				}
@@ -186,113 +309,21 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		_info: &OperationInfo<'c, 'h, Self>,
 		_context: &'c Self::Context,
 	) -> OperationResult<FileInfo> {
-		println!("file_name: {}", file_name.to_string().unwrap());
-		let now = SystemTime::now();
+		let file_name_str = file_name.to_string().unwrap();
 
-		let mut file_name_str = file_name.to_string().unwrap();
-		if file_name_str == "\\" {
-			let shares = self.filestation.list_shares();
+		println!("file_name: {}", file_name_str);
 
-			return match shares {
-				Ok(res) => {
-					let mut totalspace: u64 = 0;
-					let mut crtime: u64 = 0;
-					let mut atime: u64 = 0;
-					let mut mtime: u64 = 0;
-
-					for share in res.shares.iter() {
-						if totalspace < share.additional.volume_status.totalspace {
-							totalspace = share.additional.volume_status.totalspace;
-
-							crtime = share.additional.time.crtime;
-							atime = share.additional.time.atime;
-							mtime = share.additional.time.mtime;
-						}
-					}
-
-					let size: u64 = res.shares.len() as u64;
-
-					Ok(FileInfo {
-						attributes: winnt::FILE_ATTRIBUTE_DIRECTORY,
-						creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(crtime),
-						last_access_time: SystemTime::UNIX_EPOCH + Duration::from_secs(atime),
-						last_write_time: SystemTime::UNIX_EPOCH + Duration::from_secs(mtime),
-						file_size: size,
-						number_of_links: 0,
-						file_index: 0,
-					})
-				},
-				Err(error) => {
-					return Err(error);
-				}
-			}
-		} else if file_name_str == "\\desktop.ini" {
-			return Ok(FileInfo {
-				attributes: winnt::FILE_ATTRIBUTE_NORMAL,
-				creation_time: now,
-				last_access_time: now,
-				last_write_time: now,
-				file_size: 0,
+		match self.get_filesystem_entry(file_name_str.as_str()) {
+			Ok(file_entry) => Ok(FileInfo {
+				attributes: file_entry.attributes,
+				creation_time: file_entry.creation_time,
+				last_access_time: file_entry.last_access_time,
+				last_write_time: file_entry.last_write_time,
+				file_size: file_entry.file_size,
 				number_of_links: 0,
-				file_index: 0 
-			});
-		} else if file_name_str.matches("\\").count() == 1 {
-			let shares = self.filestation.list_shares();
-			return match shares {
-				Ok(res) => {
-					file_name_str = file_name_str.replace("\\", "/");
-
-					for share in res.shares.iter() {
-						if share.path == file_name_str {
-							return Ok(FileInfo {
-								attributes: winnt::FILE_ATTRIBUTE_DIRECTORY,
-								creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.crtime),
-								last_access_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.atime),
-								last_write_time: SystemTime::UNIX_EPOCH + Duration::from_secs(share.additional.time.mtime),
-								file_size: 0,
-								number_of_links: 0,
-								file_index: 0
-							});
-						}
-					}
-
-					return Err(-1);
-				},
-				Err(error) => {
-					if error == 408 {
-						Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)
-					} else {
-						Err(error)
-					}
-				}
-			}
-		} else {
-			file_name_str = file_name_str.replace("\\", "/");
-
-			let files_result = self.filestation.get_info_for_path(&file_name_str);
-			return match files_result {
-				Ok(file) => {
-					let attributes: u32;
-					let mut file_size: u64 = 0;
-					if file.isdir {
-						attributes = winnt::FILE_ATTRIBUTE_DIRECTORY;
-					} else {
-						attributes = winnt::FILE_ATTRIBUTE_NORMAL;
-						file_size = file.additional.size;
-					}
-
-					return Ok(FileInfo {
-						attributes,
-						creation_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.crtime),
-						last_access_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.atime),
-						last_write_time: SystemTime::UNIX_EPOCH + Duration::from_secs(file.additional.time.mtime),
-						file_size,
-						number_of_links: 0,
-						file_index: 0
-					});
-				},
-				Err(error) => Err(error)
-			}
+				file_index: 0
+			}),
+			Err(error) => Err(error)
 		}
 	}
 
@@ -343,6 +374,10 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 			info: &OperationInfo<'c, 'h, Self>,
 			context: &'c Self::Context,
 		) -> OperationResult<u32> {
+		let file_name_str = file_name.to_string().unwrap();
+
+		println!("file_name: {}", file_name_str);
+
 		return Ok(0);
 	}
 
