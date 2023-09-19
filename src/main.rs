@@ -5,12 +5,33 @@ use filesystems::FuseFileSystem;
 mod filesystems;
 mod synology_api;
 
-
 fn pause() {
     let mut stdout = stdout();
     stdout.write(b"Press Enter to continue...").unwrap();
     stdout.flush().unwrap();
     stdin().read(&mut [0]).unwrap();
+}
+
+#[cfg(target_family = "windows")]
+fn init_fuse_filesystem(hostname: &str, port: u16, secured: bool, version: u8, debug_mode: bool) -> filesystems::WindowsFuseFileSystem {
+    filesystems::WindowsFuseFileSystem::new(
+        hostname,
+        port,
+        secured,
+        version,
+        debug_mode
+    )
+}
+
+#[cfg(target_family = "unix")]
+fn init_fuse_filesystem(hostname: &str, port: u16, secured: bool, version: u8, debug_mode: bool) -> filesystems::UnixFuseFileSystem {
+    filesystems::UnixFuseFileSystem::new(
+        hostname,
+        port,
+        secured,
+        version,
+        debug_mode
+    )
 }
 
 fn main() {
@@ -49,13 +70,12 @@ fn main() {
         password = "".to_string();
     }
 
-    let mut fuse_fileystem = filesystems::WindowsFuseFileSystem::new(
+    let mut fuse_fileystem = init_fuse_filesystem(
         &hostname,
         port,
         secured,
         version,
-        debug_mode
-    );
+        debug_mode);
 
     println!("Mounting Synology NAS...");
 
