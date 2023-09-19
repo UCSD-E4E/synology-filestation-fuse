@@ -25,6 +25,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Install Dependencies
+      run: sudo sudo apt-get install -y fuse libfuse-dev pkg-config
     - name: Build
       run: cargo build --verbose
     - name: Run tests
@@ -35,6 +37,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Install Dependencies
+      run: |
+        - brew cask install osxfuse
+        - brew install pkg-config
     - name: Build
       run: cargo build --verbose
     - name: Run tests

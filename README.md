@@ -12,3 +12,14 @@ For development:
 ```
 sudo apt-get install libfuse-dev pkg-config
 ```
+
+## macOS
+Ensure that you install FUSE dependencies.  To run:
+```
+brew cask install osxfuse
+```
+
+For development:
+```
+brew install pkg-config
+```
