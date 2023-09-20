@@ -7,18 +7,18 @@ use crate::synology_api::responses::{SynologyResult, LoginResult, ListSharesResu
 use super::responses::{FileStationItem, FileAdditional};
 
 pub struct FileStation {
-    pub hostname: String,
+    hostname: String,
     base_url: String,
     sid: Option<String>,
     version: u8
 }
 
 impl FileStation {
-    pub fn new(hostname: String, port: u16, secured: bool, version: u8) -> Self {
+    pub fn new(hostname: &str, port: u16, secured: bool, version: u8) -> Self {
         let protocol = if secured { "https" } else { "http" };
         let base_url = format!("{}://{}:{}", protocol, hostname, port);
 
-        FileStation { hostname, base_url: base_url.to_string(), version, sid: Default::default() }
+        FileStation { hostname: hostname.to_string(), base_url: base_url.to_string(), version, sid: Default::default() }
     }
 
     pub fn get_info_for_path(&self, path: &str) -> Result<FileStationItem<FileAdditional>, i32> {

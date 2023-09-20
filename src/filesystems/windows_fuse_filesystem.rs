@@ -1,5 +1,5 @@
 use crate::filesystems::FuseFileSystem;
-use crate::synology_api::FileStation;
+use crate::synology_api::{FileStation, FileStationFileSystem};
 
 use std::{time::SystemTime, time::Duration, thread};
 use dokan::{
@@ -42,7 +42,8 @@ struct WindowsFileSystemEntry {
 }
 
 struct WindowsFileSystemHandler {
-    filestation: FileStation,
+    filestation_filesystem: FileStationFileSystem,
+	filestation: &FileStation
 }
 
 fn epoch_from_seconds(seconds: u64) -> SystemTime {
@@ -50,8 +51,11 @@ fn epoch_from_seconds(seconds: u64) -> SystemTime {
 }
 
 impl WindowsFileSystemHandler {
-    fn new(filestation: FileStation) -> WindowsFileSystemHandler {
-        WindowsFileSystemHandler { filestation }
+    fn new(filestation_filesystem: FileStationFileSystem) -> WindowsFileSystemHandler {
+        WindowsFileSystemHandler {
+			filestation_filesystem, 
+			filestation: &filestation_filesystem.filestation 
+		}
     }
 
 	fn login(& mut self, username: &str, password: &str) -> Result<(), i32> {
@@ -414,8 +418,8 @@ impl FuseFileSystem for WindowsFuseFileSystem {
         self.mount_point = Some(cstr_mount.clone());
 
         let unc_name = U16CString::from_str(self.hostname.as_str()).unwrap();
-        let filestation = FileStation::new(
-            self.hostname.clone(),
+        let filestation_filesystem = FileStationFileSystem::new(
+            self.hostname,
             self.port,
             self.secured,
             self.version
@@ -425,7 +429,7 @@ impl FuseFileSystem for WindowsFuseFileSystem {
 		let password_string = password.to_string();
 
         let executor = move || {
-            let mut handler = WindowsFileSystemHandler::new(filestation);
+            let mut handler = WindowsFileSystemHandler::new(filestation_filesystem);
             let options = MountOptions {
                 flags: MountFlags::ALT_STREAM | MountFlags::DEBUG | MountFlags::STDERR | MountFlags::NETWORK,
                 unc_name: Some(unc_name.as_ref()),
