@@ -1,5 +1,5 @@
 use crate::filesystems::FuseFileSystem;
-use crate::synology_api::{FileStation, FileStationFileSystem};
+use crate::synology_api::FileStationFileSystem;
 
 use std::{time::SystemTime, time::Duration, thread};
 use dokan::{
@@ -57,7 +57,7 @@ impl WindowsFileSystemHandler {
     }
 
 	fn login(& mut self, username: &str, password: &str) -> Result<(), i32> {
-		self.filestation_filesystem.filestation.login(username, password)
+		self.filestation_filesystem.login(username, password)
 	}
 
 	fn get_filesystem_entry(&self, file_name: &str) -> Result<WindowsFileSystemEntry, i32> {

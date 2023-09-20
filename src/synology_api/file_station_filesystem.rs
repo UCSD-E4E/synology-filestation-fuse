@@ -10,4 +10,8 @@ impl FileStationFileSystem {
             filestation: FileStation::new(hostname, port, secured, version)
         }
     }
+
+    pub fn login(&mut self, username: &str, password: &str) -> Result<(), i32> {
+        self.filestation.login(username, password)
+    }
 }
