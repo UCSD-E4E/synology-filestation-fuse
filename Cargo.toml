@@ -18,3 +18,5 @@ winapi = "0.3.9"
 
 [target.'cfg(target_family = "unix")'.dependencies]
 fuse = "0.3.1"
+libc = "0.2.51"
+time = "0.1"

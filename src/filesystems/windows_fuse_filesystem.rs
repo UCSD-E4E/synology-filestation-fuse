@@ -61,7 +61,7 @@ impl WindowsFileSystemHandler {
 	}
 
 	fn get_filesystem_entry(&self, file_name: &str) -> Result<WindowsFileSystemEntry, i32> {
-		let info_result = self.filestation_filesystem.get_info(file_name);
+		let info_result = self.filestation_filesystem.get_info(file_name.replace("\\", "/"));
 
 		match info_result {
 			Ok(info) => {
