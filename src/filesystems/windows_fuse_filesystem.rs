@@ -41,12 +41,12 @@ struct WindowsFileSystemEntry {
 	is_dir: bool,
 }
 
-struct WindowsFileSystemHandler {
-    filestation_filesystem: FileStationFileSystem,
-}
-
 fn epoch_from_seconds(seconds: u64) -> SystemTime {
 	SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+struct WindowsFileSystemHandler {
+    filestation_filesystem: FileStationFileSystem,
 }
 
 impl WindowsFileSystemHandler {
@@ -61,102 +61,29 @@ impl WindowsFileSystemHandler {
 	}
 
 	fn get_filesystem_entry(&self, file_name: &str) -> Result<WindowsFileSystemEntry, i32> {
-		let mut file_name_str = file_name.to_string();
+		let info_result = self.filestation_filesystem.get_info(file_name);
 
-		if file_name_str == "\\" {
-			let shares = self.filestation_filesystem.filestation.list_shares();
-
-			return match shares {
-				Ok(res) => {
-					let mut totalspace: u64 = 0;
-					let mut crtime: u64 = 0;
-					let mut atime: u64 = 0;
-					let mut mtime: u64 = 0;
-
-					for share in res.shares.iter() {
-						if totalspace < share.additional.volume_status.totalspace {
-							totalspace = share.additional.volume_status.totalspace;
-
-							crtime = share.additional.time.crtime;
-							atime = share.additional.time.atime;
-							mtime = share.additional.time.mtime;
-						}
-					}
-
-					let size: u64 = res.shares.len() as u64;
-
-					Ok(WindowsFileSystemEntry {
-						attributes: winnt::FILE_ATTRIBUTE_DIRECTORY,
-						creation_time: epoch_from_seconds(crtime),
-						last_access_time: epoch_from_seconds(atime),
-						last_write_time: epoch_from_seconds(mtime),
-						file_size: size,
-						is_dir: true
-					})
-				},
-				Err(error) => {
-					return Err(error);
+		match info_result {
+			Ok(info) => {
+				let attributes: u32;
+				let mut file_size: u64 = 0;
+				if info.is_dir {
+					attributes = winnt::FILE_ATTRIBUTE_DIRECTORY;
+				} else {
+					attributes = winnt::FILE_ATTRIBUTE_NORMAL;
+					file_size = info.size;
 				}
-			}
-		} else if file_name_str.to_lowercase().contains("desktop.ini") {
-			return Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
-		} else if file_name_str == "\\AutoRun.inf" {
-			return Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
-		} else if file_name_str.matches("\\").count() == 1 {
-			let shares = self.filestation_filesystem.filestation.list_shares();
-			return match shares {
-				Ok(res) => {
-					file_name_str = file_name_str.replace("\\", "/");
 
-					for share in res.shares.iter() {
-						if share.path == file_name_str {
-							return Ok(WindowsFileSystemEntry {
-								attributes: winnt::FILE_ATTRIBUTE_DIRECTORY,
-								creation_time: epoch_from_seconds(share.additional.time.crtime),
-								last_access_time: epoch_from_seconds(share.additional.time.atime),
-								last_write_time: epoch_from_seconds(share.additional.time.mtime),
-								file_size: 0,
-								is_dir: true
-							});
-						}
-					}
-
-					return Err(-1);
-				},
-				Err(error) => {
-					if error == 408 {
-						Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)
-					} else {
-						Err(error)
-					}
-				}
-			}
-		} else {
-			file_name_str = file_name_str.replace("\\", "/");
-
-			let files_result = self.filestation_filesystem.filestation.get_info_for_path(&file_name_str);
-			return match files_result {
-				Ok(file) => {
-					let attributes: u32;
-					let mut file_size: u64 = 0;
-					if file.isdir {
-						attributes = winnt::FILE_ATTRIBUTE_DIRECTORY;
-					} else {
-						attributes = winnt::FILE_ATTRIBUTE_NORMAL;
-						file_size = file.additional.size;
-					}
-
-					return Ok(WindowsFileSystemEntry {
-							attributes,
-							creation_time: epoch_from_seconds(file.additional.time.crtime),
-							last_access_time: epoch_from_seconds(file.additional.time.atime),
-							last_write_time: epoch_from_seconds(file.additional.time.mtime),
-							file_size,
-							is_dir: file.isdir
-					});
-				},
-				Err(error) => Err(error)
-			}
+				Ok(WindowsFileSystemEntry {
+					attributes: attributes,
+					creation_time: info.crtime,
+					last_access_time: info.atime,
+					last_write_time: info.mtime,
+					file_size: file_size,
+					is_dir: info.is_dir
+				})
+			},
+			Err(error) => Err(error)
 		}
 	}
 }
