@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Mutex};
 use serde::de::DeserializeOwned;
 use urlencoding::encode;
 
@@ -127,7 +127,10 @@ impl FileStation {
         let mut additional = HashMap::new();
         additional.insert("session", "FileStation");
 
-        self.get("SYN.API.Auth", 1, "logout", &additional)
+        let result = self.get("SYN.API.Auth", 1, "logout", &additional);
+        // self.sid = Default::default();
+
+        return result;
     }
 
     fn get<T: DeserializeOwned>(&self, api: &str, version: u8, method: &str, additional: &HashMap<&str, &str>) -> Result<T, i32> {
