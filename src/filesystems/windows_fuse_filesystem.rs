@@ -65,6 +65,12 @@ impl WindowsFileSystemHandler {
 
 		match info_result {
 			Ok(info) => {
+				if file_name.to_lowercase().contains("desktop.ini") {
+					return Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+				} else if file_name == "\\AutoRun.inf" {
+					return Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+				}
+
 				let attributes: u32;
 				let mut file_size: u64 = 0;
 				if info.is_dir {
@@ -83,7 +89,13 @@ impl WindowsFileSystemHandler {
 					is_dir: info.is_dir
 				})
 			},
-			Err(error) => Err(error)
+			Err(error) => {
+				if error == 408 {
+					return Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+				}
+
+				return Err(error);
+			}
 		}
 	}
 }
