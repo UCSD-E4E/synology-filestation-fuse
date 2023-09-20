@@ -5,15 +5,45 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "type": "cppvsdbg",
+            "type": "lldb",
             "request": "launch",
-            "name": "Debug",
-            "preLaunchTask": "cargo build",
-            "program": "${workspaceRoot}/target/debug/synology-filestation-fuse.exe",
+            "name": "Debug executable 'synology-filestation-fuse'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=synology-filestation-fuse",
+                    "--package=synology-filestation-fuse"
+                ],
+                "filter": {
+                    "name": "synology-filestation-fuse",
+                    "kind": "bin"
+                }
+            },
             "args": [
                 "--debug"
             ],
-            "cwd": "${workspaceRoot}"
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'synology-filestation-fuse'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=synology-filestation-fuse",
+                    "--package=synology-filestation-fuse"
+                ],
+                "filter": {
+                    "name": "synology-filestation-fuse",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--debug"
+            ],
+            "cwd": "${workspaceFolder}"
         }
     ]
 }
