@@ -23,16 +23,14 @@ pub struct UnixFuseFileSystem {
     hostname: String,
     port: u16,
     secured: bool,
-    version: u8,
 }
 
 impl FuseFileSystem for UnixFuseFileSystem {
-    fn new(hostname: &str, port: u16, secured: bool, version: u8, _debug: bool) -> UnixFuseFileSystem {
+    fn new(hostname: &str, port: u16, secured: bool, _debug: bool) -> UnixFuseFileSystem {
         UnixFuseFileSystem {
             hostname: hostname.to_string(),
             port,
-            secured,
-            version,
+            secured
         }
     }
 
@@ -41,7 +39,6 @@ impl FuseFileSystem for UnixFuseFileSystem {
             &self.hostname,
             self.port,
             self.secured,
-            self.version
         );
         filestation_filesystem.login(username, password).unwrap();
 

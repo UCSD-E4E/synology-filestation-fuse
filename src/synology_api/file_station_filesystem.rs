@@ -20,9 +20,9 @@ pub struct FileStationFileSystem {
 }
 
 impl FileStationFileSystem {
-    pub fn new(hostname: &str, port: u16, secured: bool, version: u8) -> FileStationFileSystem {
+    pub fn new(hostname: &str, port: u16, secured: bool) -> FileStationFileSystem {
         FileStationFileSystem {
-            filestation: FileStation::new(hostname, port, secured, version)
+            filestation: FileStation::new(hostname, port, secured)
         }
     }
     

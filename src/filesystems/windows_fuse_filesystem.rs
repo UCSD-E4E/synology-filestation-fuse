@@ -331,18 +331,16 @@ pub struct WindowsFuseFileSystem {
     hostname: String,
     port: u16,
     secured: bool,
-    version: u8,
     mount_point: Option<UCString<u16>>,
 	debug: bool,
 }
 
 impl FuseFileSystem for WindowsFuseFileSystem {
-    fn new(hostname: &str, port: u16, secured: bool, version: u8, debug: bool) -> WindowsFuseFileSystem {
+    fn new(hostname: &str, port: u16, secured: bool, debug: bool) -> WindowsFuseFileSystem {
         WindowsFuseFileSystem {
             hostname: hostname.to_string(),
             port,
             secured,
-            version,
             mount_point: Default::default(),
 			debug
         }
@@ -358,8 +356,7 @@ impl FuseFileSystem for WindowsFuseFileSystem {
         let filestation_filesystem = FileStationFileSystem::new(
             &self.hostname,
             self.port,
-            self.secured,
-            self.version
+            self.secured
         );
 
 		let username_string = username.to_string();

@@ -13,23 +13,21 @@ fn pause() {
 }
 
 #[cfg(target_family = "windows")]
-fn init_fuse_filesystem(hostname: &str, port: u16, secured: bool, version: u8, debug_mode: bool) -> filesystems::WindowsFuseFileSystem {
+fn init_fuse_filesystem(hostname: &str, port: u16, secured: bool, debug_mode: bool) -> filesystems::WindowsFuseFileSystem {
     filesystems::WindowsFuseFileSystem::new(
         hostname,
         port,
         secured,
-        version,
         debug_mode
     )
 }
 
 #[cfg(target_family = "unix")]
-fn init_fuse_filesystem(hostname: &str, port: u16, secured: bool, version: u8, debug_mode: bool) -> filesystems::UnixFuseFileSystem {
+fn init_fuse_filesystem(hostname: &str, port: u16, secured: bool, debug_mode: bool) -> filesystems::UnixFuseFileSystem {
     filesystems::UnixFuseFileSystem::new(
         hostname,
         port,
         secured,
-        version,
         debug_mode
     )
 }
@@ -42,7 +40,6 @@ fn main() {
     let hostname: String;
     let port: u16;
     let secured: bool;
-    let version: u8;
 
     let mountpoint: String;
     let username: String;
@@ -54,7 +51,6 @@ fn main() {
         hostname = env::var("SYNOLOGY_HOSTNAME").unwrap();
         port = env::var("SYNOLOGY_PORT").unwrap().parse::<u16>().unwrap();
         secured = env::var("SYNOLOGY_SECURED").unwrap().parse::<bool>().unwrap();
-        version = env::var("SYNOLOGY_VERSION").unwrap().parse::<u8>().unwrap();
 
         mountpoint = env::var("SYNOLOGY_MOUNTPOINT").unwrap();
         username = env::var("SYNOLOGY_USERNAME").unwrap();
@@ -63,7 +59,6 @@ fn main() {
         hostname = "".to_string();
         port = 0;
         secured = true;
-        version = 0;
 
         mountpoint = "".to_string();
         username = "".to_string();
@@ -74,7 +69,6 @@ fn main() {
         &hostname,
         port,
         secured,
-        version,
         debug_mode);
 
     println!("Mounting Synology NAS...");

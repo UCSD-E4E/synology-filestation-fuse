@@ -9,17 +9,16 @@ use super::responses::{FileStationItem, FileAdditional};
 pub struct FileStation {
     pub hostname: String,
     pub base_url: String,
-    pub version: u8,
 
     sid: Option<String>,
 }
 
 impl FileStation {
-    pub fn new(hostname: &str, port: u16, secured: bool, version: u8) -> Self {
+    pub fn new(hostname: &str, port: u16, secured: bool) -> Self {
         let protocol = if secured { "https" } else { "http" };
         let base_url = format!("{}://{}:{}", protocol, hostname, port);
 
-        FileStation { hostname: hostname.to_string(), base_url: base_url.to_string(), version, sid: Default::default() }
+        FileStation { hostname: hostname.to_string(), base_url: base_url.to_string(), sid: Default::default() }
     }
 
     pub fn get_info_for_path(&self, path: &str) -> Result<FileStationItem<FileAdditional>, i32> {
@@ -98,7 +97,7 @@ impl FileStation {
         let login_url = format!(
             "{}/webapi/auth.cgi?api=SYNO.API.Auth&version={}&method=login&account={}&passwd={}&session=FileStation&format=sid",
             self.base_url,
-            self.version,
+            3,
             username,
             password);
         let result = reqwest::blocking::get(login_url);
