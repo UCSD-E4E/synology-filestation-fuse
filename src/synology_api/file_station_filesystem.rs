@@ -1,13 +1,13 @@
 use super::FileStation;
 
 pub struct FileStationFileSystem {
-    file_station: FileStation,
+    pub filestation: FileStation,
 }
 
 impl FileStationFileSystem {
     pub fn new(hostname: &str, port: u16, secured: bool, version: u8) -> FileStationFileSystem {
         FileStationFileSystem {
-            file_station: FileStation::new(hostname, port, secured, version)
+            filestation: FileStation::new(hostname, port, secured, version)
         }
     }
 }

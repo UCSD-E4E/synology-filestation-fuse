@@ -7,10 +7,11 @@ use crate::synology_api::responses::{SynologyResult, LoginResult, ListSharesResu
 use super::responses::{FileStationItem, FileAdditional};
 
 pub struct FileStation {
-    hostname: String,
-    base_url: String,
+    pub hostname: String,
+    pub base_url: String,
+    pub version: u8,
+
     sid: Option<String>,
-    version: u8
 }
 
 impl FileStation {

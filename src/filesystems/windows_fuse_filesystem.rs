@@ -43,7 +43,6 @@ struct WindowsFileSystemEntry {
 
 struct WindowsFileSystemHandler {
     filestation_filesystem: FileStationFileSystem,
-	filestation: &FileStation
 }
 
 fn epoch_from_seconds(seconds: u64) -> SystemTime {
@@ -54,19 +53,18 @@ impl WindowsFileSystemHandler {
     fn new(filestation_filesystem: FileStationFileSystem) -> WindowsFileSystemHandler {
         WindowsFileSystemHandler {
 			filestation_filesystem, 
-			filestation: &filestation_filesystem.filestation 
 		}
     }
 
 	fn login(& mut self, username: &str, password: &str) -> Result<(), i32> {
-		self.filestation.login(username, password)
+		self.filestation_filesystem.filestation.login(username, password)
 	}
 
 	fn get_filesystem_entry(&self, file_name: &str) -> Result<WindowsFileSystemEntry, i32> {
 		let mut file_name_str = file_name.to_string();
 
 		if file_name_str == "\\" {
-			let shares = self.filestation.list_shares();
+			let shares = self.filestation_filesystem.filestation.list_shares();
 
 			return match shares {
 				Ok(res) => {
@@ -105,7 +103,7 @@ impl WindowsFileSystemHandler {
 		} else if file_name_str == "\\AutoRun.inf" {
 			return Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
 		} else if file_name_str.matches("\\").count() == 1 {
-			let shares = self.filestation.list_shares();
+			let shares = self.filestation_filesystem.filestation.list_shares();
 			return match shares {
 				Ok(res) => {
 					file_name_str = file_name_str.replace("\\", "/");
@@ -136,7 +134,7 @@ impl WindowsFileSystemHandler {
 		} else {
 			file_name_str = file_name_str.replace("\\", "/");
 
-			let files_result = self.filestation.get_info_for_path(&file_name_str);
+			let files_result = self.filestation_filesystem.filestation.get_info_for_path(&file_name_str);
 			return match files_result {
 				Ok(file) => {
 					let attributes: u32;
@@ -204,7 +202,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		) -> OperationResult<()> {
 		
 		if file_name.to_string().unwrap() == "\\" {
-			let shares = self.filestation.list_shares();
+			let shares = self.filestation_filesystem.filestation.list_shares();
 			return match shares {
 				Ok(res) => {
 					for share in res.shares.iter() {
@@ -234,7 +232,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 			}
 		}
 		
-		let files = self.filestation.list_files(&file_name.to_string().unwrap().replace("\\", "/"));
+		let files = self.filestation_filesystem.filestation.list_files(&file_name.to_string().unwrap().replace("\\", "/"));
 		match files {
 			Ok(res) => {
 				for file in res.files.iter() {
@@ -281,7 +279,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		&'h self,
 		_info: &OperationInfo<'c, 'h, Self>,
 	) -> OperationResult<DiskSpaceInfo> {
-		let shares = self.filestation.list_shares();
+		let shares = self.filestation_filesystem.filestation.list_shares();
 
 		match shares {
 			Ok(res) => {
@@ -349,7 +347,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		_info: &OperationInfo<'c, 'h, Self>,
 	) -> OperationResult<VolumeInfo> {
 		Ok(VolumeInfo {
-			name: U16CString::from_str(self.filestation.hostname.as_str()).unwrap(),
+			name: U16CString::from_str(self.filestation_filesystem.filestation.hostname.as_str()).unwrap(),
 			serial_number: 0,
 			max_component_length: 255,
 			fs_flags: winnt::FILE_CASE_PRESERVED_NAMES
@@ -386,7 +384,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 	}
 
     fn unmounted(&'h self, _info: &OperationInfo<'c, 'h, Self>) -> OperationResult<()> {
-        self.filestation.logout()
+        self.filestation_filesystem.filestation.logout()
 	}
 }
 
@@ -419,7 +417,7 @@ impl FuseFileSystem for WindowsFuseFileSystem {
 
         let unc_name = U16CString::from_str(self.hostname.as_str()).unwrap();
         let filestation_filesystem = FileStationFileSystem::new(
-            self.hostname,
+            &self.hostname,
             self.port,
             self.secured,
             self.version
