@@ -41,7 +41,7 @@ impl FileStationFileSystem {
 		let mut path2ino = self.path2ino.lock().unwrap();
 		let mut ino2path = self.ino2path.lock().unwrap();
 
-		let mut ino: u64;
+		let ino: u64;
 		if !path2ino.contains_key(path) {
 			ino = (path2ino.len() + 1) as u64;
 			path2ino.insert(path.to_string(), ino);
@@ -151,6 +151,61 @@ impl FileStationFileSystem {
 				},
 				Err(error) => Err(error)
 			}
+		}
+	}
+
+	pub fn list_files(&self, path: &str) -> Result<Vec<FileSystemInfo>, i32> {
+		if path == "/" {
+			let shares = self.filestation.list_shares();
+			return match shares {
+				Ok(res) => {
+					let mut found_files: Vec<FileSystemInfo> = Vec::new();
+
+					for share in res.shares.iter() {
+						found_files.push(FileSystemInfo {
+							atime: epoch_from_seconds(share.additional.time.atime),
+							crtime: epoch_from_seconds(share.additional.time.crtime),
+							ctime: epoch_from_seconds(share.additional.time.ctime),
+							mtime: epoch_from_seconds(share.additional.time.mtime),
+							size: 0,
+							ino: self.insert_ino(path),
+							is_dir: true
+						});
+					}
+
+					return Ok(found_files);
+				},
+				Err(error) => {
+					Err(error)
+				}
+			}
+		}
+		
+		let files = self.filestation.list_files(path);
+		match files {
+			Ok(res) => {
+				let mut found_files: Vec<FileSystemInfo> = Vec::new();
+
+				for file in res.files.iter() {
+					let mut file_size: u64 = 0;
+					if !file.isdir {
+						file_size = file.additional.size;
+					}
+
+					found_files.push(FileSystemInfo {
+						atime: epoch_from_seconds(file.additional.time.atime),
+						crtime: epoch_from_seconds(file.additional.time.crtime),
+						ctime: epoch_from_seconds(file.additional.time.ctime),
+						mtime: epoch_from_seconds(file.additional.time.mtime),
+						size: file_size,
+						ino: self.insert_ino(path),
+						is_dir: file.isdir
+					});
+				}
+
+				return Ok(found_files);
+			},
+			Err(error) => Err(error)
 		}
 	}
 

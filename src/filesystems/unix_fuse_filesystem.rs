@@ -37,13 +37,13 @@ impl Filesystem for UnixFileSystemHandler {
                     ino: info.ino,
                     size: info.size,
                     blocks: info.size,
-                    atime: systemtime2timespec(info.atime),                                  // 1970-01-01 00:00:00
+                    atime: systemtime2timespec(info.atime),
                     mtime: systemtime2timespec(info.mtime),
                     ctime: systemtime2timespec(info.ctime),
                     crtime: systemtime2timespec(info.crtime),
                     kind: FileType::Directory,
                     perm: 0o755,
-                    nlink: 2,
+                    nlink: 0,
                     uid: 501,
                     gid: 20,
                     rdev: 0,
@@ -59,6 +59,10 @@ impl Filesystem for UnixFileSystemHandler {
     }
 
     fn open(&mut self, _req: &fuse::Request, _ino: u64, _flags: u32, reply: fuse::ReplyOpen) {
+        reply.error(ENOSYS);
+    }
+
+    fn readdir(&mut self, _req: &fuse::Request, _ino: u64, _fh: u64, _offset: i64, reply: fuse::ReplyDirectory) {
         reply.error(ENOSYS);
     }
 }

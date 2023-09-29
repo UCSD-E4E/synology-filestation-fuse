@@ -140,6 +140,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 			_info: &OperationInfo<'c, 'h, Self>,
 			_context: &'c Self::Context,
 		) -> OperationResult<()> {
+		let result = self.filestation_filesystem.list_files(file_name.to_str().replace("/", "\\"));
 		
 		if file_name.to_string().unwrap() == "\\" {
 			let shares = self.filestation_filesystem.filestation.list_shares();
