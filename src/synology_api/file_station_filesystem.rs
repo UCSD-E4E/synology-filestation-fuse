@@ -42,13 +42,19 @@ impl FileStationFileSystem {
 		let mut path2ino = self.path2ino.lock().unwrap();
 		let mut ino2path = self.ino2path.lock().unwrap();
 
+		let mut path_str = path.to_string();
+		path_str = path_str.replace("//", "/");
+		if path_str.len() > 1 && path_str.ends_with("/") {
+			path_str = path_str.chars().take(path.len() - 1).skip(1).collect();
+		}
+
 		let ino: u64;
-		if !path2ino.contains_key(path) {
+		if !path2ino.contains_key(&path_str) {
 			ino = (path2ino.len() + 1) as u64;
-			path2ino.insert(path.to_string(), ino);
-			ino2path.insert(ino, path.to_string());
+			path2ino.insert(path_str.clone(), ino);
+			ino2path.insert(ino, path_str);
 		} else {
-			ino = path2ino[path];
+			ino = path2ino[&path_str];
 		}
 
 		drop(path2ino);
@@ -58,15 +64,20 @@ impl FileStationFileSystem {
 	}
 
 	#[cfg(target_family = "unix")]
-	pub fn get_info_for_ino(&self, ino: u64) -> Result<FileSystemInfo, i32> {
-		let ino2path = self.ino2path.lock().unwrap();
-		let path = ino2path[&ino].clone();
-		drop(ino2path);
+	pub fn get_path_for_ino(&self, ino: u64) -> Result<String, i32> {
+		let ino2path = self.ino2path.lock();
 
-		self.get_info_for_path(&path)
+		match ino2path {
+			Ok(map) => {
+				let path = map[&ino].clone();
+				drop(map);
+				Ok(path)
+			},
+			Err(_error) => Err(-1)
+		}
 	}
     
-    pub fn get_info_for_path(&self, file_name: &str) -> Result<FileSystemInfo, i32> {
+    pub fn get_info(&self, file_name: &str) -> Result<FileSystemInfo, i32> {
 		let file_name_str = file_name.to_string();
 
 		if file_name_str == "/" {
@@ -92,12 +103,15 @@ impl FileStationFileSystem {
 					}
 
 					let path2ino = self.path2ino.lock().unwrap();
+					let ino = path2ino[&file_name_str];
+					println!("ino: {} for {}", ino, file_name_str);
+
 					Ok(FileSystemInfo {
                         atime: epoch_from_seconds(atime),
                         ctime: epoch_from_seconds(ctime),
                         crtime: epoch_from_seconds(crtime),
                         mtime: epoch_from_seconds(mtime),
-						ino: path2ino[&file_name_str],
+						ino,
 						name: file_name_str,
 						size: 0,
 						is_dir: true,
@@ -114,6 +128,7 @@ impl FileStationFileSystem {
 					for share in res.shares.iter() {
 						if share.path == file_name_str {
 							let ino = self.insert_ino(&file_name_str);
+							println!("ino: {} for {}", ino, file_name_str);
 
 							return Ok(FileSystemInfo {
                                 atime: epoch_from_seconds(share.additional.time.atime),
@@ -137,6 +152,7 @@ impl FileStationFileSystem {
 			return match files_result {
 				Ok(file) => {
 					let ino = self.insert_ino(&file_name_str);
+					println!("ino: {} for {}", ino, file_name_str);
 
 					let mut size: u64 = 0;
 					if !file.isdir {
@@ -167,6 +183,9 @@ impl FileStationFileSystem {
 					let mut found_files: Vec<FileSystemInfo> = Vec::new();
 
 					for share in res.shares.iter() {
+						let ino = self.insert_ino(&share.path);
+						println!("ino: {} for {}", ino, share.name);
+
 						found_files.push(FileSystemInfo {
 							atime: epoch_from_seconds(share.additional.time.atime),
 							crtime: epoch_from_seconds(share.additional.time.crtime),
@@ -174,7 +193,7 @@ impl FileStationFileSystem {
 							mtime: epoch_from_seconds(share.additional.time.mtime),
 							name: share.name.to_string(),
 							size: 0,
-							ino: self.insert_ino(path),
+							ino,
 							is_dir: true
 						});
 					}
@@ -193,6 +212,9 @@ impl FileStationFileSystem {
 				let mut found_files: Vec<FileSystemInfo> = Vec::new();
 
 				for file in res.files.iter() {
+					let ino = self.insert_ino(&file.path);
+					println!("ino: {} for {}", ino, file.name);
+
 					let mut file_size: u64 = 0;
 					if !file.isdir {
 						file_size = file.additional.size;
@@ -205,7 +227,7 @@ impl FileStationFileSystem {
 						mtime: epoch_from_seconds(file.additional.time.mtime),
 						name: file.name.to_string(),
 						size: file_size,
-						ino: self.insert_ino(path),
+						ino,
 						is_dir: file.isdir
 					});
 				}
