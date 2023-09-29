@@ -279,7 +279,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 	}
 
     fn unmounted(&'h self, _info: &OperationInfo<'c, 'h, Self>) -> OperationResult<()> {
-        self.filestation_filesystem.filestation.logout()
+        self.filestation.logout()
 	}
 }
 

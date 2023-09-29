@@ -58,18 +58,18 @@ pub struct Time {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct Perm {
-    posix: u16,
-    acl: Acl
+    pub posix: u16,
+    pub acl: Acl
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct Acl {
-    append: bool,
-    del: bool,
-    exec: bool,
-    read: bool,
-    write: bool
+    pub append: bool,
+    pub del: bool,
+    pub exec: bool,
+    pub read: bool,
+    pub write: bool
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

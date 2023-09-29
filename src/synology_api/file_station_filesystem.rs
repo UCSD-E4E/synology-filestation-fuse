@@ -11,6 +11,8 @@ pub struct FileSystemInfo {
     pub ctime: SystemTime,
     pub crtime: SystemTime,
 
+	pub perm: u16,
+
 	pub name: String,
     pub is_dir: bool,
     pub size: u64,
@@ -18,7 +20,7 @@ pub struct FileSystemInfo {
 }
 
 pub struct FileStationFileSystem {
-    pub filestation: FileStation,
+    filestation: FileStation,
 	path2ino: Mutex<HashMap<String, u64>>,
 	ino2path: Mutex<HashMap<u64, String>>,
 }
@@ -111,6 +113,7 @@ impl FileStationFileSystem {
                         crtime: epoch_from_seconds(crtime),
                         mtime: epoch_from_seconds(mtime),
 						ino,
+						perm: 0o755,
 						name: file_name_str,
 						size: 0,
 						is_dir: true,
@@ -135,6 +138,7 @@ impl FileStationFileSystem {
                                 mtime: epoch_from_seconds(share.additional.time.mtime),
 								name: share.name.to_string(),
 								size: 0,
+								perm: share.additional.perm.posix,
 								is_dir: true,
 								ino
 							});
@@ -163,6 +167,7 @@ impl FileStationFileSystem {
                         mtime: epoch_from_seconds(file.additional.time.mtime),
 						name: file.name,
                         size,
+						perm: file.additional.perm.posix,
                         is_dir: file.isdir,
 						ino
 					});
@@ -190,6 +195,7 @@ impl FileStationFileSystem {
 							name: share.name.to_string(),
 							size: 0,
 							ino,
+							perm: share.additional.perm.posix,
 							is_dir: true
 						});
 					}
@@ -222,6 +228,7 @@ impl FileStationFileSystem {
 						mtime: epoch_from_seconds(file.additional.time.mtime),
 						name: file.name.to_string(),
 						size: file_size,
+						perm: file.additional.perm.posix,
 						ino,
 						is_dir: file.isdir
 					});
@@ -236,4 +243,8 @@ impl FileStationFileSystem {
     pub fn login(&mut self, username: &str, password: &str) -> Result<(), i32> {
         self.filestation.login(username, password)
     }
+
+	pub fn logout(&self) -> Result<(), i32> {
+		self.filestation.logout()
+	}
 }

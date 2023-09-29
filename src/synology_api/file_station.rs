@@ -58,7 +58,7 @@ impl FileStation {
         let encoded_path = encode(paths_str.as_str()).to_string();
         additional.insert("path", encoded_path.as_str());
         
-        let encoded_additional = encode("[\"size\",\"time\"]").to_string();
+        let encoded_additional = encode("[\"size\",\"time\",\"perm\"]").to_string();
         additional.insert("additional", encoded_additional.as_str());
 
         let result: Result<serde_json::Value, i32> = self.get("SYNO.FileStation.List", 2, "getinfo", &additional, true);

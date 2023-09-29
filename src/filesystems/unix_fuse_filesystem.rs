@@ -31,6 +31,10 @@ impl Filesystem for UnixFileSystemHandler {
         reply.error(ENOSYS);
     }
 
+    fn destroy(&mut self, _req: &fuse::Request) {
+        self.filestation_filesystem.logout().unwrap();
+    }
+
     fn getattr(&mut self, _req: &fuse::Request, ino: u64, reply: fuse::ReplyAttr) {
         let path_result = self.filestation_filesystem.get_path_for_ino(ino);
         if path_result.is_err() {
@@ -55,7 +59,7 @@ impl Filesystem for UnixFileSystemHandler {
                     ctime: systemtime2timespec(info.ctime),
                     crtime: systemtime2timespec(info.crtime),
                     kind: FileType::Directory,
-                    perm: 0o755,
+                    perm: info.perm,
                     nlink: 0,
                     uid: 501,
                     gid: 20,
@@ -105,7 +109,7 @@ impl Filesystem for UnixFileSystemHandler {
                 ctime: systemtime2timespec(info.ctime),
                 crtime: systemtime2timespec(info.crtime),
                 kind: file_type,
-                perm: 0o755,
+                perm: info.perm,
                 nlink: 0,
                 uid: 501,
                 gid: 20,
