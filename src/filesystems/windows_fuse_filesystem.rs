@@ -140,80 +140,42 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 			_info: &OperationInfo<'c, 'h, Self>,
 			_context: &'c Self::Context,
 		) -> OperationResult<()> {
-		let result = self.filestation_filesystem.list_files(file_name.to_str().replace("/", "\\"));
-		
-		if file_name.to_string().unwrap() == "\\" {
-			let shares = self.filestation_filesystem.filestation.list_shares();
-			return match shares {
-				Ok(res) => {
-					for share in res.shares.iter() {
-						let name = U16CString::from_str(share.name.as_str()).unwrap();
 
-						if is_name_in_expression(pattern, name, false) {
-							let result = fill_find_data(&FindData {
-								attributes: winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY,
-								creation_time: epoch_from_seconds(share.additional.time.crtime),
-								last_access_time: epoch_from_seconds(share.additional.time.atime),
-								last_write_time: epoch_from_seconds(share.additional.time.mtime),
-								file_size: 0,
-								file_name: U16CString::from_str(share.name.as_str()).unwrap()
-							});
+		let result = self.filestation_filesystem.list_files(
+			file_name.to_string().unwrap().replace("\\", "/").as_str());
 
-							if result.is_err() {
-								return Err(-2);
-							}
-						}
-					}
-
-					return Ok(());
-				},
-				Err(error) => {
-					Err(error)
-				}
-			}
-		}
-		
-		let files = self.filestation_filesystem.filestation.list_files(&file_name.to_string().unwrap().replace("\\", "/"));
-		match files {
-			Ok(res) => {
-				for file in res.files.iter() {
-					let name = U16CString::from_str(file.name.as_str()).unwrap();
+		return match result {
+			Ok(files) => {
+				for file in files.iter() {
+					let name = U16CString::from_str(&file.name).unwrap();
 
 					let attributes: u32;
-					let mut file_size: u64 = 0;
-					if file.isdir {
+					if file.is_dir {
 						attributes = winnt::FILE_ATTRIBUTE_DIRECTORY;
 					} else {
 						attributes = winnt::FILE_ATTRIBUTE_NORMAL;
-						file_size = file.additional.size;
 					}
 
 					if is_name_in_expression(pattern, name, false) {
 						let result = fill_find_data(&FindData {
 							attributes,
-							creation_time: epoch_from_seconds(file.additional.time.crtime),
-							last_access_time: epoch_from_seconds(file.additional.time.atime),
-							last_write_time: epoch_from_seconds(file.additional.time.mtime),
-							file_size,
+							creation_time: file.crtime,
+							last_access_time: file.atime,
+							last_write_time: file.mtime,
+							file_size: file.size,
 							file_name: U16CString::from_str(file.name.as_str()).unwrap()
 						});
 
 						if result.is_err() {
-							return Err(-3);
+							return Err(-2);
 						}
 					}
 				}
 
 				return Ok(());
 			},
-			Err(error) => {
-				if error == 408 {
-					return Err(winapi::shared::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)
-				}
-				
-				return Err(error);
-			}
-		}
+			Err(error) => Err(error)
+		};
 	}
 
     fn get_disk_free_space(
@@ -364,10 +326,17 @@ impl FuseFileSystem for WindowsFuseFileSystem {
 		let username_string = username.to_string();
 		let password_string = password.to_string();
 
+		let debug = self.debug;
+
         let executor = move || {
             let mut handler = WindowsFileSystemHandler::new(filestation_filesystem);
+			let mut flags = MountFlags::ALT_STREAM | MountFlags::STDERR | MountFlags::NETWORK;
+			if debug {
+				flags |= MountFlags::DEBUG;
+			}			
+
             let options = MountOptions {
-                flags: MountFlags::ALT_STREAM | MountFlags::DEBUG | MountFlags::STDERR | MountFlags::NETWORK,
+                flags,
                 unc_name: Some(unc_name.as_ref()),
                 ..Default::default()
             };

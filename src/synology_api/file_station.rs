@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::collections::HashMap;
 use serde::de::DeserializeOwned;
 use urlencoding::encode;
 

@@ -11,6 +11,7 @@ pub struct FileSystemInfo {
     pub ctime: SystemTime,
     pub crtime: SystemTime,
 
+	pub name: String,
     pub is_dir: bool,
     pub size: u64,
 	pub ino: u64,
@@ -56,6 +57,7 @@ impl FileStationFileSystem {
 		return ino;
 	}
 
+	#[cfg(target_family = "unix")]
 	pub fn get_info_for_ino(&self, ino: u64) -> Result<FileSystemInfo, i32> {
 		let ino2path = self.ino2path.lock().unwrap();
 		let path = ino2path[&ino].clone();
@@ -95,9 +97,10 @@ impl FileStationFileSystem {
                         ctime: epoch_from_seconds(ctime),
                         crtime: epoch_from_seconds(crtime),
                         mtime: epoch_from_seconds(mtime),
+						ino: path2ino[&file_name_str],
+						name: file_name_str,
 						size: 0,
 						is_dir: true,
-						ino: path2ino[&file_name_str]
 					})
 				},
 				Err(error) => {
@@ -117,6 +120,7 @@ impl FileStationFileSystem {
                                 ctime: epoch_from_seconds(share.additional.time.ctime),
                                 crtime: epoch_from_seconds(share.additional.time.crtime),
                                 mtime: epoch_from_seconds(share.additional.time.mtime),
+								name: share.name.to_string(),
 								size: 0,
 								is_dir: true,
 								ino
@@ -144,6 +148,7 @@ impl FileStationFileSystem {
                         ctime: epoch_from_seconds(file.additional.time.ctime),
                         crtime: epoch_from_seconds(file.additional.time.crtime),
                         mtime: epoch_from_seconds(file.additional.time.mtime),
+						name: file.name,
                         size,
                         is_dir: file.isdir,
 						ino
@@ -167,6 +172,7 @@ impl FileStationFileSystem {
 							crtime: epoch_from_seconds(share.additional.time.crtime),
 							ctime: epoch_from_seconds(share.additional.time.ctime),
 							mtime: epoch_from_seconds(share.additional.time.mtime),
+							name: share.name.to_string(),
 							size: 0,
 							ino: self.insert_ino(path),
 							is_dir: true
@@ -197,6 +203,7 @@ impl FileStationFileSystem {
 						crtime: epoch_from_seconds(file.additional.time.crtime),
 						ctime: epoch_from_seconds(file.additional.time.ctime),
 						mtime: epoch_from_seconds(file.additional.time.mtime),
+						name: file.name.to_string(),
 						size: file_size,
 						ino: self.insert_ino(path),
 						is_dir: file.isdir
