@@ -41,10 +41,6 @@ struct WindowsFileSystemEntry {
 	is_dir: bool,
 }
 
-fn epoch_from_seconds(seconds: u64) -> SystemTime {
-	SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
-}
-
 struct WindowsFileSystemHandler {
     filestation_filesystem: FileStationFileSystem,
 }
@@ -216,8 +212,6 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 	) -> OperationResult<FileInfo> {
 		let file_name_str = file_name.to_string().unwrap();
 
-		println!("file_name: {}", file_name_str);
-
 		match self.get_filesystem_entry(file_name_str.as_str()) {
 			Ok(file_entry) => Ok(FileInfo {
 				attributes: file_entry.attributes,
@@ -280,8 +274,6 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 			context: &'c Self::Context,
 		) -> OperationResult<u32> {
 		let file_name_str = file_name.to_string().unwrap();
-
-		println!("file_name: {}", file_name_str);
 
 		return Ok(0);
 	}

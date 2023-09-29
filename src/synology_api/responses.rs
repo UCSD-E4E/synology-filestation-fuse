@@ -25,6 +25,7 @@ pub struct FileStationItem<T> {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct FileAdditional {
+    pub perm: Perm,
     pub size: u64,
     pub time: Time
 }
@@ -32,6 +33,7 @@ pub struct FileAdditional {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct ShareAdditional {
+    pub perm: Perm,
     pub time: Time,
     pub volume_status: VolumeStatus
 }
@@ -51,6 +53,23 @@ pub struct Time {
     pub mtime: u64,
     pub ctime: u64,
     pub crtime: u64
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct Perm {
+    posix: u16,
+    acl: Acl
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct Acl {
+    append: bool,
+    del: bool,
+    exec: bool,
+    read: bool,
+    write: bool
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

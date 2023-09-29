@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Mutex, time::{Duration, SystemTime}};
 use serde::de::DeserializeOwned;
 use urlencoding::encode;
+use log::{debug, error};
 
 use crate::synology_api::responses::{SynologyResult, LoginResult, ListSharesResult, ListFilesResult};
 
@@ -75,7 +76,7 @@ impl FileStation {
                 return match parsed_result {
                     Ok(parsed) => Ok(parsed),
                     Err(error) => {
-                        println!("Error: {} with json: {}", error, value_str);
+                        error!("Error: {} with json: {}", error, value_str);
 
                         Err(-4)
                     }
@@ -92,7 +93,7 @@ impl FileStation {
         additional.insert("folder_path", encoded_path.as_str());
 
         
-        let encoded_additional = encode("[\"size\",\"time\"]").to_string();
+        let encoded_additional = encode("[\"size\",\"time\",\"perm\"]").to_string();
         additional.insert("additional", encoded_additional.as_str());
 
         self.get("SYNO.FileStation.List", 2, "list", &additional, true)
@@ -101,7 +102,7 @@ impl FileStation {
     pub fn list_shares(&self) -> Result<ListSharesResult, i32> {
         let mut additional = HashMap::new();
 
-        let encoded_additional = encode("[\"volume_status\",\"time\"]").to_string();
+        let encoded_additional = encode("[\"volume_status\",\"time\",\"perm\"]").to_string();
         additional.insert("additional", encoded_additional.as_str());
 
         self.get("SYNO.FileStation.List", 2, "list_share", &additional, true)
@@ -159,13 +160,11 @@ impl FileStation {
                     sid
                 );
 
-                println!("url: {}", url);
-
                 for (key, value) in &*additional {
                     url += format!("&{}={}", key, value).as_ref();
                 }
 
-                println!("url = {}", url);
+                debug!("url: {}", url);
 
                 let mut cache = self.cache.lock().unwrap();
                 if !allow_cache || !cache.contains_key(url.as_str()) || cache[url.as_str()].cache_time.elapsed().unwrap() > self.cache_lifetime {
@@ -191,7 +190,7 @@ impl FileStation {
                                                 cache.insert(url, FileStationCacheItem { cache_time: request_time, data: value.clone() });
 
                                                 if !value["success"].as_bool().unwrap() {
-                                                    println!("success: false with json '{}'.", text);
+                                                    error!("success: false with json '{}'.", text);
     
                                                     Err(value["error"].as_object().unwrap()["code"].as_i64().unwrap() as i32)
                                                 } else {
@@ -200,7 +199,7 @@ impl FileStation {
                                                     match parsed_result {
                                                         Ok(parsed) => Ok(parsed.data),
                                                         Err(error) => {
-                                                            println!("err: {} with json '{}'.", error, text);
+                                                            error!("err: {} with json '{}'.", error, text);
     
                                                             Err(-7)
                                                         } 
@@ -208,14 +207,14 @@ impl FileStation {
                                                 }
                                             },
                                             Err(error) => {
-                                                println!("err: {} with json '{}'.", error, text);
+                                                error!("err: {} with json '{}'.", error, text);
     
                                                 Err(-8)
                                             }
                                         }
                                     },
                                     Err(error) => {
-                                        println!("err: {}", error);
+                                        error!("{}", error);
                                         Err(-9)
                                     }
                                 }
@@ -227,13 +226,13 @@ impl FileStation {
                         Err(error) => Err(error.status().unwrap().as_u16() as i32)
                     }
                 } else {
-                    println!("Using cache...");
+                    debug!("Using cache for url: {}.", url);
                     let parsed_result = serde_json::from_value::<SynologyResult<T>>(cache[url.as_str()].data.clone());
     
                     match parsed_result {
                         Ok(parsed) => Ok(parsed.data),
                         Err(error) => {
-                            println!("err: {} with cached json.", error);
+                            error!("err: {} with cached json.", error);
 
                             Err(-7)
                         } 

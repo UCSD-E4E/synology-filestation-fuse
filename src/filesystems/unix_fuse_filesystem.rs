@@ -77,7 +77,6 @@ impl Filesystem for UnixFileSystemHandler {
         
         let mut path = format!("{}/{}", parent_path, name.to_str().unwrap());
         path = path.replace("//", "/");
-        println!("lookup path: {}", path);
 
         let info_result = self.filestation_filesystem.get_info(&path);
 
@@ -131,8 +130,6 @@ impl Filesystem for UnixFileSystemHandler {
             return;
         }
         let path: String = path_result.unwrap();
-
-        println!("offset: {}", offset);
 
         let result = self.filestation_filesystem.list_files(&path);
         match result {

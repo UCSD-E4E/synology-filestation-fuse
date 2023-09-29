@@ -1,5 +1,8 @@
+extern crate pretty_env_logger;
+
 use std::env;
 use std::io::{stdin, stdout, Read, Write};
+use log::info;
 use filesystems::FuseFileSystem;
 
 mod filesystems;
@@ -33,6 +36,8 @@ fn init_fuse_filesystem(hostname: &str, port: u16, secured: bool, debug_mode: bo
 }
 
 fn main() {
+    pretty_env_logger::init();
+
     let args: Vec<String> = env::args().collect();
 
     let debug_mode = args[1] == "--debug";
@@ -46,7 +51,7 @@ fn main() {
     let password: String;
 
     if debug_mode {
-        println!("Running in debug mode...");
+        info!("Running in debug mode...");
 
         hostname = env::var("SYNOLOGY_HOSTNAME").unwrap();
         port = env::var("SYNOLOGY_PORT").unwrap().parse::<u16>().unwrap();
@@ -71,7 +76,7 @@ fn main() {
         secured,
         debug_mode);
 
-    println!("Mounting Synology NAS...");
+    info!("Mounting Synology NAS...");
 
     fuse_fileystem.mount(&mountpoint, &username, &password);
 
@@ -80,6 +85,6 @@ fn main() {
         pause();
     }
 
-    println!("Unmounting Synology NAS...");
+    info!("Unmounting Synology NAS...");
     fuse_fileystem.unmount();
 }
