@@ -85,8 +85,15 @@ impl Filesystem for UnixFileSystemHandler {
             reply.error(info_result.err().unwrap());
             return;
         }
-
         let info = info_result.unwrap();
+
+        let file_type: FileType;
+        if info.is_dir {
+            file_type = FileType::Directory;
+        } else {
+            file_type = FileType::RegularFile;
+        }
+
         let ttl: Timespec = Timespec::new(5, 0);
         reply.entry(
             &ttl,
@@ -98,7 +105,7 @@ impl Filesystem for UnixFileSystemHandler {
                 mtime: systemtime2timespec(info.mtime),
                 ctime: systemtime2timespec(info.ctime),
                 crtime: systemtime2timespec(info.crtime),
-                kind: FileType::Directory,
+                kind: file_type,
                 perm: 0o755,
                 nlink: 0,
                 uid: 501,
@@ -155,6 +162,8 @@ impl Filesystem for UnixFileSystemHandler {
 
                     return;
                 }
+
+                reply.ok();
             }
             Err(err) => reply.error(err)
         }

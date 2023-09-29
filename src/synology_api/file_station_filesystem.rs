@@ -29,7 +29,7 @@ impl FileStationFileSystem {
 		let ino2path = HashMap::new();
 
         let filestation_filesystem = FileStationFileSystem {
-            filestation: FileStation::new(hostname, port, secured),
+            filestation: FileStation::new(hostname, port, secured, Duration::from_secs(5)),
 			path2ino: Mutex::new(path2ino),
 			ino2path: Mutex::new(ino2path)
         };
@@ -104,7 +104,6 @@ impl FileStationFileSystem {
 
 					let path2ino = self.path2ino.lock().unwrap();
 					let ino = path2ino[&file_name_str];
-					println!("ino: {} for {}", ino, file_name_str);
 
 					Ok(FileSystemInfo {
                         atime: epoch_from_seconds(atime),
@@ -128,7 +127,6 @@ impl FileStationFileSystem {
 					for share in res.shares.iter() {
 						if share.path == file_name_str {
 							let ino = self.insert_ino(&file_name_str);
-							println!("ino: {} for {}", ino, file_name_str);
 
 							return Ok(FileSystemInfo {
                                 atime: epoch_from_seconds(share.additional.time.atime),
@@ -152,7 +150,6 @@ impl FileStationFileSystem {
 			return match files_result {
 				Ok(file) => {
 					let ino = self.insert_ino(&file_name_str);
-					println!("ino: {} for {}", ino, file_name_str);
 
 					let mut size: u64 = 0;
 					if !file.isdir {
@@ -184,7 +181,6 @@ impl FileStationFileSystem {
 
 					for share in res.shares.iter() {
 						let ino = self.insert_ino(&share.path);
-						println!("ino: {} for {}", ino, share.name);
 
 						found_files.push(FileSystemInfo {
 							atime: epoch_from_seconds(share.additional.time.atime),
@@ -213,7 +209,6 @@ impl FileStationFileSystem {
 
 				for file in res.files.iter() {
 					let ino = self.insert_ino(&file.path);
-					println!("ino: {} for {}", ino, file.name);
 
 					let mut file_size: u64 = 0;
 					if !file.isdir {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Mutex, time::{Duration, SystemTime}};
 use serde::de::DeserializeOwned;
 use urlencoding::encode;
 
@@ -6,19 +6,33 @@ use crate::synology_api::responses::{SynologyResult, LoginResult, ListSharesResu
 
 use super::responses::{FileStationItem, FileAdditional};
 
+
+struct FileStationCacheItem {
+    cache_time: SystemTime,
+    data: serde_json::Value
+}
+
 pub struct FileStation {
     pub hostname: String,
     pub base_url: String,
 
+    cache: Mutex<HashMap<String, FileStationCacheItem>>,
+    cache_lifetime: Duration,
     sid: Option<String>,
 }
 
 impl FileStation {
-    pub fn new(hostname: &str, port: u16, secured: bool) -> Self {
+    pub fn new(hostname: &str, port: u16, secured: bool, cache_lifetime: Duration) -> Self {
         let protocol = if secured { "https" } else { "http" };
         let base_url = format!("{}://{}:{}", protocol, hostname, port);
 
-        FileStation { hostname: hostname.to_string(), base_url: base_url.to_string(), sid: Default::default() }
+        FileStation {
+            hostname: hostname.to_string(),
+            base_url: base_url.to_string(),
+            cache: Mutex::new(HashMap::new()),
+            cache_lifetime,
+            sid: Default::default()
+        }
     }
 
     pub fn get_info_for_path(&self, path: &str) -> Result<FileStationItem<FileAdditional>, i32> {
@@ -46,7 +60,7 @@ impl FileStation {
         let encoded_additional = encode("[\"size\",\"time\"]").to_string();
         additional.insert("additional", encoded_additional.as_str());
 
-        let result: Result<serde_json::Value, i32> = self.get("SYNO.FileStation.List", 2, "getinfo", &additional);
+        let result: Result<serde_json::Value, i32> = self.get("SYNO.FileStation.List", 2, "getinfo", &additional, true);
         match result {
             Ok(value) => {
                 for item in value["files"].as_array().unwrap().iter() {
@@ -81,7 +95,7 @@ impl FileStation {
         let encoded_additional = encode("[\"size\",\"time\"]").to_string();
         additional.insert("additional", encoded_additional.as_str());
 
-        self.get("SYNO.FileStation.List", 2, "list", &additional)
+        self.get("SYNO.FileStation.List", 2, "list", &additional, true)
     }
 
     pub fn list_shares(&self) -> Result<ListSharesResult, i32> {
@@ -90,7 +104,7 @@ impl FileStation {
         let encoded_additional = encode("[\"volume_status\",\"time\"]").to_string();
         additional.insert("additional", encoded_additional.as_str());
 
-        self.get("SYNO.FileStation.List", 2, "list_share", &additional)
+        self.get("SYNO.FileStation.List", 2, "list_share", &additional, true)
     }
 
     pub fn login(&mut self, username: &str, password: &str) -> Result<(), i32> {
@@ -127,13 +141,13 @@ impl FileStation {
         let mut additional = HashMap::new();
         additional.insert("session", "FileStation");
 
-        let result = self.get("SYN.API.Auth", 1, "logout", &additional);
+        let result = self.get("SYN.API.Auth", 1, "logout", &additional, false);
         // self.sid = Default::default();
 
         return result;
     }
 
-    fn get<T: DeserializeOwned>(&self, api: &str, version: u8, method: &str, additional: &HashMap<&str, &str>) -> Result<T, i32> {
+    fn get<T: DeserializeOwned>(&self, api: &str, version: u8, method: &str, additional: &HashMap<&str, &str>, allow_cache: bool) -> Result<T, i32> {
         match &self.sid {
             Some(sid) => {
                 let mut url = format!(
@@ -153,54 +167,77 @@ impl FileStation {
 
                 println!("url = {}", url);
 
-                let result = reqwest::blocking::get(url);
+                let mut cache = self.cache.lock().unwrap();
+                if !allow_cache || !cache.contains_key(url.as_str()) || cache[url.as_str()].cache_time.elapsed().unwrap() > self.cache_lifetime {
+                    // Remove the key if it is in the cache.  It's expired.
+                    if cache.contains_key(url.as_str()) {
+                        cache.remove(url.as_str());
+                    }
 
-                match result {
-                    Ok(res) => {
-                        if res.status() == 200 {
-                            let text_result = res.text();
+                    let request_time = SystemTime::now();
+                    let result = reqwest::blocking::get(url.clone());
 
-                            match text_result {
-                                Ok(text) => {
-                                    let value_result = serde_json::from_str::<serde_json::Value>(text.as_str());
+                    return match result {
+                        Ok(res) => {
+                            if res.status() == 200 {
+                                let text_result = res.text();
+    
+                                match text_result {
+                                    Ok(text) => {
+                                        let value_result = serde_json::from_str::<serde_json::Value>(text.as_str());
+    
+                                        match value_result {
+                                            Ok(value) => {
+                                                cache.insert(url, FileStationCacheItem { cache_time: request_time, data: value.clone() });
 
-                                    match value_result {
-                                        Ok(value) => {
-                                            if !value["success"].as_bool().unwrap() {
-                                                println!("success: false with json '{}'.", text);
-
-                                                Err(value["error"].as_object().unwrap()["code"].as_i64().unwrap() as i32)
-                                            } else {
-                                                let parsed_result = serde_json::from_value::<SynologyResult<T>>(value);
-
-                                                match parsed_result {
-                                                    Ok(parsed) => Ok(parsed.data),
-                                                    Err(error) => {
-                                                        println!("err: {} with json '{}'.", error, text);
-
-                                                        Err(-7)
-                                                    } 
+                                                if !value["success"].as_bool().unwrap() {
+                                                    println!("success: false with json '{}'.", text);
+    
+                                                    Err(value["error"].as_object().unwrap()["code"].as_i64().unwrap() as i32)
+                                                } else {
+                                                    let parsed_result = serde_json::from_value::<SynologyResult<T>>(value);
+    
+                                                    match parsed_result {
+                                                        Ok(parsed) => Ok(parsed.data),
+                                                        Err(error) => {
+                                                            println!("err: {} with json '{}'.", error, text);
+    
+                                                            Err(-7)
+                                                        } 
+                                                    }
                                                 }
+                                            },
+                                            Err(error) => {
+                                                println!("err: {} with json '{}'.", error, text);
+    
+                                                Err(-8)
                                             }
-                                        },
-                                        Err(error) => {
-                                            println!("err: {} with json '{}'.", error, text);
-
-                                            Err(-8)
                                         }
+                                    },
+                                    Err(error) => {
+                                        println!("err: {}", error);
+                                        Err(-9)
                                     }
-                                },
-                                Err(error) => {
-                                    println!("err: {}", error);
-                                    Err(-9)
                                 }
                             }
-                        }
-                        else {
-                            Err(res.status().as_u16() as i32)
-                        }
-                    },
-                    Err(error) => Err(error.status().unwrap().as_u16() as i32)
+                            else {
+                                Err(res.status().as_u16() as i32)
+                            }
+                        },
+                        Err(error) => Err(error.status().unwrap().as_u16() as i32)
+                    }
+                } else {
+                    println!("Using cache...");
+                    let parsed_result = serde_json::from_value::<SynologyResult<T>>(cache[url.as_str()].data.clone());
+    
+                    match parsed_result {
+                        Ok(parsed) => Ok(parsed.data),
+                        Err(error) => {
+                            println!("err: {} with cached json.", error);
+
+                            Err(-7)
+                        } 
+                    }
                 }
             },
             None => Err(403)
