@@ -36,6 +36,38 @@ impl FileStation {
         }
     }
 
+    pub fn download(&self, path: &str, buffer: &mut Vec<u8>) -> Result<(), i32> {
+        match &self.sid {
+            Some(sid) => {
+                let download_url = format!(
+                    "{}/webapi/entry.cgi?api={}&version={}&method={}&path={}&mode={}&_sid={}",
+                    self.base_url,
+                    "SYNO.FileStation.Download",
+                    2,
+                    "download",
+                    path,
+                    "download",
+                    sid);
+                let result = reqwest::blocking::get(download_url);
+
+                match result {
+                    Ok(res) => {
+                        if res.status() != 200 {
+                            return Err(res.status().as_u16() as i32);
+                        }
+
+                        let mut res_buffer = res.bytes().unwrap().to_vec();
+                        buffer.append(&mut res_buffer);
+
+                        Ok(())
+                    },
+                    Err(_err) => Err(-1)
+                }
+            },
+            None => Err(403)
+        }
+    }
+
     pub fn get_info_for_path(&self, path: &str) -> Result<FileStationItem<FileAdditional>, i32> {
         match self.get_info_for_paths(vec!(path)) {
             Ok(result) => Ok(result.files.first().unwrap().clone()),

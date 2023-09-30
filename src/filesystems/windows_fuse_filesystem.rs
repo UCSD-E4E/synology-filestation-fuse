@@ -270,16 +270,25 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 			file_name: &U16CStr,
 			offset: i64,
 			buffer: &mut [u8],
-			info: &OperationInfo<'c, 'h, Self>,
-			context: &'c Self::Context,
+			_info: &OperationInfo<'c, 'h, Self>,
+			_context: &'c Self::Context,
 		) -> OperationResult<u32> {
-		let file_name_str = file_name.to_string().unwrap();
+		let file_name_str = file_name.to_string().unwrap().replace("\\", "/");
 
-		return Ok(0);
+		let result = self.filestation_filesystem.read_bytes(&file_name_str, offset as u64, buffer);
+
+		match result {
+			Ok(size) => {
+				println!("offset: {}, size: {}", offset, size);
+		
+				Ok(size as u32)
+			},
+			Err(error) => Err(error)
+		}
 	}
 
     fn unmounted(&'h self, _info: &OperationInfo<'c, 'h, Self>) -> OperationResult<()> {
-        self.filestation.logout()
+        self.filestation_filesystem.logout()
 	}
 }
 
@@ -321,7 +330,7 @@ impl FuseFileSystem for WindowsFuseFileSystem {
 		let debug = self.debug;
 
         let executor = move || {
-            let mut handler = WindowsFileSystemHandler::new(filestation_filesystem);
+            let mut handler = WindowsFileSystemHandler::new(filestation_filesystem.unwrap());
 			let mut flags = MountFlags::ALT_STREAM | MountFlags::STDERR | MountFlags::NETWORK;
 			if debug {
 				flags |= MountFlags::DEBUG;
