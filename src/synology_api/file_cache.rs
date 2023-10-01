@@ -93,7 +93,7 @@ impl FileCache {
 			Ok(connection) => {
 				match fs::File::create(self.get_cache_path(info)) {
 					Ok(file) => {
-						let query = "INSERT INTO cached_files VALUES (?, ?, ?)";
+						let query = "INSERT INTO cached_files VALUES (?, ?, ?, ?)";
 						connection
 							.prepare(query)
 							.unwrap()
@@ -103,6 +103,8 @@ impl FileCache {
 							.bind((2, info.mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64))
 							.unwrap()
 							.bind((3, info.size as i64))
+                            .unwrap()
+							.bind((4, SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64))
                             .unwrap()
 							.next();
 
@@ -213,7 +215,7 @@ impl FileCache {
 			return current_version;
 		}
 
-		let query = "CREATE TABLE cached_files (path TEXT, mtime INTEGER, size INTEGER);";
+		let query = "CREATE TABLE cached_files (path TEXT, mtime INTEGER, size INTEGER, last_access INTEGER);";
 		connection.execute(query).unwrap();
 
 		self.set_sqlite_version(connection, 1)
