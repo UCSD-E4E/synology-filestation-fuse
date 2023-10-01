@@ -68,14 +68,14 @@ impl FileStation {
         }
     }
 
-    pub fn get_info_for_path(&self, path: &str) -> Result<FileStationItem<FileAdditional>, i32> {
-        match self.get_info_for_paths(vec!(path)) {
+    pub async fn get_info_for_path(&self, path: &str) -> Result<FileStationItem<FileAdditional>, i32> {
+        match self.get_info_for_paths(vec!(path)).await {
             Ok(result) => Ok(result.files.first().unwrap().clone()),
             Err(error) => Err(error)
         }
     }
 
-    pub fn get_info_for_paths(&self, paths: Vec<&str>) -> Result<ListFilesResult, i32> {
+    pub async fn get_info_for_paths(&self, paths: Vec<&str>) -> Result<ListFilesResult, i32> {
         let mut paths_str = "".to_string();
         paths_str += paths.first().unwrap();
 
@@ -93,7 +93,7 @@ impl FileStation {
         let encoded_additional = encode("[\"size\",\"time\",\"perm\"]").to_string();
         additional.insert("additional", encoded_additional.as_str());
 
-        let result: Result<serde_json::Value, i32> = self.get("SYNO.FileStation.List", 2, "getinfo", &additional, true);
+        let result: Result<serde_json::Value, i32> = self.get("SYNO.FileStation.List", 2, "getinfo", &additional, true).await;
         match result {
             Ok(value) => {
                 for item in value["files"].as_array().unwrap().iter() {
@@ -118,7 +118,7 @@ impl FileStation {
         }
     }
 
-    pub fn list_files(&self, path: &str) -> Result<ListFilesResult, i32> {
+    pub async fn list_files(&self, path: &str) -> Result<ListFilesResult, i32> {
         let mut additional = HashMap::new();
 
         let encoded_path = encode(path).to_string();
@@ -128,31 +128,31 @@ impl FileStation {
         let encoded_additional = encode("[\"size\",\"time\",\"perm\"]").to_string();
         additional.insert("additional", encoded_additional.as_str());
 
-        self.get("SYNO.FileStation.List", 2, "list", &additional, true)
+        self.get("SYNO.FileStation.List", 2, "list", &additional, true).await
     }
 
-    pub fn list_shares(&self) -> Result<ListSharesResult, i32> {
+    pub async fn list_shares(&self) -> Result<ListSharesResult, i32> {
         let mut additional = HashMap::new();
 
         let encoded_additional = encode("[\"volume_status\",\"time\",\"perm\"]").to_string();
         additional.insert("additional", encoded_additional.as_str());
 
-        self.get("SYNO.FileStation.List", 2, "list_share", &additional, true)
+        self.get("SYNO.FileStation.List", 2, "list_share", &additional, true).await
     }
 
-    pub fn login(&mut self, username: &str, password: &str) -> Result<(), i32> {
+    pub async fn login(&mut self, username: &str, password: &str) -> Result<(), i32> {
         let login_url = format!(
             "{}/webapi/auth.cgi?api=SYNO.API.Auth&version={}&method=login&account={}&passwd={}&session=FileStation&format=sid",
             self.base_url,
             3,
             username,
             password);
-        let result = reqwest::blocking::get(login_url);
+        let result = reqwest::get(login_url).await;
 
         match result {
             Ok(res) => {
                 if res.status() == 200 {
-                    let login_result = res.json::<SynologyResult<LoginResult>>().unwrap();
+                    let login_result = res.json::<SynologyResult<LoginResult>>().await.unwrap();
                     
                     if login_result.success {
                         self.sid = Some(login_result.data.sid);
@@ -170,17 +170,17 @@ impl FileStation {
         }
     }
 
-    pub fn logout(&self) -> Result<(), i32> {
+    pub async fn logout(&self) -> Result<(), i32> {
         let mut additional = HashMap::new();
         additional.insert("session", "FileStation");
 
-        let result = self.get("SYN.API.Auth", 1, "logout", &additional, false);
+        let result = self.get("SYN.API.Auth", 1, "logout", &additional, false).await;
         // self.sid = Default::default();
 
         return result;
     }
 
-    fn get<T: DeserializeOwned>(&self, api: &str, version: u8, method: &str, additional: &HashMap<&str, &str>, allow_cache: bool) -> Result<T, i32> {
+    async fn get<T: DeserializeOwned>(&self, api: &str, version: u8, method: &str, additional: &HashMap<&str, &str>, allow_cache: bool) -> Result<T, i32> {
         match &self.sid {
             Some(sid) => {
                 let mut url = format!(
@@ -206,12 +206,12 @@ impl FileStation {
                     }
 
                     let request_time = SystemTime::now();
-                    let result = reqwest::blocking::get(url.clone());
+                    let result = reqwest::get(url.clone()).await;
 
                     return match result {
                         Ok(res) => {
                             if res.status() == 200 {
-                                let text_result = res.text();
+                                let text_result = res.text().await;
     
                                 match text_result {
                                     Ok(text) => {

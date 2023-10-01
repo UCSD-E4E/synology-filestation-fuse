@@ -965,6 +965,7 @@ dependencies = [
  "serde_json",
  "sqlite",
  "time 0.3.29",
+ "tokio",
  "urlencoding",
  "widestring",
  "winapi",

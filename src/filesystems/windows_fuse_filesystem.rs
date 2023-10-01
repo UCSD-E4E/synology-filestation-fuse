@@ -178,29 +178,14 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		&'h self,
 		_info: &OperationInfo<'c, 'h, Self>,
 	) -> OperationResult<DiskSpaceInfo> {
-		let shares = self.filestation_filesystem.filestation.list_shares();
-
-		match shares {
-			Ok(res) => {
-				let mut totalspace: u64 = 0;
-				let mut freespace: u64 = 0;
-
-				for share in res.shares.iter() {
-					if totalspace < share.additional.volume_status.totalspace {
-						totalspace = share.additional.volume_status.totalspace;
-						freespace = share.additional.volume_status.freespace;
-					}
-				}
-
-				Ok(DiskSpaceInfo {
+		match self.filestation_filesystem.get_free_space() {
+			Ok((totalspace, freespace)) => Ok(
+				DiskSpaceInfo {
 					byte_count: totalspace,
 					free_byte_count: freespace,
 					available_byte_count: freespace,
-				})
-			},
-			Err(error) => {
-				Err(error)
-			}
+			}),
+			Err(err) => Err(err)
 		}
 	}
 

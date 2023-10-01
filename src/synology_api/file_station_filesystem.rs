@@ -1,5 +1,6 @@
 use super::{FileStation, FileCache, epoch_from_seconds};
 use std::{time::{SystemTime, Duration}, collections::HashMap, sync::Mutex, io::{Error, Write}, fs::File};
+use tokio::runtime::{Runtime, Builder};
 use log::error;
 
 pub struct FileSystemInfo {
@@ -19,6 +20,7 @@ pub struct FileSystemInfo {
 
 pub struct FileStationFileSystem {
     pub filestation: FileStation,
+	runtime: Runtime,
 
 	path2ino: Mutex<HashMap<String, u64>>,
 	ino2path: Mutex<HashMap<u64, String>>,
@@ -32,11 +34,14 @@ impl FileStationFileSystem {
 				let path2ino = HashMap::new();
 				let ino2path = HashMap::new();
 
+				let mut builder = Builder::new_current_thread();
+
 				let filestation_filesystem = FileStationFileSystem {
 					filestation: FileStation::new(hostname, port, secured, Duration::from_secs(5)),
 					path2ino: Mutex::new(path2ino),
 					ino2path: Mutex::new(ino2path),
-					file_cache: Mutex::new(filecache)
+					file_cache: Mutex::new(filecache),
+					runtime: builder.enable_io().build().unwrap(),
 				};
 				filestation_filesystem.insert_ino("/");
 				
@@ -84,12 +89,35 @@ impl FileStationFileSystem {
 			Err(_error) => Err(-1)
 		}
 	}
+
+	pub fn get_free_space(&self) -> Result<(u64, u64), i32> {
+		let shares = self.runtime.block_on(self.filestation.list_shares());
+
+		match shares {
+			Ok(res) => {
+				let mut totalspace: u64 = 0;
+				let mut freespace: u64 = 0;
+
+				for share in res.shares.iter() {
+					if totalspace < share.additional.volume_status.totalspace {
+						totalspace = share.additional.volume_status.totalspace;
+						freespace = share.additional.volume_status.freespace;
+					}
+				}
+
+				Ok((totalspace, freespace))
+			},
+			Err(error) => {
+				Err(error)
+			}
+		}
+	}
     
     pub fn get_info(&self, file_name: &str) -> Result<FileSystemInfo, i32> {
 		let file_name_str = file_name.to_string();
 
 		if file_name_str == "/" {
-			let shares = self.filestation.list_shares();
+			let shares = self.runtime.block_on(self.filestation.list_shares());
 
 			return match shares {
 				Ok(res) => {
@@ -131,7 +159,8 @@ impl FileStationFileSystem {
 				}
 			}
 		} else if file_name_str.matches("/").count() == 1 {
-			let shares = self.filestation.list_shares();
+			let shares = self.runtime.block_on(self.filestation.list_shares());
+
 			return match shares {
 				Ok(res) => {
 					for share in res.shares.iter() {
@@ -158,7 +187,8 @@ impl FileStationFileSystem {
 				Err(error) => Err(error)
 			}
 		} else {
-			let files_result = self.filestation.get_info_for_path(&file_name_str);
+			let files_result = self.runtime.block_on(self.filestation.get_info_for_path(&file_name_str));
+
 			return match files_result {
 				Ok(file) => {
 					let ino = self.insert_ino(&file_name_str);
@@ -188,7 +218,8 @@ impl FileStationFileSystem {
 
 	pub fn list_files(&self, path: &str) -> Result<Vec<FileSystemInfo>, i32> {
 		if path == "/" {
-			let shares = self.filestation.list_shares();
+			let shares = self.runtime.block_on(self.filestation.list_shares());
+
 			return match shares {
 				Ok(res) => {
 					let mut found_files: Vec<FileSystemInfo> = Vec::new();
@@ -218,7 +249,7 @@ impl FileStationFileSystem {
 			}
 		}
 		
-		let files = self.filestation.list_files(path);
+		let files = self.runtime.block_on(self.filestation.list_files(path));
 		match files {
 			Ok(res) => {
 				let mut found_files: Vec<FileSystemInfo> = Vec::new();
@@ -252,11 +283,11 @@ impl FileStationFileSystem {
 	}
 
     pub fn login(&mut self, username: &str, password: &str) -> Result<(), i32> {
-        self.filestation.login(username, password)
+        self.runtime.block_on(self.filestation.login(username, password))
     }
 
 	pub fn logout(&self) -> Result<(), i32> {
-		self.filestation.logout()
+		self.runtime.block_on(self.filestation.logout())
 	}
 
 	pub fn read_bytes(&self, path: &str, offset: u64, buffer: &mut [u8]) -> Result<u64, i32> {
