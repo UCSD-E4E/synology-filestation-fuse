@@ -111,7 +111,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		create_options: u32,
 		info: &mut OperationInfo<'c, 'h, Self>,
 	) -> OperationResult<CreateFileInfo<Self::Context>> {
-		let file_name_str = file_name.to_string().unwrap();
+		let file_name_str = file_name.to_string().unwrap().replace("\\", "/");
 		println!("file_name: {}", file_name_str);
 
 		match self.get_filesystem_entry(file_name_str.as_str()) {
