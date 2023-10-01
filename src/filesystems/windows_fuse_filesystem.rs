@@ -260,7 +260,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for WindowsFileSystemHandler {
 		) -> OperationResult<u32> {
 		let file_name_str = file_name.to_string().unwrap().replace("\\", "/");
 
-		let result = self.filestation_filesystem.read_bytes(&file_name_str, offset as u64, buffer);
+		let result = self.filestation_filesystem.read_bytes(&file_name_str, offset, buffer);
 
 		match result {
 			Ok(size) => {

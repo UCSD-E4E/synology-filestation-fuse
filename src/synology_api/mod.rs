@@ -1,4 +1,4 @@
-pub use self::file_station_filesystem::FileStationFileSystem;
+pub use self::file_station_filesystem::{FileStationFileSystem, FileSystemInfo};
 pub use self::file_station::FileStation;
 pub use self::file_cache::FileCache;
 pub use self::utils::epoch_from_seconds;

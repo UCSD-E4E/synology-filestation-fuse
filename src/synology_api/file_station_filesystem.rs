@@ -90,6 +90,7 @@ impl FileStationFileSystem {
 		}
 	}
 
+	#[cfg(target_family = "windows")]
 	pub fn get_free_space(&self) -> Result<(u64, u64), i32> {
 		let shares = self.runtime.block_on(self.filestation.list_shares());
 
@@ -290,7 +291,7 @@ impl FileStationFileSystem {
 		self.runtime.block_on(self.filestation.logout())
 	}
 
-	pub fn read_bytes(&self, path: &str, offset: u64, buffer: &mut [u8]) -> Result<u64, i32> {
+	pub fn read_bytes(&self, path: &str, offset: i64, buffer: &mut [u8]) -> Result<u64, i32> {
 		let cache = self.file_cache.lock().unwrap();
 		match self.get_info(path) {
 			Ok(info) => {
@@ -338,14 +339,14 @@ impl FileStationFileSystem {
 	}
 	
 	#[cfg(target_family = "unix")]
-	fn read_from_file(&self, file: &File, offset: u64, buffer: &mut [u8]) -> Result<usize, Error> {
+	fn read_from_file(&self, file: &File, offset: i64, buffer: &mut [u8]) -> Result<usize, Error> {
     use std::os::unix::prelude::FileExt;
 
-		file.read_at(buffer, offset)
+		file.read_at(buffer, offset as u64)
 	}
 
 	#[cfg(target_family = "windows")]
-	fn read_from_file(&self, file: &File, offset: u64, buffer: &mut [u8]) -> Result<usize, Error> {
+	fn read_from_file(&self, file: &File, offset: i64, buffer: &mut [u8]) -> Result<usize, Error> {
     use std::os::windows::prelude::FileExt;
 
 		file.seek_read(buffer, offset)

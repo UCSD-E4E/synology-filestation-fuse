@@ -1,20 +1,25 @@
 use crate::filesystems::FuseFileSystem;
-use crate::synology_api::FileStationFileSystem;
+use crate::synology_api::{FileStationFileSystem, FileSystemInfo};
 
-use std::{ffi::OsStr, time::Duration};
+use std::{ffi::OsStr, time::Duration, collections::HashMap};
 use fuser::{FileType, FileAttr, Filesystem, MountOption};
-use libc::{ENOSYS, ENOENT};
+use libc::{ENOSYS, ENOENT, EEXIST};
+use log::error;
 
 struct UnixFileSystemHandler {
     filestation_filesystem: FileStationFileSystem,
-    block_size: u32
+    block_size: u32,
+    next_handle: u64,
+    file_handles: HashMap<u64, FileSystemInfo>
 }
 
 impl UnixFileSystemHandler {
     pub fn new(filestation_filesystem: FileStationFileSystem) -> UnixFileSystemHandler {
         UnixFileSystemHandler {
-            filestation_filesystem: filestation_filesystem,
-            block_size: 4096
+            filestation_filesystem,
+            block_size: 4096,
+            next_handle: 1,
+            file_handles: HashMap::new()
         }
     }
 
@@ -118,8 +123,48 @@ impl Filesystem for UnixFileSystemHandler {
             0);
     }
 
-    fn open(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        reply.opened(0, 0);
+    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+        let path = self.filestation_filesystem.get_path_for_ino(ino).unwrap();
+        
+        match self.filestation_filesystem.get_info(&path) {
+            Ok(info) => {
+                let handle = self.next_handle;
+                self.next_handle += 1;
+                self.file_handles.insert(handle, info);
+
+                reply.opened(handle, 0);
+            },
+            Err(error) => {
+                error!("An error occured while trying to open file. {}", error);
+                reply.error(error);
+            }
+        }
+    }
+
+    fn read(
+            &mut self,
+            _req: &fuser::Request<'_>,
+            ino: u64,
+            fh: u64,
+            offset: i64,
+            size: u32,
+            flags: i32,
+            lock_owner: Option<u64>,
+            reply: fuser::ReplyData,
+        ) {
+        
+        if !self.file_handles.contains_key(&fh) {
+            reply.error(EEXIST);
+            return;
+        }
+
+        let info = &self.file_handles[&fh];
+
+        let mut buffer = vec![0 as u8; size as usize];
+        match self.filestation_filesystem.read_bytes(&info.path, offset, &mut buffer) {
+            Ok(_size) => reply.data(&buffer),
+            Err(error) => reply.error(error)
+        }
     }
 
     fn readdir(
