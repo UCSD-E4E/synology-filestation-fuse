@@ -195,7 +195,7 @@ impl FuseFileSystem for UnixFuseFileSystem {
             &self.hostname,
             self.port,
             self.secured,
-        );
+        ).unwrap();
         filestation_filesystem.login(username, password).unwrap();
 
         let options = ["-o", "ro", "-o", "fsname=SYNO_FileStation"]

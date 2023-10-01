@@ -304,6 +304,13 @@ impl FileStationFileSystem {
 			Err(error) => Err(error)
 		}
 	}
+	
+	#[cfg(target_family = "unix")]
+	fn read_from_file(&self, file: &File, offset: u64, buffer: &mut [u8]) -> Result<usize, Error> {
+    use std::os::unix::prelude::FileExt;
+
+		file.read_at(buffer, offset)
+	}
 
 	#[cfg(target_family = "windows")]
 	fn read_from_file(&self, file: &File, offset: u64, buffer: &mut [u8]) -> Result<usize, Error> {
