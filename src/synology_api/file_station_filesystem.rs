@@ -322,7 +322,7 @@ impl FileStationFileSystem {
 
 				match cache.get_file_cache(&info) {
 					Some(file) => {
-						match self.read_from_file(&file, offset, buffer) {
+						match self.read_from_file(&file, offset as u64, buffer) {
 							Ok(size) => Ok(size as u64),
 							Err(error) => {
 								error!("An error occurred: {}", error);
@@ -339,14 +339,14 @@ impl FileStationFileSystem {
 	}
 	
 	#[cfg(target_family = "unix")]
-	fn read_from_file(&self, file: &File, offset: i64, buffer: &mut [u8]) -> Result<usize, Error> {
+	fn read_from_file(&self, file: &File, offset: u64, buffer: &mut [u8]) -> Result<usize, Error> {
     use std::os::unix::prelude::FileExt;
 
-		file.read_at(buffer, offset as u64)
+		file.read_at(buffer, offset)
 	}
 
 	#[cfg(target_family = "windows")]
-	fn read_from_file(&self, file: &File, offset: i64, buffer: &mut [u8]) -> Result<usize, Error> {
+	fn read_from_file(&self, file: &File, offset: u64, buffer: &mut [u8]) -> Result<usize, Error> {
     use std::os::windows::prelude::FileExt;
 
 		file.seek_read(buffer, offset)
