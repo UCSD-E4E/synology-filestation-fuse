@@ -81,6 +81,7 @@ impl FileCache {
 
 	pub fn get_file_cache(&self, info: &FileSystemInfo) -> Option<fs::File> {
 		if self.is_file_cached(info) {
+			self.update_cache_access_time(info).unwrap();
 			let file = fs::File::open(self.get_cache_path(info)).unwrap();
 			return Some(file);
 		}
@@ -125,20 +126,39 @@ impl FileCache {
 		}
 	}
 
-	fn get_cache_path(&self, info: &FileSystemInfo) -> PathBuf {
-		let mut path = self.root.clone();
+	fn update_cache_access_time(&self, info: &FileSystemInfo) -> Result<(), i32> {
+		match self.get_sqlite_connection() {
+			Ok(connection) => {
+				let update_query = "
+				UPDATE cached_files
+				SET last_access = ?
+				WHERE path = ?
+				";
+				connection
+					.prepare(update_query)
+					.unwrap()
+					.into_iter()
+					.bind((1, SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64))
+					.unwrap()
+					.bind((2, info.path.as_str()))
+					.unwrap()
+					.next();
 
-		for part in info.path.split("/").into_iter() {
-			path.push(part);
+				Ok(())
+			},
+			Err(error) => {
+				error!("An error occurred while updating the file cache access time: {}", error);
+
+				Err(-1)
+			}
 		}
-		fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-		path
 	}
 
 	fn delete_cache_entry(&self, info: &FileSystemInfo) -> Result<(), i32> {
 		match self.get_sqlite_connection() {
 			Ok(connection) => {
+				let path = self.get_cache_path(info);
+
 				// Remove the invalid cache entry.
 				let delete_query = "DELETE FROM cached_files WHERE path = ?";
 				connection
@@ -149,14 +169,32 @@ impl FileCache {
 					.unwrap()
 					.next();
 
-				Ok(())
+				match fs::remove_file(path) {
+					Ok(()) => Ok(()),
+					Err(error) => {
+						error!("An error occurred while deleting the file cache: {}", error);
+		
+						Err(-1)
+					}
+				}
 			},
 			Err(error) => {
-				error!("An error occurred while checking if the file is cached: {}", error);
+				error!("An error occurred while deleting the file cache: {}", error);
 
 				Err(-1)
 			}
 		}
+	}
+
+	fn get_cache_path(&self, info: &FileSystemInfo) -> PathBuf {
+		let mut path = self.root.clone();
+
+		for part in info.path.split("/").into_iter() {
+			path.push(part);
+		}
+		fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+		path
 	}
 
 	fn get_sqlite_connection(&self) -> Result<sqlite::Connection, sqlite::Error> {

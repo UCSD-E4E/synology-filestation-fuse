@@ -29,10 +29,6 @@ impl UnixFileSystemHandler {
 }
 
 impl Filesystem for UnixFileSystemHandler {
-    fn access(&mut self, _req: &fuser::Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
-        reply.ok();
-    }
-
     fn destroy(&mut self) {
         self.filestation_filesystem.logout().unwrap();
     }
@@ -144,12 +140,12 @@ impl Filesystem for UnixFileSystemHandler {
     fn read(
             &mut self,
             _req: &fuser::Request<'_>,
-            ino: u64,
+            _ino: u64,
             fh: u64,
             offset: i64,
             size: u32,
-            flags: i32,
-            lock_owner: Option<u64>,
+            _flags: i32,
+            _lock_owner: Option<u64>,
             reply: fuser::ReplyData,
         ) {
         
@@ -171,7 +167,7 @@ impl Filesystem for UnixFileSystemHandler {
             &mut self,
             _req: &fuser::Request<'_>,
             ino: u64,
-            fh: u64,
+            _fh: u64,
             offset: i64,
             mut reply: fuser::ReplyDirectory,
         ) {
@@ -215,10 +211,6 @@ impl Filesystem for UnixFileSystemHandler {
                 }
                 Err(err) => reply.error(err)
             }
-    }
-
-    fn statfs(&mut self, _req: &fuser::Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     }
 }
 

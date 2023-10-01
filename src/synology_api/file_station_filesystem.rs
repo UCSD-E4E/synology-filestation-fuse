@@ -183,7 +183,8 @@ impl FileStationFileSystem {
 						}
 					}
 
-					return Err(-1);
+					error!("No matching share was found: {}", file_name_str);
+					return Err(2);
 				},
 				Err(error) => Err(error)
 			}
@@ -244,9 +245,7 @@ impl FileStationFileSystem {
 
 					return Ok(found_files);
 				},
-				Err(error) => {
-					Err(error)
-				}
+				Err(error) => Err(error)
 			}
 		}
 		
@@ -331,7 +330,11 @@ impl FileStationFileSystem {
 							}
 						}
 					},
-					None => Err(-1)
+					None => {
+						error!("File not found in the cache: {}", info.path);
+
+						Err(-1)
+					}
 				}
 			},
 			Err(error) => Err(error)

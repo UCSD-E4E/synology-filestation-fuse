@@ -54,6 +54,8 @@ impl FileStation {
                 match result {
                     Ok(mut res) => {
                         if res.status() != 200 {
+                            error!("An errror occurred while downloading: {}", res.status());
+
                             return Err(res.status().as_u16() as i32);
                         }
 
@@ -185,6 +187,7 @@ impl FileStation {
                     }
                 }
                 else {
+                    error!("An error occurred when logging in: {}", res.status());
                     Err(res.status().as_u16() as i32)
                 }
             },
