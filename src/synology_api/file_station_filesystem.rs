@@ -301,21 +301,22 @@ impl FileStationFileSystem {
 						return Err(file_result.err().unwrap());
 					}
 
-					let mut large_buffer: Vec<u8> = Vec::new();
-					let result = self.filestation.download(path, &mut large_buffer);
+					let file_mutex = Mutex::new(file_result.unwrap());
+					let result = self.runtime.block_on(self.filestation.download(path, |bytes| {
+						let mut file = file_mutex.lock().unwrap();
+						let write_result = file.write_all(&bytes.to_vec());
+						
+						if write_result.is_err() {
+							return Err(-1);
+						}
+
+						return Ok(());
+					}));
+					drop(file_mutex);
 
 					if result.is_err() {
 						return Err(result.err().unwrap());
 					}
-
-					let mut file = file_result.unwrap();
-
-					let write_result = file.write_all(&large_buffer);
-					if write_result.is_err() {
-						return Err(-1);
-					}
-
-					drop(file);
 				}
 
 				match cache.get_file_cache(&info) {

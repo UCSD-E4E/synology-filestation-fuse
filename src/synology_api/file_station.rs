@@ -1,4 +1,5 @@
 use std::{collections::HashMap, sync::Mutex, time::{Duration, SystemTime}};
+use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use urlencoding::encode;
 use log::{debug, error};
@@ -36,7 +37,7 @@ impl FileStation {
         }
     }
 
-    pub fn download(&self, path: &str, buffer: &mut Vec<u8>) -> Result<(), i32> {
+    pub async fn download(&self, path: &str, callback: impl Fn(Bytes) -> Result<(), i32>) -> Result<(), i32> {
         match &self.sid {
             Some(sid) => {
                 let download_url = format!(
@@ -48,16 +49,37 @@ impl FileStation {
                     path,
                     "download",
                     sid);
-                let result = reqwest::blocking::get(download_url);
+                let result = reqwest::get(download_url).await;
 
                 match result {
-                    Ok(res) => {
+                    Ok(mut res) => {
                         if res.status() != 200 {
                             return Err(res.status().as_u16() as i32);
                         }
 
-                        let mut res_buffer = res.bytes().unwrap().to_vec();
-                        buffer.append(&mut res_buffer);
+                        loop {
+                            let result = match res.chunk().await {
+                                Ok(result) => match result {
+                                    Some(bytes) => {
+                                        match callback(bytes) {
+                                            Ok(()) => Ok(false),
+                                            Err(error) => Err(error)
+                                        }
+                                    }
+                                    None => Ok(true)
+                                },
+                                Err(error) => {
+                                    error!("An error occurred while downloading chunks: {}", error);
+                                    Err(-1)
+                                }
+                            };
+
+                            if result.is_err() {
+                                return Err(result.err().unwrap());
+                            } else if result.unwrap() {
+                                break;
+                            }
+                        }
 
                         Ok(())
                     },

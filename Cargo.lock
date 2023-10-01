@@ -963,6 +963,7 @@ dependencies = [
 name = "synology-filestation-fuse"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "dirs",
  "dokan",
  "fuser",
