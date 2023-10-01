@@ -1,5 +1,5 @@
 use super::{FileStation, FileCache, epoch_from_seconds};
-use std::{time::{SystemTime, Duration}, collections::HashMap, sync::Mutex, os::windows::prelude::FileExt, io::{Error, Write}, fs::File};
+use std::{time::{SystemTime, Duration}, collections::HashMap, sync::Mutex, io::{Error, Write}, fs::File};
 use log::error;
 
 pub struct FileSystemInfo {
@@ -307,6 +307,8 @@ impl FileStationFileSystem {
 
 	#[cfg(target_family = "windows")]
 	fn read_from_file(&self, file: &File, offset: u64, buffer: &mut [u8]) -> Result<usize, Error> {
+    use std::os::windows::prelude::FileExt;
+
 		file.seek_read(buffer, offset)
 	}
 }
