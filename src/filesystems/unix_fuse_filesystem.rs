@@ -1,41 +1,38 @@
 use crate::filesystems::FuseFileSystem;
 use crate::synology_api::FileStationFileSystem;
 
-use std::{ffi::OsStr, time::{SystemTime, UNIX_EPOCH}};
-use time::Timespec;
-use fuse::{FileType, FileAttr, Filesystem};
+use std::{ffi::OsStr, time::Duration};
+use fuser::{FileType, FileAttr, Filesystem, MountOption};
 use libc::{ENOSYS, ENOENT};
 
-fn systemtime2timespec(system_time: SystemTime) -> Timespec {
-    Timespec { sec: system_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64, nsec: 0 }
-}
-
 struct UnixFileSystemHandler {
-    filestation_filesystem: FileStationFileSystem
+    filestation_filesystem: FileStationFileSystem,
+    block_size: u32
 }
 
 impl UnixFileSystemHandler {
     pub fn new(filestation_filesystem: FileStationFileSystem) -> UnixFileSystemHandler {
         UnixFileSystemHandler {
-            filestation_filesystem: filestation_filesystem
+            filestation_filesystem: filestation_filesystem,
+            block_size: 4096
         }
+    }
+
+    fn size2blocks(&self, size: u64) -> u64 {
+        (size + self.block_size as u64 - 1) / self.block_size as u64
     }
 }
 
 impl Filesystem for UnixFileSystemHandler {
-    fn access(&mut self, _req: &fuse::Request, _ino: u64, _mask: u32, reply: fuse::ReplyEmpty) {
+    fn access(&mut self, _req: &fuser::Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
         reply.ok();
     }
 
-    fn create(&mut self, _req: &fuse::Request, _parent: u64, _name: &OsStr, _mode: u32, _flags: u32, reply: fuse::ReplyCreate) {
-        reply.error(ENOSYS);
-    }
-
-    fn destroy(&mut self, _req: &fuse::Request) {
+    fn destroy(&mut self) {
         self.filestation_filesystem.logout().unwrap();
     }
 
-    fn getattr(&mut self, _req: &fuse::Request, ino: u64, reply: fuse::ReplyAttr) {
+    fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyAttr) {
         let path_result = self.filestation_filesystem.get_path_for_ino(ino);
         if path_result.is_err() {
             reply.error(ENOSYS);
@@ -46,18 +43,19 @@ impl Filesystem for UnixFileSystemHandler {
         println!("path: {}", path);
 
         let info_result = self.filestation_filesystem.get_info(&path);
-        let ttl: Timespec = Timespec::new(10, 0);
+        let ttl = Duration::from_secs(10);
 
         match info_result {
             Ok(info) => {
                 reply.attr(&ttl, &FileAttr {
                     ino: info.ino,
                     size: info.size,
-                    blocks: info.size,
-                    atime: systemtime2timespec(info.atime),
-                    mtime: systemtime2timespec(info.mtime),
-                    ctime: systemtime2timespec(info.ctime),
-                    crtime: systemtime2timespec(info.crtime),
+                    blksize: self.block_size,
+                    blocks: self.size2blocks(info.size),
+                    atime: info.atime,
+                    mtime: info.mtime,
+                    ctime: info.ctime,
+                    crtime: info.crtime,
                     kind: FileType::Directory,
                     perm: info.perm,
                     nlink: 0,
@@ -71,7 +69,7 @@ impl Filesystem for UnixFileSystemHandler {
         }
     }
 
-    fn lookup(&mut self, _req: &fuse::Request, parent: u64, name: &OsStr, reply: fuse::ReplyEntry) {
+    fn lookup(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEntry) {
         let parent_path_result = self.filestation_filesystem.get_path_for_ino(parent);
         if parent_path_result.is_err() {
             reply.error(ENOSYS);
@@ -97,17 +95,18 @@ impl Filesystem for UnixFileSystemHandler {
             file_type = FileType::RegularFile;
         }
 
-        let ttl: Timespec = Timespec::new(5, 0);
+        let ttl = Duration::from_secs(10);
         reply.entry(
             &ttl,
             &FileAttr {
                 ino: info.ino,
                 size: info.size,
-                blocks: info.size,
-                atime: systemtime2timespec(info.atime),
-                mtime: systemtime2timespec(info.mtime),
-                ctime: systemtime2timespec(info.ctime),
-                crtime: systemtime2timespec(info.crtime),
+                blksize: self.block_size,
+                blocks: self.size2blocks(info.size),
+                atime: info.atime,
+                mtime: info.mtime,
+                ctime: info.ctime,
+                crtime: info.crtime,
                 kind: file_type,
                 perm: info.perm,
                 nlink: 0,
@@ -119,58 +118,61 @@ impl Filesystem for UnixFileSystemHandler {
             0);
     }
 
-    fn open(&mut self, _req: &fuse::Request, _ino: u64, _flags: u32, reply: fuse::ReplyOpen) {
+    fn open(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
         reply.opened(0, 0);
     }
 
-    fn read(&mut self, _req: &fuse::Request, _ino: u64, _fh: u64, _offset: i64, _size: u32, reply: fuse::ReplyData) {
-        reply.error(ENOSYS);
-    }
-
-    fn readdir(&mut self, _req: &fuse::Request, ino: u64, _fh: u64, offset: i64, mut reply: fuse::ReplyDirectory) {
-        let path_result = self.filestation_filesystem.get_path_for_ino(ino);
-        if path_result.is_err() {
-            reply.error(ENOSYS);
-            return;
-        }
-        let path: String = path_result.unwrap();
-
-        let result = self.filestation_filesystem.list_files(&path);
-        match result {
-            Ok(files) => {
-                let mut is_next = false;
-                if offset == 0 {
-                    is_next = true;
-                }
-
-                for file in files.iter() {
-                    if !is_next {
-                        if offset == (file.ino as i64) {
-                            is_next = true;
-                        }
-                        continue;
-                    }
-
-                    let file_type: FileType;
-                    if file.is_dir {
-                        file_type = FileType::Directory;
-                    } else {
-                        file_type = FileType::RegularFile;
-                    }
-
-                    reply.add(file.ino, file.ino as i64, file_type, file.name.clone());
-                    reply.ok();
-
-                    return;
-                }
-
-                reply.ok();
+    fn readdir(
+            &mut self,
+            _req: &fuser::Request<'_>,
+            ino: u64,
+            fh: u64,
+            offset: i64,
+            mut reply: fuser::ReplyDirectory,
+        ) {
+            let path_result = self.filestation_filesystem.get_path_for_ino(ino);
+            if path_result.is_err() {
+                reply.error(ENOSYS);
+                return;
             }
-            Err(err) => reply.error(err)
-        }
+            let path: String = path_result.unwrap();
+    
+            let result = self.filestation_filesystem.list_files(&path);
+            match result {
+                Ok(files) => {
+                    let mut is_next = false;
+                    if offset == 0 {
+                        is_next = true;
+                    }
+    
+                    for file in files.iter() {
+                        if !is_next {
+                            if offset == (file.ino as i64) {
+                                is_next = true;
+                            }
+                            continue;
+                        }
+    
+                        let file_type: FileType;
+                        if file.is_dir {
+                            file_type = FileType::Directory;
+                        } else {
+                            file_type = FileType::RegularFile;
+                        }
+    
+                        let _ = reply.add(file.ino, file.ino as i64, file_type, file.name.clone());
+                        reply.ok();
+    
+                        return;
+                    }
+    
+                    reply.ok();
+                }
+                Err(err) => reply.error(err)
+            }
     }
 
-    fn statfs(&mut self, _req: &fuse::Request, _ino: u64, reply: fuse::ReplyStatfs) {
+    fn statfs(&mut self, _req: &fuser::Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     }
 }
@@ -198,11 +200,8 @@ impl FuseFileSystem for UnixFuseFileSystem {
         ).unwrap();
         filestation_filesystem.login(username, password).unwrap();
 
-        let options = ["-o", "ro", "-o", "fsname=SYNO_FileStation"]
-            .iter()
-            .map(|o| o.as_ref())
-            .collect::<Vec<&OsStr>>();
-        fuse::mount(UnixFileSystemHandler::new(filestation_filesystem), &OsStr::new(mount_point), &options).unwrap();
+        let options = vec![MountOption::RW, MountOption::FSName("SYNO_FileStation".to_string())];
+        fuser::mount2(UnixFileSystemHandler::new(filestation_filesystem), mount_point, &options).unwrap();
     }
 
     fn unmount(&self) {
