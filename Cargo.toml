@@ -1,0 +1,22 @@
+[package]
+name = "synology-fuse"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "synology-fuse"
+path = "src/main.rs"
+
+[dependencies]
+fuser       = "0.15"
+tokio       = { version = "1", features = ["full"] }
+reqwest     = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+moka        = { version = "0.12", features = ["sync"] }
+clap        = { version = "4", features = ["derive", "env"] }
+libc        = "0.2"
+anyhow      = "1"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes       = "1"
