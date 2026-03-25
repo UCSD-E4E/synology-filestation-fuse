@@ -167,6 +167,20 @@ All requests go to `/webapi/entry.cgi` (authentication uses `/webapi/auth.cgi`).
 | Create folder | `SYNO.FileStation.CreateFolder` | `create` |
 | Rename | `SYNO.FileStation.Rename` | `rename` |
 
+## Contributing
+
+This project uses [Conventional Commits](https://www.conventionalcommits.org/). Commit messages determine the next version number automatically via [release-please](https://github.com/googleapis/release-please):
+
+| Commit prefix | Example | Version bump |
+|---|---|---|
+| `fix:` | `fix: handle HTTP 416 as EOF` | patch (`0.1.0` → `0.1.1`) |
+| `feat:` | `feat: add read cache` | minor (`0.1.0` → `0.2.0`) |
+| `feat!:` or `BREAKING CHANGE:` footer | `feat!: change CLI flag names` | major (`0.1.0` → `1.0.0`) |
+
+Other prefixes (`docs:`, `chore:`, `refactor:`, `test:`, etc.) do not trigger a release.
+
+When a qualifying commit lands on `main`, release-please opens a PR that bumps the version in `Cargo.toml` and updates `CHANGELOG.md`. Merging that PR creates a GitHub release and tag.
+
 ## License
 
 MIT
