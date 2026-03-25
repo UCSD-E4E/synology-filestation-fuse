@@ -239,6 +239,13 @@ impl SynologyClient {
         let url = format!("{}/entry.cgi", self.base_url);
         debug!("upload: {}/{} ({} bytes)", folder_path, filename, data.len());
 
+        // overwrite=true via the multipart API times out on some DSM versions.
+        // Delete the existing file first so we can always upload with overwrite=false.
+        if overwrite {
+            let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
+            let _ = self.delete(&full_path).await; // ignore error — file may not exist yet
+        }
+
         let file_part = multipart::Part::bytes(data)
             .file_name(filename.to_string())
             .mime_str("application/octet-stream")
@@ -250,7 +257,7 @@ impl SynologyClient {
             .text("method", "upload")
             .text("path", folder_path.to_string())
             .text("create_parents", "true")
-            .text("overwrite", overwrite.to_string())
+            .text("overwrite", "false")
             .part("file", file_part);
 
         let text = self.http

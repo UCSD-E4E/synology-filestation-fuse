@@ -158,6 +158,7 @@ impl SynologyFS {
         };
         let filename = &nas_path[nas_path.rfind('/').unwrap() + 1..];
 
+        debug!("flush_write_buffer: fh={} parent={:?} filename={:?} size={}", fh, parent, filename, data.len());
         self.block(self.client.upload(parent, filename, data, true))?;
         self.cache.invalidate_path(&nas_path);
         self.read_cache.invalidate_ino(ino);
