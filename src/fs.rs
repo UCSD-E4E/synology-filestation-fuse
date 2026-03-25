@@ -201,6 +201,7 @@ impl Filesystem for SynologyFS {
             path: VIRTUAL_ROOT_PATH.to_string(),
             isdir: true,
             additional: None,
+            code: None,
         };
         self.cache.seed_root(root_info);
         Ok(())
@@ -265,7 +266,8 @@ impl Filesystem for SynologyFS {
                 self.cache.insert(ino, info);
                 reply.entry(&TTL, &attr, 0);
             }
-            Err(SynoFsError::NotFound) | Err(SynoFsError::ApiError(414)) | Err(SynoFsError::ApiError(415)) => {
+            Err(SynoFsError::NotFound)
+            | Err(SynoFsError::ApiError(408 | 414 | 415)) => {
                 reply.error(ENOENT);
             }
             Err(e) => {

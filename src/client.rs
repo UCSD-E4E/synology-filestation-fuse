@@ -154,7 +154,7 @@ impl SynologyClient {
         let url = format!("{}/entry.cgi", self.base_url);
         let path_json = serde_json::to_string(&[path]).unwrap();
         debug!("get_info: {}", path);
-        let resp = self.http
+        let text = self.http
             .get(&url)
             .query(&[
                 ("api", "SYNO.FileStation.List"),
@@ -166,12 +166,21 @@ impl SynologyClient {
             ])
             .send()
             .await?
-            .json::<SynoResponse<GetInfoData>>()
+            .text()
             .await?;
+
+        debug!("get_info raw response: {}", text);
+
+        let resp: SynoResponse<GetInfoData> = serde_json::from_str(&text)
+            .map_err(|e| SynoFsError::Io(format!("get_info parse error: {e}")))?;
 
         if resp.success {
             let mut files = resp.data.ok_or(SynoFsError::NotFound)?.files;
-            files.pop().ok_or(SynoFsError::NotFound)
+            let file = files.pop().ok_or(SynoFsError::NotFound)?;
+            if let Some(code) = file.code {
+                return Err(SynoFsError::ApiError(code));
+            }
+            Ok(file)
         } else {
             let code = resp.error.map(|e| e.code).unwrap_or(0);
             Err(SynoFsError::ApiError(code))
@@ -242,16 +251,21 @@ impl SynologyClient {
             .text("path", folder_path.to_string())
             .text("create_parents", "true")
             .text("overwrite", overwrite.to_string())
-            .text("_sid", self.sid())
             .part("file", file_part);
 
-        let resp = self.http
+        let text = self.http
             .post(&url)
+            .query(&[("_sid", self.sid())])
             .multipart(form)
             .send()
             .await?
-            .json::<SynoResponse<UploadData>>()
+            .text()
             .await?;
+
+        debug!("upload raw response: {}", text);
+
+        let resp: SynoResponse<UploadData> = serde_json::from_str(&text)
+            .map_err(|e| SynoFsError::Io(format!("upload parse error: {e}")))?;
 
         if resp.success {
             Ok(())

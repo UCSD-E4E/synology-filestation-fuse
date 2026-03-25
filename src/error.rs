@@ -48,6 +48,8 @@ fn syno_code_to_errno(code: u32) -> i32 {
         // CreateFolder-specific errors
         1100 => EIO,      // Failed to create folder
         1101 => EEXIST,   // Folder already exists
+        // Generic session/privilege errors
+        119 => EACCES,    // Insufficient privilege / session does not have write access
         // Upload-specific errors
         1800 => EIO,      // Upload failed
         1804 => ENOSPC,   // Not enough quota

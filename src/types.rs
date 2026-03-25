@@ -1,12 +1,19 @@
 use serde::Deserialize;
 
-/// One file or directory returned by SYNO.FileStation.List
+/// One file or directory returned by SYNO.FileStation.List.
+/// When `get_info` is called on a path with no permission or that doesn't exist,
+/// the API returns `success:true` but puts `{"code":NNN,"path":"..."}` in the files
+/// array instead of a real entry.  The `code` field captures that per-entry error.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SynoFileInfo {
+    #[serde(default)]
     pub name: String,
     pub path: String,
+    #[serde(default)]
     pub isdir: bool,
     pub additional: Option<SynoAdditional>,
+    /// Per-entry error code returned by the API when the entry is inaccessible.
+    pub code: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
