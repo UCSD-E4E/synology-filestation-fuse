@@ -87,3 +87,54 @@ impl From<serde_json::Error> for SynoFsError {
         Self::Io(e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_variants_map_to_expected_errno() {
+        assert_eq!(SynoFsError::NotFound.to_errno(), ENOENT);
+        assert_eq!(SynoFsError::PermissionDenied.to_errno(), EACCES);
+        assert_eq!(SynoFsError::AlreadyExists.to_errno(), EEXIST);
+        assert_eq!(SynoFsError::NotEmpty.to_errno(), ENOTEMPTY);
+        assert_eq!(SynoFsError::InvalidArg.to_errno(), EINVAL);
+        assert_eq!(SynoFsError::NoSpace.to_errno(), ENOSPC);
+        assert_eq!(SynoFsError::NotSupported.to_errno(), ENOSYS);
+        assert_eq!(SynoFsError::Io("oops".into()).to_errno(), EIO);
+    }
+
+    #[test]
+    fn known_api_codes_map_correctly() {
+        let cases = [
+            (400, EINVAL),
+            (402, EAGAIN),
+            (403, ENOENT),
+            (408, EACCES),
+            (414, ENOENT),
+            (415, ENOENT),
+            (416, ENOTEMPTY),
+            (418, EEXIST),
+            (419, ENOSPC),
+            (1101, EEXIST),
+            (1804, ENOSPC),
+            (1805, EACCES),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(
+                SynoFsError::ApiError(code).to_errno(), expected,
+                "API code {code} should map to errno {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_api_code_maps_to_eio() {
+        assert_eq!(SynoFsError::ApiError(9999).to_errno(), EIO);
+    }
+
+    #[test]
+    fn session_privilege_code_maps_to_eacces() {
+        assert_eq!(SynoFsError::ApiError(119).to_errno(), EACCES);
+    }
+}

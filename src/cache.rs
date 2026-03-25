@@ -5,6 +5,17 @@ use bytes::Bytes;
 use moka::sync::Cache;
 use crate::types::{InodeEntry, SynoFileInfo};
 
+#[cfg(test)]
+fn make_file_info(path: &str) -> SynoFileInfo {
+    SynoFileInfo {
+        name: path.rsplit('/').next().unwrap_or("").to_string(),
+        path: path.to_string(),
+        isdir: false,
+        additional: None,
+        code: None,
+    }
+}
+
 pub struct InodeCache {
     next_ino: RwLock<u64>,
     /// ino → InodeEntry with TTL eviction
@@ -220,5 +231,239 @@ impl ReadCache {
                 self.in_flight.lock().unwrap().remove(&(ino, idx));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // InodeCache tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn inode_alloc_is_stable() {
+        let cache = InodeCache::new(30);
+        let a = cache.get_or_alloc_ino("/share/file.txt");
+        let b = cache.get_or_alloc_ino("/share/file.txt");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn inode_alloc_is_case_insensitive() {
+        let cache = InodeCache::new(30);
+        let a = cache.get_or_alloc_ino("/Share/File.txt");
+        let b = cache.get_or_alloc_ino("/share/file.txt");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn different_paths_get_different_inodes() {
+        let cache = InodeCache::new(30);
+        let a = cache.get_or_alloc_ino("/share/a.txt");
+        let b = cache.get_or_alloc_ino("/share/b.txt");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn insert_and_get_by_ino() {
+        let cache = InodeCache::new(30);
+        let info = make_file_info("/share/hello.txt");
+        let ino = cache.get_or_alloc_ino("/share/hello.txt");
+        cache.insert(ino, info.clone());
+        let entry = cache.get_by_ino(ino).unwrap();
+        assert_eq!(entry.ino, ino);
+        assert_eq!(entry.path, "/share/hello.txt");
+    }
+
+    #[test]
+    fn seed_root_uses_inode_1() {
+        let cache = InodeCache::new(30);
+        let info = make_file_info("");
+        cache.seed_root(info);
+        let entry = cache.get_by_ino(1).unwrap();
+        assert_eq!(entry.ino, 1);
+    }
+
+    #[test]
+    fn get_path_for_ino_returns_correct_path() {
+        let cache = InodeCache::new(30);
+        let info = make_file_info("/share/doc.pdf");
+        let ino = cache.get_or_alloc_ino("/share/doc.pdf");
+        cache.insert(ino, info);
+        assert_eq!(cache.get_path_for_ino(ino).as_deref(), Some("/share/doc.pdf"));
+    }
+
+    #[test]
+    fn get_ino_for_path_is_case_insensitive() {
+        let cache = InodeCache::new(30);
+        let ino = cache.get_or_alloc_ino("/Share/File.TXT");
+        assert_eq!(cache.get_ino_for_path("/share/file.txt"), Some(ino));
+    }
+
+    #[test]
+    fn invalidate_path_removes_entry() {
+        let cache = InodeCache::new(30);
+        let info = make_file_info("/share/temp.txt");
+        let ino = cache.get_or_alloc_ino("/share/temp.txt");
+        cache.insert(ino, info);
+        cache.invalidate_path("/share/temp.txt");
+        assert!(cache.get_by_ino(ino).is_none());
+        assert!(cache.get_ino_for_path("/share/temp.txt").is_none());
+    }
+
+    #[test]
+    fn invalidate_prefix_removes_matching_entries() {
+        let cache = InodeCache::new(30);
+        for name in &["a.txt", "b.txt", "c.txt"] {
+            let path = format!("/share/{}", name);
+            let ino = cache.get_or_alloc_ino(&path);
+            cache.insert(ino, make_file_info(&path));
+        }
+        let other_ino = cache.get_or_alloc_ino("/other/file.txt");
+        cache.insert(other_ino, make_file_info("/other/file.txt"));
+
+        cache.invalidate_prefix("/share/");
+
+        assert!(cache.get_ino_for_path("/share/a.txt").is_none());
+        assert!(cache.get_ino_for_path("/share/b.txt").is_none());
+        assert!(cache.get_ino_for_path("/share/c.txt").is_none());
+        // Entry outside the prefix is untouched.
+        assert!(cache.get_ino_for_path("/other/file.txt").is_some());
+    }
+
+    #[test]
+    fn get_size_for_ino_returns_size() {
+        use crate::types::SynoAdditional;
+        let cache = InodeCache::new(30);
+        let mut info = make_file_info("/share/video.mp4");
+        info.additional = Some(SynoAdditional {
+            size: Some(1234567),
+            owner: None,
+            time: None,
+            perm: None,
+        });
+        let ino = cache.get_or_alloc_ino("/share/video.mp4");
+        cache.insert(ino, info);
+        assert_eq!(cache.get_size_for_ino(ino), Some(1234567));
+    }
+
+    #[test]
+    fn get_size_returns_none_when_not_cached() {
+        let cache = InodeCache::new(30);
+        assert!(cache.get_size_for_ino(999).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ReadCache tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_cache_insert_and_get() {
+        let rc = ReadCache::new(1024, 16);
+        let data = Bytes::from_static(b"hello world");
+        rc.insert(1, 0, data.clone());
+        assert_eq!(rc.get(1, 0).unwrap(), data);
+    }
+
+    #[test]
+    fn read_cache_contains() {
+        let rc = ReadCache::new(1024, 16);
+        assert!(!rc.contains(1, 0));
+        rc.insert(1, 0, Bytes::from_static(b"x"));
+        assert!(rc.contains(1, 0));
+    }
+
+    #[test]
+    fn claim_inflight_grants_exclusive_access() {
+        let rc = ReadCache::new(1024, 16);
+        assert!(rc.claim_inflight(1, 0));  // first caller wins
+        assert!(!rc.claim_inflight(1, 0)); // second caller loses
+    }
+
+    #[test]
+    fn cancel_inflight_releases_slot() {
+        let rc = ReadCache::new(1024, 16);
+        assert!(rc.claim_inflight(1, 0));
+        rc.cancel_inflight(1, 0);
+        assert!(rc.claim_inflight(1, 0)); // slot is free again
+    }
+
+    #[test]
+    fn wait_for_block_returns_data_after_insert() {
+        let rc = Arc::new(ReadCache::new(1024, 16));
+        assert!(rc.claim_inflight(1, 0));
+
+        let rc2 = rc.clone();
+        let handle = std::thread::spawn(move || {
+            rc2.wait_for_block(1, 0)
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        rc.insert(1, 0, Bytes::from_static(b"payload"));
+
+        let result = handle.join().unwrap();
+        assert_eq!(result.unwrap(), Bytes::from_static(b"payload"));
+    }
+
+    #[test]
+    fn wait_for_block_returns_none_after_cancel() {
+        let rc = Arc::new(ReadCache::new(1024, 16));
+        assert!(rc.claim_inflight(1, 0));
+
+        let rc2 = rc.clone();
+        let handle = std::thread::spawn(move || {
+            rc2.wait_for_block(1, 0)
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        rc.cancel_inflight(1, 0);
+
+        let result = handle.join().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn wait_for_block_returns_empty_bytes_as_eof_sentinel() {
+        let rc = Arc::new(ReadCache::new(1024, 16));
+        assert!(rc.claim_inflight(1, 5));
+
+        let rc2 = rc.clone();
+        let handle = std::thread::spawn(move || {
+            rc2.wait_for_block(1, 5)
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        rc.insert(1, 5, Bytes::new()); // EOF sentinel
+
+        let result = handle.join().unwrap();
+        assert_eq!(result, Some(Bytes::new()));
+    }
+
+    #[test]
+    fn invalidate_ino_removes_all_blocks() {
+        let rc = ReadCache::new(1024, 16);
+        rc.insert(1, 0, Bytes::from_static(b"block0"));
+        rc.insert(1, 1, Bytes::from_static(b"block1"));
+        rc.insert(2, 0, Bytes::from_static(b"other_ino"));
+
+        rc.invalidate_ino(1);
+
+        assert!(!rc.contains(1, 0));
+        assert!(!rc.contains(1, 1));
+        assert!(rc.contains(2, 0)); // other ino untouched
+    }
+
+    #[test]
+    fn invalidate_ino_clears_inflight_markers() {
+        let rc = ReadCache::new(1024, 16);
+        // Insert a block so ino_blocks tracks it, then re-claim it as in-flight
+        // (simulates a concurrent re-download starting just before invalidation).
+        rc.insert(1, 0, Bytes::from_static(b"data"));
+        rc.claim_inflight(1, 0);
+        rc.invalidate_ino(1);
+        // The in-flight marker should have been cleared along with the cached block.
+        assert!(rc.claim_inflight(1, 0));
     }
 }
