@@ -10,6 +10,8 @@ A FUSE filesystem driver that mounts a [Synology FileStation](https://www.synolo
 - Rename files (same-directory) and move files (cross-directory)
 - Truncate files via `setattr`
 - Metadata cache with configurable TTL to reduce API round-trips
+- Block-level read cache (default 256 MiB) with background prefetch for smooth streaming playback
+- Interactive password prompt with hidden input when password is not set via flag or environment variable
 - Uses `rustls` — no OpenSSL dependency required
 
 ## Requirements
@@ -39,12 +41,12 @@ sudo dnf install fuse3-devel
 cargo build --release
 ```
 
-The binary will be at `target/release/synology-fuse`.
+The binary will be at `target/release/synology-filestation-fuse`.
 
 ## Usage
 
 ```bash
-synology-fuse --host <NAS_HOST> -u <USERNAME> -p <PASSWORD> [OPTIONS] <MOUNTPOINT>
+synology-filestation-fuse --host <NAS_HOST> -u <USERNAME> [OPTIONS] <MOUNTPOINT>
 ```
 
 ### Arguments
@@ -54,43 +56,47 @@ synology-fuse --host <NAS_HOST> -u <USERNAME> -p <PASSWORD> [OPTIONS] <MOUNTPOIN
 | `<MOUNTPOINT>` | Local directory to mount on | *(required)* |
 | `--host <HOST>` | NAS hostname or IP address | *(required)* |
 | `-u, --username` | NAS account username | *(required)* |
-| `-p, --password` | NAS account password | *(required, or `SYNO_PASSWORD` env var)* |
+| `-p, --password` | NAS account password (or `SYNO_PASSWORD` env var; prompted with hidden input if omitted) | *(optional)* |
 | `--otp <CODE>` | TOTP code for 2FA (or `SYNO_OTP` env var); prompted interactively if omitted and 2FA is enabled | *(optional)* |
 | `--port <PORT>` | API port | `5001` |
 | `--https` | Use HTTPS | `true` |
 | `--cache-ttl <SECS>` | Metadata cache TTL in seconds | `30` |
+| `--read-cache-mb <MiB>` | Read cache size in MiB for file data blocks | `256` |
 | `--log-level <LEVEL>` | Log level (`error`, `warn`, `info`, `debug`, `trace`) | `info` |
 
 ### Examples
 
 ```bash
-# Mount all shares (the mountpoint will list every share you have access to)
+# Mount — password will be prompted securely if not supplied
 mkdir -p /mnt/nas
-synology-fuse --host 192.168.1.100 -u admin -p mypassword /mnt/nas
-ls /mnt/nas          # shows all shares, e.g. homes  photo  video  backup
-cd /mnt/nas/homes    # browse into a share
+synology-filestation-fuse --host 192.168.1.100 -u admin /mnt/nas
+# Password: ********
+
+# Pass password via flag
+synology-filestation-fuse --host 192.168.1.100 -u admin -p mypassword /mnt/nas
+
+# Pass password via environment variable
+export SYNO_PASSWORD=mypassword
+synology-filestation-fuse --host nas.local -u admin /mnt/nas
 
 # With two-factor authentication (TOTP code passed directly)
-synology-fuse --host 192.168.1.100 -u admin -p mypassword --otp 123456 /mnt/nas
+synology-filestation-fuse --host 192.168.1.100 -u admin --otp 123456 /mnt/nas
 
 # With 2FA via environment variable
-SYNO_OTP=123456 synology-fuse --host 192.168.1.100 -u admin -p mypassword /mnt/nas
+SYNO_OTP=123456 synology-filestation-fuse --host 192.168.1.100 -u admin /mnt/nas
 
 # With 2FA enabled but no code supplied — will prompt interactively:
 #   Two-factor authentication code: ______
-synology-fuse --host 192.168.1.100 -u admin -p mypassword /mnt/nas
-
-# Use an environment variable for the password
-export SYNO_PASSWORD=mypassword
-synology-fuse --host nas.local -u admin /mnt/nas
+synology-filestation-fuse --host 192.168.1.100 -u admin /mnt/nas
 
 # Mount over plain HTTP (DSM default HTTP port)
-synology-fuse --host 192.168.1.100 --port 5000 --no-https \
-  -u admin -p mypassword /mnt/nas
+synology-filestation-fuse --host 192.168.1.100 --port 5000 --no-https -u admin /mnt/nas
+
+# Larger read cache for smoother playback of large video files
+synology-filestation-fuse --host nas.local -u admin --read-cache-mb 512 /mnt/nas
 
 # Enable debug logging
-synology-fuse --host nas.local -u admin -p mypassword \
-  --log-level debug /mnt/nas
+synology-filestation-fuse --host nas.local -u admin --log-level debug /mnt/nas
 
 # Unmount
 fusermount -u /mnt/nas
@@ -104,21 +110,30 @@ synology-fuse/
     ├── main.rs     CLI argument parsing, Tokio runtime setup, fuser::mount2
     ├── fs.rs       fuser::Filesystem trait implementation (all FUSE operations)
     ├── client.rs   Async Synology FileStation HTTP API client
-    ├── cache.rs    Inode ↔ path bidirectional cache with TTL eviction
+    ├── cache.rs    Inode ↔ path metadata cache + block-level read cache
     ├── types.rs    Serde types for API JSON responses
     └── error.rs    Synology API error code → POSIX errno translation
 ```
 
+### Virtual root
+
+The mountpoint root (inode 1) is a synthetic directory that does not correspond to any real path on the NAS. Reading it calls `SYNO.FileStation.List list_share` to enumerate all shares the authenticated account can see. Each share appears as a subdirectory.
+
 ### Sync/async bridge
 
-The FUSE dispatch loop (inside `fuser::mount2`) is synchronous and single-threaded. All Synology API calls are async via `reqwest`. The driver bridges these by holding a `tokio::runtime::Handle` and calling `handle.block_on(future)` inside each FUSE callback. A multi-thread Tokio runtime is used to avoid deadlocks — the calling thread blocks while the Tokio worker pool handles I/O.
+The FUSE dispatch loop (inside `fuser::mount2`) is synchronous and single-threaded. All Synology API calls are async via `reqwest`. The driver bridges these by holding a `tokio::runtime::Handle` and calling `handle.block_on(future)` inside each FUSE callback. A multi-thread Tokio runtime is used so that background prefetch tasks can run on worker threads while the FUSE thread is blocked on a foreground download.
+
+### Read cache
+
+File data is cached in fixed-size 256 KiB blocks using a `moka` LRU cache (default capacity 256 MiB). On `open()`, the first block is downloaded synchronously (guaranteeing an immediate cache hit on the first `read()`) and the next 15 blocks plus the last 4 blocks are prefetched asynchronously in the background. During `read()`, the next 16 blocks are prefetched. An in-flight deduplication mechanism prevents multiple concurrent HTTP requests for the same block. The read cache is invalidated on write, rename, or delete.
 
 ### Write buffering
 
-The Synology Upload API requires the complete file body as a multipart upload; it does not support partial or streaming writes. As a result:
+The Synology Upload API requires the complete file body as a single multipart upload; it does not support partial or streaming writes. As a result:
 
 - Write data is accumulated in an in-memory buffer per open file handle.
 - The buffer is flushed to the NAS on `flush()` or `release()`.
+- Overwriting an existing file deletes it first, then re-uploads the new content.
 - Large file writes consume proportional memory.
 
 ### Metadata cache
@@ -127,12 +142,13 @@ File and directory metadata is cached in a `moka` TTL cache (default 30 seconds)
 
 ## Known Limitations
 
-- **Cross-directory directory moves are not supported.** Moving a directory to a different parent returns `ENOSYS`. The Synology API has no atomic move primitive; only same-directory renames use the efficient `SYNO.FileStation.Rename` API.
+- **Cross-directory directory moves are not supported.** Moving a directory to a different parent returns `ENOSYS`. Only same-directory renames use the efficient `SYNO.FileStation.Rename` API.
 - **Cross-directory file moves are not atomic.** They are implemented as download → upload → delete. A failure mid-sequence may leave data duplicated or missing.
-- **Large files require large in-memory buffers.** Writes to a file buffer the entire file content in process memory until the file is closed or flushed.
+- **Large files require large in-memory write buffers.** Writing to a file buffers the entire file content in process memory until the file is closed or flushed.
+- **Overwriting a file is not atomic.** The existing file is deleted before the new content is uploaded; a crash between those two steps would result in data loss.
 - **Inode numbers are not stable across remounts.** Inodes are allocated in-memory and reset on each mount.
 - **No support for symlinks, hard links, or special files.**
-- **Permissions and timestamps are read-only.** `chmod`, `chown`, and `touch` will appear to succeed but changes are not persisted to the NAS.
+- **Permissions and timestamps are read-only.** `chmod`, `chown`, and `utimens` will appear to succeed but changes are not persisted to the NAS.
 
 ## Synology API Reference
 
@@ -142,6 +158,7 @@ All requests go to `/webapi/entry.cgi` (authentication uses `/webapi/auth.cgi`).
 |---|---|---|
 | Login | `SYNO.API.Auth` | `login` |
 | Logout | `SYNO.API.Auth` | `logout` |
+| List shares | `SYNO.FileStation.List` | `list_share` |
 | List directory | `SYNO.FileStation.List` | `list` |
 | Get file info | `SYNO.FileStation.List` | `getinfo` |
 | Download file | `SYNO.FileStation.Download` | `download` |
