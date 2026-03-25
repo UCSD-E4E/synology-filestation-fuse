@@ -205,8 +205,18 @@ impl SynologyClient {
             req = req.header("Range", range);
         }
 
-        let bytes = req.send().await?.bytes().await?;
-        Ok(bytes)
+        let resp = req.send().await?;
+        let status = resp.status();
+
+        // 416 Range Not Satisfiable = requested range starts past EOF; return empty (EOF signal).
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            return Ok(Bytes::new());
+        }
+        if !status.is_success() {
+            return Err(SynoFsError::Io(format!("download HTTP {}", status)));
+        }
+
+        Ok(resp.bytes().await?)
     }
 
     /// Upload file contents (replaces entire file).

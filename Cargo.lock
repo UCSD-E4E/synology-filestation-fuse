@@ -1233,7 +1233,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "synology-fuse"
+name = "synology-filestation-fuse"
 version = "0.1.0"
 dependencies = [
  "anyhow",

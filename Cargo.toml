@@ -1,10 +1,10 @@
 [package]
-name = "synology-fuse"
+name = "synology-filestation-fuse"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "synology-fuse"
+name = "synology-filestation-fuse"
 path = "src/main.rs"
 
 [dependencies]

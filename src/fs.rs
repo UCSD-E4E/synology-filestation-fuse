@@ -18,6 +18,8 @@ use crate::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
 
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO: u64 = 1;
+/// Tell the kernel not to flush the page cache between opens of the same file.
+const FOPEN_KEEP_CACHE: u32 = 2;
 
 struct WriteBuffer {
     nas_path: String,
@@ -162,6 +164,19 @@ impl SynologyFS {
         Ok(())
     }
 
+    /// Returns false if the POSIX permission bits on `info` deny read access to the current user.
+    /// When permission data is absent we err on the side of inclusion.
+    fn can_read_share(&self, info: &crate::types::SynoFileInfo) -> bool {
+        let Some(add) = &info.additional else { return true; };
+        let Some(perm) = &add.perm else { return true; };
+        let posix = perm.posix;
+        if let Some(owner) = &add.owner {
+            if owner.uid == self.uid { return posix & 0o400 != 0; }
+            if owner.gid == self.gid { return posix & 0o040 != 0; }
+        }
+        posix & 0o004 != 0
+    }
+
     /// Synthetic FileAttr for the virtual root (inode 1).
     fn virtual_root_attr(&self) -> FileAttr {
         FileAttr {
@@ -234,7 +249,7 @@ impl Filesystem for SynologyFS {
                 Ok(s) => s,
                 Err(e) => { reply.error(e.to_errno()); return; }
             };
-            match shares.into_iter().find(|s| s.name == name_str) {
+            match shares.into_iter().find(|s| s.name == name_str && self.can_read_share(s)) {
                 Some(info) => {
                     let ino = self.cache.get_or_alloc_ino(&info.path);
                     let attr = self.syno_to_attr(ino, &info);
@@ -328,8 +343,9 @@ impl Filesystem for SynologyFS {
                 Ok(s) => s,
                 Err(e) => { error!("readdir shares: {}", e); reply.error(e.to_errno()); return; }
             };
-            debug!("readdir root: got {} shares", shares.len());
-            (shares, ROOT_INO)
+            let visible: Vec<_> = shares.into_iter().filter(|s| self.can_read_share(s)).collect();
+            debug!("readdir root: {} accessible shares", visible.len());
+            (visible, ROOT_INO)
         } else {
             let entries = match self.block(self.client.list_dir(&path)) {
                 Ok(e) => e,
@@ -400,17 +416,37 @@ impl Filesystem for SynologyFS {
             let block_start = block_idx * block_size;
 
             let block = if let Some(cached) = self.read_cache.get(ino, block_idx) {
+                if cached.is_empty() { break; } // EOF sentinel
                 cached
-            } else {
+            } else if self.read_cache.claim_inflight(ino, block_idx) {
+                // We won the race — download synchronously.
                 debug!("read cache miss: ino={} block={}", ino, block_idx);
                 match self.block(self.client.download(&path, block_start, block_size)) {
-                    Ok(b) => {
+                    Ok(b) if !b.is_empty() => {
                         self.read_cache.insert(ino, block_idx, b.clone());
                         b
                     }
+                    Ok(empty) => {
+                        // EOF — cache empty sentinel so any waiters know too.
+                        self.read_cache.insert(ino, block_idx, empty);
+                        break;
+                    }
                     Err(e) => {
+                        self.read_cache.cancel_inflight(ino, block_idx);
                         error!("read {}: {}", path, e);
                         reply.error(e.to_errno());
+                        return;
+                    }
+                }
+            } else {
+                // Another task is downloading this block — wait for it.
+                debug!("read waiting for inflight: ino={} block={}", ino, block_idx);
+                match self.read_cache.wait_for_block(ino, block_idx) {
+                    Some(b) if b.is_empty() => break, // EOF sentinel
+                    Some(b) => b,
+                    None => {
+                        // Other task had a real network error.
+                        reply.error(EIO);
                         return;
                     }
                 }
@@ -428,18 +464,20 @@ impl Filesystem for SynologyFS {
             }
         }
 
-        // Background prefetch of the next block so sequential reads don't stall
-        let prefetch_idx = last_block + 1;
-        if !self.read_cache.contains(ino, prefetch_idx) {
-            let client = self.client.clone();
-            let rc = self.read_cache.clone();
-            let path_clone = path.clone();
-            self.rt.spawn(async move {
-                let start = prefetch_idx * block_size;
-                if let Ok(data) = client.download(&path_clone, start, block_size).await {
-                    rc.insert(ino, prefetch_idx, data);
-                }
-            });
+        // Background prefetch of the next 16 blocks to keep VLC's read-ahead buffer full.
+        for prefetch_idx in (last_block + 1)..=(last_block + 16) {
+            if !self.read_cache.contains(ino, prefetch_idx) && self.read_cache.claim_inflight(ino, prefetch_idx) {
+                let client = self.client.clone();
+                let rc = self.read_cache.clone();
+                let path_clone = path.clone();
+                self.rt.spawn(async move {
+                    let start = prefetch_idx * block_size;
+                    match client.download(&path_clone, start, block_size).await {
+                        Ok(data) => rc.insert(ino, prefetch_idx, data), // empty == EOF sentinel
+                        Err(_) => rc.cancel_inflight(ino, prefetch_idx),
+                    }
+                });
+            }
         }
 
         reply.data(&result);
@@ -452,6 +490,57 @@ impl Filesystem for SynologyFS {
         };
         debug!("open: ino={} path={} flags={:#o}", ino, path, flags);
 
+        let block_size = self.read_cache.block_size;
+        let file_size = self.cache.get_size_for_ino(ino).unwrap_or(0);
+        let total_blocks = if file_size > 0 { (file_size + block_size - 1) / block_size } else { 0 };
+
+        // Block 0: download synchronously so VLC's very first read() is a guaranteed cache hit.
+        if total_blocks > 0 && !self.read_cache.contains(ino, 0) {
+            if self.read_cache.claim_inflight(ino, 0) {
+                match self.block(self.client.download(&path, 0, block_size)) {
+                    Ok(data) if !data.is_empty() => self.read_cache.insert(ino, 0, data),
+                    _ => self.read_cache.cancel_inflight(ino, 0),
+                }
+            }
+            // If another task already claimed it, skip — it'll be in cache when read() runs.
+        }
+
+        // Head: blocks 1-15 async — covers container headers and codec init data.
+        let head_end = 16u64.min(total_blocks);
+        for block_idx in 1..head_end {
+            if !self.read_cache.contains(ino, block_idx) && self.read_cache.claim_inflight(ino, block_idx) {
+                let client = self.client.clone();
+                let rc = self.read_cache.clone();
+                let p = path.clone();
+                self.rt.spawn(async move {
+                    let start = block_idx * block_size;
+                    match client.download(&p, start, block_size).await {
+                        Ok(data) => rc.insert(ino, block_idx, data), // empty == EOF sentinel
+                        Err(_) => rc.cancel_inflight(ino, block_idx),
+                    }
+                });
+            }
+        }
+
+        // Tail: last 4 blocks — MP4 MOOV boxes are often written at the end of the file.
+        if total_blocks > head_end {
+            let tail_start = total_blocks.saturating_sub(4).max(head_end);
+            for block_idx in tail_start..total_blocks {
+                if !self.read_cache.contains(ino, block_idx) && self.read_cache.claim_inflight(ino, block_idx) {
+                    let client = self.client.clone();
+                    let rc = self.read_cache.clone();
+                    let p = path.clone();
+                    self.rt.spawn(async move {
+                        let start = block_idx * block_size;
+                        match client.download(&p, start, block_size).await {
+                            Ok(data) => rc.insert(ino, block_idx, data), // empty == EOF sentinel
+                            Err(_) => rc.cancel_inflight(ino, block_idx),
+                        }
+                    });
+                }
+            }
+        }
+
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         self.write_buffers.lock().unwrap().insert(fh, WriteBuffer {
             nas_path: path,
@@ -459,7 +548,8 @@ impl Filesystem for SynologyFS {
             data: Vec::new(),
             dirty: false,
         });
-        reply.opened(fh, 0);
+        // FOPEN_KEEP_CACHE: don't invalidate the kernel page cache between opens.
+        reply.opened(fh, FOPEN_KEEP_CACHE);
     }
 
     fn write(

@@ -120,14 +120,20 @@ impl InodeCache {
         let key = path.to_lowercase();
         self.path_to_ino.read().unwrap().get(&key).copied()
     }
+
+    /// Return the file size for `ino` from the metadata cache, if available.
+    pub fn get_size_for_ino(&self, ino: u64) -> Option<u64> {
+        self.by_ino.get(&ino)
+            .and_then(|entry| entry.info.additional.as_ref()?.size)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Block-level read cache for file data
 // ---------------------------------------------------------------------------
 
-/// Size of each cached block in bytes (1 MiB).
-pub const READ_BLOCK_SIZE: u64 = 1024 * 1024;
+/// Size of each cached block in bytes (256 KiB).
+pub const READ_BLOCK_SIZE: u64 = 256 * 1024;
 
 /// A cache of file data split into fixed-size blocks.
 ///
@@ -139,6 +145,10 @@ pub struct ReadCache {
     /// Tracks which block indices are cached for each inode so we can do
     /// targeted invalidation when a file is written or deleted.
     ino_blocks: RwLock<HashMap<u64, HashSet<u64>>>,
+    /// Blocks currently being downloaded (prefetch or sync).  A block in this
+    /// set will appear in `blocks` once the download completes.  Used to avoid
+    /// issuing duplicate HTTP requests for the same block.
+    in_flight: std::sync::Mutex<HashSet<(u64, u64)>>,
     pub block_size: u64,
 }
 
@@ -152,6 +162,7 @@ impl ReadCache {
         Self {
             blocks,
             ino_blocks: RwLock::new(HashMap::new()),
+            in_flight: std::sync::Mutex::new(HashSet::new()),
             block_size,
         }
     }
@@ -165,10 +176,39 @@ impl ReadCache {
         self.ino_blocks.write().unwrap()
             .entry(ino).or_default()
             .insert(block_idx);
+        self.in_flight.lock().unwrap().remove(&(ino, block_idx));
     }
 
     pub fn contains(&self, ino: u64, block_idx: u64) -> bool {
         self.blocks.contains_key(&(ino, block_idx))
+    }
+
+    /// Returns `true` if this call wins the race to download the block.
+    /// Returns `false` if another task already claimed it — the caller should
+    /// wait on [`wait_for_block`] instead.
+    pub fn claim_inflight(&self, ino: u64, block_idx: u64) -> bool {
+        self.in_flight.lock().unwrap().insert((ino, block_idx))
+    }
+
+    /// Mark a failed download so other waiters don't spin forever.
+    pub fn cancel_inflight(&self, ino: u64, block_idx: u64) {
+        self.in_flight.lock().unwrap().remove(&(ino, block_idx));
+    }
+
+    /// Spin-wait (5 ms polls) until the block appears in cache or the
+    /// in-flight marker is gone (meaning the download failed).
+    /// Returns the cached bytes on success, `None` on failure.
+    pub fn wait_for_block(&self, ino: u64, block_idx: u64) -> Option<Bytes> {
+        loop {
+            if let Some(data) = self.blocks.get(&(ino, block_idx)) {
+                return Some(data);
+            }
+            if !self.in_flight.lock().unwrap().contains(&(ino, block_idx)) {
+                // Download finished (or failed) without populating the cache.
+                return self.blocks.get(&(ino, block_idx));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Evict all cached blocks for `ino` (call after writing or deleting a file).
@@ -177,6 +217,7 @@ impl ReadCache {
         if let Some(set) = indices {
             for idx in set {
                 self.blocks.invalidate(&(ino, idx));
+                self.in_flight.lock().unwrap().remove(&(ino, idx));
             }
         }
     }
