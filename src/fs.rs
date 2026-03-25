@@ -164,19 +164,6 @@ impl SynologyFS {
         Ok(())
     }
 
-    /// Returns false if the POSIX permission bits on `info` deny read access to the current user.
-    /// When permission data is absent we err on the side of inclusion.
-    fn can_read_share(&self, info: &crate::types::SynoFileInfo) -> bool {
-        let Some(add) = &info.additional else { return true; };
-        let Some(perm) = &add.perm else { return true; };
-        let posix = perm.posix;
-        if let Some(owner) = &add.owner {
-            if owner.uid == self.uid { return posix & 0o400 != 0; }
-            if owner.gid == self.gid { return posix & 0o040 != 0; }
-        }
-        posix & 0o004 != 0
-    }
-
     /// Synthetic FileAttr for the virtual root (inode 1).
     fn virtual_root_attr(&self) -> FileAttr {
         FileAttr {
@@ -249,7 +236,7 @@ impl Filesystem for SynologyFS {
                 Ok(s) => s,
                 Err(e) => { reply.error(e.to_errno()); return; }
             };
-            match shares.into_iter().find(|s| s.name == name_str && self.can_read_share(s)) {
+            match shares.into_iter().find(|s| s.name == name_str) {
                 Some(info) => {
                     let ino = self.cache.get_or_alloc_ino(&info.path);
                     let attr = self.syno_to_attr(ino, &info);
@@ -343,9 +330,8 @@ impl Filesystem for SynologyFS {
                 Ok(s) => s,
                 Err(e) => { error!("readdir shares: {}", e); reply.error(e.to_errno()); return; }
             };
-            let visible: Vec<_> = shares.into_iter().filter(|s| self.can_read_share(s)).collect();
-            debug!("readdir root: {} accessible shares", visible.len());
-            (visible, ROOT_INO)
+            debug!("readdir root: got {} shares", shares.len());
+            (shares, ROOT_INO)
         } else {
             let entries = match self.block(self.client.list_dir(&path)) {
                 Ok(e) => e,
