@@ -38,9 +38,9 @@ struct Args {
     #[arg(long, short = 'u')]
     username: String,
 
-    /// NAS account password (or set SYNO_PASSWORD env var)
+    /// NAS account password (or set SYNO_PASSWORD env var; prompted if omitted)
     #[arg(long, short = 'p', env = "SYNO_PASSWORD")]
-    password: String,
+    password: Option<String>,
 
     /// TOTP code for two-factor authentication (or set SYNO_OTP env var).
     /// If 2FA is enabled and this is not provided, you will be prompted interactively.
@@ -70,12 +70,12 @@ fn is_otp_required(e: &error::SynoFsError) -> bool {
     matches!(e, error::SynoFsError::ApiError(403 | 404))
 }
 
-fn prompt_otp() -> anyhow::Result<String> {
-    eprint!("Two-factor authentication code: ");
+fn prompt(label: &str) -> anyhow::Result<String> {
+    eprint!("{}: ", label);
     io::stderr().flush()?;
-    let mut code = String::new();
-    io::stdin().read_line(&mut code)?;
-    Ok(code.trim().to_string())
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    Ok(value.trim().to_string())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -103,14 +103,19 @@ fn main() -> anyhow::Result<()> {
 
     // Synology API error code 403 means an OTP code is required.
     // If the user didn't supply one via --otp / SYNO_OTP, prompt interactively.
+    let password = match args.password {
+        Some(p) => p,
+        None => rpassword::prompt_password("Password: ")?,
+    };
+
     let otp = args.otp.as_deref();
-    let login_result = rt.block_on(client.login(&args.username, &args.password, otp));
+    let login_result = rt.block_on(client.login(&args.username, &password, otp));
 
     match login_result {
         Ok(()) => {}
         Err(ref e) if is_otp_required(e) => {
-            let code = prompt_otp()?;
-            rt.block_on(client.login(&args.username, &args.password, Some(&code)))?;
+            let code = prompt("Two-factor authentication code")?;
+            rt.block_on(client.login(&args.username, &password, Some(&code)))?;
         }
         Err(e) => return Err(e.into()),
     }
