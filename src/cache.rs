@@ -20,8 +20,10 @@ pub struct InodeCache {
     next_ino: RwLock<u64>,
     /// ino → InodeEntry with TTL eviction
     by_ino: Cache<u64, Arc<InodeEntry>>,
-    /// path → ino mapping (not TTL-evicted; invalidated manually on mutations)
+    /// lowercase(path) → ino  (never TTL-evicted; invalidated manually on mutations)
     path_to_ino: RwLock<HashMap<String, u64>>,
+    /// ino → original-case path  (never TTL-evicted; source of truth for path strings)
+    ino_to_path: RwLock<HashMap<u64, String>>,
 }
 
 impl InodeCache {
@@ -34,6 +36,7 @@ impl InodeCache {
             next_ino: RwLock::new(2), // 1 is reserved for root
             by_ino,
             path_to_ino: RwLock::new(HashMap::new()),
+            ino_to_path: RwLock::new(HashMap::new()),
         }
     }
 
@@ -64,8 +67,8 @@ impl InodeCache {
         let entry = Arc::new(InodeEntry { ino, path: path.clone(), info });
         self.by_ino.insert(ino, entry);
         let key = path.to_lowercase();
-        let mut map = self.path_to_ino.write().unwrap();
-        map.insert(key, ino);
+        self.path_to_ino.write().unwrap().insert(key, ino);
+        self.ino_to_path.write().unwrap().insert(ino, path);
     }
 
     /// Seed inode 1 for the root directory.
@@ -74,8 +77,8 @@ impl InodeCache {
         let entry = Arc::new(InodeEntry { ino: 1, path: path.clone(), info });
         self.by_ino.insert(1, entry);
         let key = path.to_lowercase();
-        let mut map = self.path_to_ino.write().unwrap();
-        map.insert(key, 1);
+        self.path_to_ino.write().unwrap().insert(key, 1);
+        self.ino_to_path.write().unwrap().insert(1, path);
     }
 
     /// Look up a cached entry by inode.
@@ -85,24 +88,19 @@ impl InodeCache {
 
     /// Look up the path for a given inode (even if metadata is evicted).
     pub fn get_path_for_ino(&self, ino: u64) -> Option<String> {
-        // First check the live metadata cache
+        // Prefer the live metadata cache (freshest data).
         if let Some(entry) = self.by_ino.get(&ino) {
             return Some(entry.path.clone());
         }
-        // Fall back to the path_to_ino map (reverse lookup)
-        let map = self.path_to_ino.read().unwrap();
-        for (path, &mapped_ino) in map.iter() {
-            if mapped_ino == ino {
-                return Some(path.clone());
-            }
-        }
-        None
+        // Fall back to ino_to_path which stores the original-case path permanently.
+        self.ino_to_path.read().unwrap().get(&ino).cloned()
     }
 
     /// Remove all entries whose path starts with `prefix` (after mutations).
     pub fn invalidate_prefix(&self, prefix: &str) {
         let lower = prefix.to_lowercase();
         let mut map = self.path_to_ino.write().unwrap();
+        let mut itp = self.ino_to_path.write().unwrap();
         let to_remove: Vec<String> = map
             .keys()
             .filter(|k| k.starts_with(&lower))
@@ -111,6 +109,7 @@ impl InodeCache {
         for path in &to_remove {
             if let Some(&ino) = map.get(path) {
                 self.by_ino.invalidate(&ino);
+                itp.remove(&ino);
             }
             map.remove(path);
         }
@@ -122,6 +121,7 @@ impl InodeCache {
         let mut map = self.path_to_ino.write().unwrap();
         if let Some(&ino) = map.get(&key) {
             self.by_ino.invalidate(&ino);
+            self.ino_to_path.write().unwrap().remove(&ino);
             map.remove(&key);
         }
     }
