@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.2](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.1...synology-filestation-fuse-v0.1.2) (2026-03-27)
+
+
+### Features
+
+* macos support ([abd6207](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/abd6207616fe0b5ff8a0ba148c2078dcaec2ad41))
+
+
+### Bug Fixes
+
+* cache issues ([5235928](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/52359285201b3f718483b1045f73f96a66cc511c))
+
 ## [0.1.1](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.0...synology-filestation-fuse-v0.1.1) (2026-03-25)
 
 
