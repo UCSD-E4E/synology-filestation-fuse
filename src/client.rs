@@ -10,6 +10,7 @@ use crate::types::{
     SynoFileInfo, SynoResponse, ADDITIONAL_FIELDS, SHARE_ADDITIONAL_FIELDS,
 };
 
+#[derive(Debug)]
 pub struct SynologyClient {
     http: Client,
     base_url: String,
@@ -271,6 +272,15 @@ impl SynologyClient {
         if overwrite {
             let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
             let _ = self.delete(&full_path).await; // ignore error — file may not exist yet
+
+            // Synology Delete is async on modern DSM: poll get_info until the file is
+            // gone (or inaccessible) before uploading, to avoid 418 AlreadyExists.
+            for _ in 0..10u8 {
+                match self.get_info(&full_path).await {
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                    Err(_) => break, // gone or inaccessible — safe to upload
+                }
+            }
         }
 
         let file_part = multipart::Part::bytes(data)
