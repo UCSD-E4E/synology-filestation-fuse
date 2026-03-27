@@ -18,14 +18,16 @@ A FUSE filesystem driver that mounts a [Synology FileStation](https://www.synolo
 
 ### System
 
-- Linux with FUSE support (`/dev/fuse`)
-- `libfuse3` runtime library (`libfuse3-3` on Ubuntu/Debian)
+- Linux with FUSE support (`/dev/fuse`), **or** macOS with [macFUSE](https://osxfuse.github.io/)
+- Linux: `libfuse3` runtime library (`libfuse3-3` on Ubuntu/Debian)
+- macOS: macFUSE kext (`brew install --cask macfuse`)
 - A Synology NAS running DSM with FileStation API enabled
 
 ### Build
 
 - Rust toolchain (1.70+) — install via [rustup](https://rustup.rs)
-- `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL)
+- Linux: `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL)
+- macOS: macFUSE SDK (`brew install --cask macfuse`)
 
 ```bash
 # Ubuntu / Debian
@@ -33,6 +35,9 @@ sudo apt-get install libfuse3-dev
 
 # Fedora / RHEL
 sudo dnf install fuse3-devel
+
+# macOS (requires Homebrew)
+brew install --cask macfuse
 ```
 
 ## Building
@@ -98,8 +103,11 @@ synology-filestation-fuse --host nas.local -u admin --read-cache-mb 512 /mnt/nas
 # Enable debug logging
 synology-filestation-fuse --host nas.local -u admin --log-level debug /mnt/nas
 
-# Unmount
+# Unmount (Linux)
 fusermount -u /mnt/nas
+
+# Unmount (macOS)
+umount /mnt/nas
 ```
 
 ## Architecture

@@ -1,4 +1,5 @@
 use std::sync::RwLock;
+use std::time::Duration;
 use bytes::Bytes;
 use reqwest::{Client, multipart};
 use tracing::debug;
@@ -21,6 +22,9 @@ impl SynologyClient {
         let base_url = format!("{}://{}:{}/webapi", scheme, host, port);
         let http = Client::builder()
             .danger_accept_invalid_certs(true) // common for self-signed NAS certs
+            // Drop idle connections after 4 s so we don't reuse connections the NAS
+            // has already closed on its side (~7 s keep-alive on most DSM versions).
+            .pool_idle_timeout(Duration::from_secs(4))
             .build()
             .expect("failed to build HTTP client");
         Self { http, base_url, sid: RwLock::new(None) }
@@ -188,6 +192,9 @@ impl SynologyClient {
     }
 
     /// Download file bytes, optionally with a byte range.
+    ///
+    /// Retries up to 2 times on transient connection errors (e.g. the NAS closing a
+    /// keep-alive connection mid-stream while the response body is being read).
     pub async fn download(
         &self,
         path: &str,
@@ -198,34 +205,54 @@ impl SynologyClient {
         let path_json = serde_json::to_string(&[path]).unwrap();
         debug!("download: {} offset={} len={}", path, offset, length);
 
-        let mut req = self.http
-            .get(&url)
-            .query(&[
-                ("api", "SYNO.FileStation.Download"),
-                ("version", "2"),
-                ("method", "download"),
-                ("path", &path_json),
-                ("mode", "download"),
-                ("_sid", &self.sid()),
-            ]);
+        let range_header = if length > 0 {
+            Some(format!("bytes={}-{}", offset, offset + length - 1))
+        } else {
+            None
+        };
 
-        if length > 0 {
-            let range = format!("bytes={}-{}", offset, offset + length - 1);
-            req = req.header("Range", range);
+        let mut last_err = SynoFsError::Io("no attempts".into());
+        for attempt in 0..3u8 {
+            if attempt > 0 {
+                debug!("download retry {} for {} offset={}", attempt, path, offset);
+            }
+
+            let mut req = self.http
+                .get(&url)
+                .query(&[
+                    ("api", "SYNO.FileStation.Download"),
+                    ("version", "2"),
+                    ("method", "download"),
+                    ("path", &path_json),
+                    ("mode", "download"),
+                    ("_sid", &self.sid()),
+                ]);
+
+            if let Some(ref range) = range_header {
+                req = req.header("Range", range.as_str());
+            }
+
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => { last_err = e.into(); continue; }
+            };
+
+            let status = resp.status();
+
+            // 416 Range Not Satisfiable = requested range starts past EOF; return empty (EOF signal).
+            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                return Ok(Bytes::new());
+            }
+            if !status.is_success() {
+                return Err(SynoFsError::Io(format!("download HTTP {}", status)));
+            }
+
+            match resp.bytes().await {
+                Ok(b) => return Ok(b),
+                Err(e) => { last_err = e.into(); }
+            }
         }
-
-        let resp = req.send().await?;
-        let status = resp.status();
-
-        // 416 Range Not Satisfiable = requested range starts past EOF; return empty (EOF signal).
-        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-            return Ok(Bytes::new());
-        }
-        if !status.is_success() {
-            return Err(SynoFsError::Io(format!("download HTTP {}", status)));
-        }
-
-        Ok(resp.bytes().await?)
+        Err(last_err)
     }
 
     /// Upload file contents (replaces entire file).

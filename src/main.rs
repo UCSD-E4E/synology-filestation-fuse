@@ -134,12 +134,14 @@ fn main() -> anyhow::Result<()> {
 
     let fs = SynologyFS::new(client.clone(), cache, read_cache, handle, uid, gid);
 
-    let options = vec![
+    let mut options = vec![
         MountOption::RW,
         MountOption::FSName("synology-fuse".to_string()),
-        MountOption::AutoUnmount,
         MountOption::AllowOther,
     ];
+    // AutoUnmount is Linux-only; macFUSE unmounts automatically when the process exits.
+    #[cfg(target_os = "linux")]
+    options.push(MountOption::AutoUnmount);
 
     info!("Mounting shares on {}", args.mountpoint.display());
 
