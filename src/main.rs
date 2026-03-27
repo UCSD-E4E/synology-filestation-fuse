@@ -61,6 +61,13 @@ struct Args {
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Use the macFUSE FSKit backend instead of the kernel extension.
+    /// Requires macOS 15.4+ and macFUSE 5.0+. No kernel extension approval needed.
+    /// The mount point must be a directory inside /Volumes.
+    #[cfg(target_os = "macos")]
+    #[arg(long, default_value_t = false)]
+    fskit: bool,
 }
 
 /// Synology API error 403 = "Account disabled" or "Incorrect password", but in the context of
@@ -134,14 +141,29 @@ fn main() -> anyhow::Result<()> {
 
     let fs = SynologyFS::new(client.clone(), cache, read_cache, handle, uid, gid);
 
+    // AutoUnmount is Linux-only; macFUSE unmounts automatically when the process exits.
+    #[cfg(target_os = "linux")]
+    let options = vec![
+        MountOption::RW,
+        MountOption::FSName("synology-fuse".to_string()),
+        MountOption::AllowOther,
+        MountOption::AutoUnmount,
+    ];
+    #[cfg(not(target_os = "linux"))]
     let mut options = vec![
         MountOption::RW,
         MountOption::FSName("synology-fuse".to_string()),
         MountOption::AllowOther,
     ];
-    // AutoUnmount is Linux-only; macFUSE unmounts automatically when the process exits.
-    #[cfg(target_os = "linux")]
-    options.push(MountOption::AutoUnmount);
+    // FSKit backend: no kernel extension required, but needs macOS 15.4+ and macFUSE 5.0+.
+    // Mount point must be inside /Volumes.
+    #[cfg(target_os = "macos")]
+    if args.fskit {
+        if !args.mountpoint.starts_with("/Volumes") {
+            eprintln!("warning: --fskit requires the mount point to be inside /Volumes");
+        }
+        options.push(MountOption::CUSTOM("backend=fskit".to_string()));
+    }
 
     info!("Mounting shares on {}", args.mountpoint.display());
 
