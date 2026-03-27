@@ -1,6 +1,6 @@
 # synology-fuse
 
-A FUSE filesystem driver that mounts a [Synology FileStation](https://www.synology.com/en-global/dsm/feature/file_station) share as a local directory on Linux. Written in Rust.
+A FUSE filesystem driver that mounts a [Synology FileStation](https://www.synology.com/en-global/dsm/feature/file_station) share as a local directory on Linux and macOS. Written in Rust.
 
 ## Features
 
@@ -18,16 +18,19 @@ A FUSE filesystem driver that mounts a [Synology FileStation](https://www.synolo
 
 ### System
 
-- Linux with FUSE support (`/dev/fuse`), **or** macOS with [macFUSE](https://osxfuse.github.io/)
-- Linux: `libfuse3` runtime library (`libfuse3-3` on Ubuntu/Debian)
-- macOS: macFUSE kext (`brew install --cask macfuse`)
-- A Synology NAS running DSM with FileStation API enabled
+| Platform | Requirement |
+|---|---|
+| Linux | FUSE support (`/dev/fuse`); `libfuse3-3` runtime (Ubuntu/Debian) |
+| macOS (kext) | [macFUSE](https://macfuse.io) 4.0+ — requires allowing a system extension in Recovery Mode |
+| macOS (FSKit) | [macFUSE](https://macfuse.io) 5.0+ and macOS 15.4+ — one-time approval in System Settings → Privacy & Security → Extensions; no Recovery Mode required |
+
+All platforms require a Synology NAS running DSM with FileStation API enabled.
 
 ### Build
 
 - Rust toolchain (1.70+) — install via [rustup](https://rustup.rs)
 - Linux: `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL)
-- macOS: macFUSE SDK (`brew install --cask macfuse`)
+- macOS: macFUSE 5.0+ (`brew install --cask macfuse`)
 
 ```bash
 # Ubuntu / Debian
@@ -68,6 +71,7 @@ synology-filestation-fuse --host <NAS_HOST> -u <USERNAME> [OPTIONS] <MOUNTPOINT>
 | `--cache-ttl <SECS>` | Metadata cache TTL in seconds | `30` |
 | `--read-cache-mb <MiB>` | Read cache size in MiB for file data blocks | `256` |
 | `--log-level <LEVEL>` | Log level (`error`, `warn`, `info`, `debug`, `trace`) | `info` |
+| `--fskit` | *(macOS only)* Use macFUSE FSKit backend — no kernel extension approval needed; requires macOS 15.4+ and macFUSE 5.0+; mount point must be inside `/Volumes` | `false` |
 
 ### Examples
 
@@ -108,6 +112,16 @@ fusermount -u /mnt/nas
 
 # Unmount (macOS)
 umount /mnt/nas
+
+# macOS with FSKit backend (macFUSE 5.0+, macOS 15.4+).
+# Mount point must be inside /Volumes.
+# First use: approve the macFUSE extension in
+#   System Settings → Privacy & Security → Extensions → File System Extensions
+# then restart. No Recovery Mode required.
+mkdir /Volumes/nas
+synology-filestation-fuse --host nas.local -u admin --fskit /Volumes/nas
+# Unmount
+umount /Volumes/nas
 ```
 
 ## Architecture
@@ -150,6 +164,7 @@ File and directory metadata is cached in a `moka` TTL cache (default 30 seconds)
 
 ## Known Limitations
 
+- **macOS FSKit backend is experimental.** Performance is lower than the kernel extension path and some operations may be unreliable. Requires macOS 15.4+ and macFUSE 5.0+. Mount point must be inside `/Volumes`.
 - **Cross-directory directory moves are not supported.** Moving a directory to a different parent returns `ENOSYS`. Only same-directory renames use the efficient `SYNO.FileStation.Rename` API.
 - **Cross-directory file moves are not atomic.** They are implemented as download → upload → delete. A failure mid-sequence may leave data duplicated or missing.
 - **Large files require large in-memory write buffers.** Writing to a file buffers the entire file content in process memory until the file is closed or flushed.
