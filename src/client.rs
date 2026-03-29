@@ -277,7 +277,7 @@ impl SynologyClient {
             // gone (or inaccessible) before uploading, to avoid 418 AlreadyExists.
             for _ in 0..10u8 {
                 match self.get_info(&full_path).await {
-                    Ok(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
                     Err(_) => break, // gone or inaccessible — safe to upload
                 }
             }

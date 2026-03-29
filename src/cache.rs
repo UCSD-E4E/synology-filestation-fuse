@@ -222,6 +222,14 @@ impl ReadCache {
         }
     }
 
+    /// Evict a single cached block (e.g. a stale EOF sentinel).
+    pub fn invalidate_block(&self, ino: u64, block_idx: u64) {
+        self.blocks.invalidate(&(ino, block_idx));
+        if let Some(set) = self.ino_blocks.write().unwrap().get_mut(&ino) {
+            set.remove(&block_idx);
+        }
+    }
+
     /// Evict all cached blocks for `ino` (call after writing or deleting a file).
     pub fn invalidate_ino(&self, ino: u64) {
         let indices = self.ino_blocks.write().unwrap().remove(&ino);

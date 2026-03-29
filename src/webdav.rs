@@ -158,6 +158,9 @@ struct SynoDavFile {
     offset: u64,
     /// Buffered write data; `Some` when opened for writing.
     write_buf: Option<Vec<u8>>,
+    /// True when the file did not exist on the NAS at open time.
+    /// Used to skip the delete-before-upload overwrite path.
+    is_new: bool,
 }
 
 impl DavFile for SynoDavFile {
@@ -224,10 +227,11 @@ impl DavFile for SynoDavFile {
             }
             let client = self.client.clone();
             let path = self.nas_path.clone();
+            let overwrite = !self.is_new;
             Box::pin(async move {
                 let (parent, filename) = split_path(&path);
                 client
-                    .upload(parent, filename, data, true)
+                    .upload(parent, filename, data, overwrite)
                     .await
                     .map_err(syno_err)
             })
@@ -330,21 +334,24 @@ impl DavFileSystem for SynologyDavFs {
                         info,
                         offset: 0,
                         write_buf: Some(Vec::new()),
+                        is_new: false,
                     });
                     return Ok(file);
                 }
 
                 // For a write/create open, the caller will PUT the content.
                 // We build a placeholder SynoFileInfo so flush() knows where to upload.
-                let info = match self.client.get_info(&nas).await {
-                    Ok(info) => info,
-                    Err(_) => SynoFileInfo {
+                // Track whether the file already exists so flush() can skip the
+                // delete-before-overwrite path for brand-new files.
+                let (info, is_new) = match self.client.get_info(&nas).await {
+                    Ok(info) => (info, false),
+                    Err(_) => (SynoFileInfo {
                         name: nas.rsplit('/').next().unwrap_or("").to_string(),
                         path: nas.clone(),
                         isdir: false,
                         additional: None,
                         code: None,
-                    },
+                    }, true),
                 };
 
                 let file: Box<dyn DavFile> = Box::new(SynoDavFile {
@@ -353,6 +360,7 @@ impl DavFileSystem for SynologyDavFs {
                     info,
                     offset: 0,
                     write_buf: Some(Vec::new()),
+                    is_new,
                 });
                 Ok(file)
             } else {
@@ -363,6 +371,7 @@ impl DavFileSystem for SynologyDavFs {
                     info,
                     offset: 0,
                     write_buf: None,
+                    is_new: false,
                 });
                 Ok(file)
             }
