@@ -9,7 +9,7 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use libc::{EIO, ENOENT, ENOSYS};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cache::{InodeCache, ReadCache};
 use crate::client::SynologyClient;
@@ -205,6 +205,7 @@ impl Filesystem for SynologyFS {
             code: None,
         };
         self.cache.seed_root(root_info);
+        info!("NAS is mounted and ready for use");
         Ok(())
     }
 
