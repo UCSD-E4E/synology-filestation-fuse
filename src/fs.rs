@@ -8,7 +8,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{EIO, ENOENT, ENOSYS};
+use libc::{EISDIR, EIO, ENOENT, ENOTEMPTY, ENOSYS, ENOTDIR};
 use tracing::{debug, error, warn};
 
 use crate::cache::{InodeCache, ReadCache};
@@ -874,11 +874,58 @@ impl Filesystem for SynologyFS {
         // fully atomic and can lose the destination if a crash occurs between steps.
         if parent == new_parent {
             if old_path != new_path {
-                if let Some(ino) = self.cache.get_ino_for_path(&new_path) {
-                    self.read_cache.invalidate_ino(ino);
+                // Determine source type (file vs. directory) from the metadata cache.
+                let src_ino = self.cache.get_or_alloc_ino(&old_path);
+                let src_is_dir = self.cache.get_by_ino(src_ino)
+                    .map(|e| e.info.isdir)
+                    .unwrap_or(false);
+
+                // Check what is at the destination and enforce POSIX rename(2) semantics.
+                match self.block(self.client.get_info(&new_path)) {
+                    Ok(dst_info) => {
+                        if src_is_dir && !dst_info.isdir {
+                            // rename(dir, file) → ENOTDIR
+                            reply.error(ENOTDIR);
+                            return;
+                        }
+                        if !src_is_dir && dst_info.isdir {
+                            // rename(file, dir) → EISDIR
+                            reply.error(EISDIR);
+                            return;
+                        }
+                        if dst_info.isdir {
+                            // rename(dir, dir) is only permitted when the destination is empty.
+                            match self.block(self.client.list_dir(&new_path)) {
+                                Ok(entries) if !entries.is_empty() => {
+                                    reply.error(ENOTEMPTY);
+                                    return;
+                                }
+                                Err(e) => {
+                                    reply.error(e.to_errno());
+                                    return;
+                                }
+                                Ok(_) => {} // empty directory — safe to remove
+                            }
+                        }
+                        // Destination is a file or an empty directory — safe to remove.
+                        if let Some(ino) = self.cache.get_ino_for_path(&new_path) {
+                            self.read_cache.invalidate_ino(ino);
+                        }
+                        self.cache.invalidate_path(&new_path);
+                        if let Err(e) = self.block(self.client.delete(&new_path)) {
+                            reply.error(e.to_errno());
+                            return;
+                        }
+                    }
+                    Err(SynoFsError::NotFound | SynoFsError::ApiError(414 | 415)) => {
+                        // Destination does not exist — nothing to remove.
+                        self.cache.invalidate_path(&new_path);
+                    }
+                    Err(e) => {
+                        reply.error(e.to_errno());
+                        return;
+                    }
                 }
-                self.cache.invalidate_path(&new_path);
-                let _ = self.block(self.client.delete(&new_path)); // ignore error — may not exist
             }
             match self.block(self.client.rename(&old_path, new_name_str)) {
                 Ok(info) => {
