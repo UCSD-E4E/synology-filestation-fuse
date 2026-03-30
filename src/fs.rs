@@ -868,8 +868,10 @@ impl Filesystem for SynologyFS {
         debug!("rename: {} -> {}", old_path, new_path);
 
         // Same directory: use the efficient Rename API.
-        // POSIX rename(2) must atomically replace the destination if it exists.
-        // The Synology Rename API does not overwrite — delete the destination first.
+        // POSIX rename(2) atomically replaces the destination if it exists, but the
+        // Synology Rename API cannot overwrite. We approximate POSIX "replace"
+        // semantics by deleting the destination first, then renaming, which is not
+        // fully atomic and can lose the destination if a crash occurs between steps.
         if parent == new_parent {
             if old_path != new_path {
                 if let Some(ino) = self.cache.get_ino_for_path(&new_path) {
