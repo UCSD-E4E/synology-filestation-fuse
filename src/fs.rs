@@ -155,7 +155,7 @@ impl SynologyFS {
 
         let nas_path = buf.nas_path.clone();
         let ino = buf.ino;
-        let data = buf.data.clone();
+        let data = std::mem::take(&mut buf.data);
         let overwrite = !buf.new_file;
         buf.dirty = false;
 
