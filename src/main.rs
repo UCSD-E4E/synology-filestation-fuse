@@ -201,7 +201,14 @@ async fn serve_and_mount(
     let volume_name = mountpoint
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "mountpoint '{}' has no final path component; \
+                 please provide a path like '/Volumes/nas' rather than a root or trailing-slash path",
+                mountpoint.display()
+            )
+        })?;
     let path_prefix = format!("/{}", volume_name);
 
     let handler = Arc::new(
