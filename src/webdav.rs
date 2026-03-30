@@ -345,13 +345,17 @@ impl DavFileSystem for SynologyDavFs {
                 // delete-before-overwrite path for brand-new files.
                 let (info, is_new) = match self.client.get_info(&nas).await {
                     Ok(info) => (info, false),
-                    Err(_) => (SynoFileInfo {
-                        name: nas.rsplit('/').next().unwrap_or("").to_string(),
-                        path: nas.clone(),
-                        isdir: false,
-                        additional: None,
-                        code: None,
-                    }, true),
+                    Err(SynoFsError::NotFound) => (
+                        SynoFileInfo {
+                            name: nas.rsplit('/').next().unwrap_or("").to_string(),
+                            path: nas.clone(),
+                            isdir: false,
+                            additional: None,
+                            code: None,
+                        },
+                        true,
+                    ),
+                    Err(err) => return Err(syno_err(err)),
                 };
 
                 let file: Box<dyn DavFile> = Box::new(SynoDavFile {
