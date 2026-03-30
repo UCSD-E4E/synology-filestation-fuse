@@ -26,6 +26,13 @@ impl SynologyClient {
             // Drop idle connections after 4 s so we don't reuse connections the NAS
             // has already closed on its side (~7 s keep-alive on most DSM versions).
             .pool_idle_timeout(Duration::from_secs(4))
+            // Fail fast if the NAS is unreachable rather than waiting for the OS-level
+            // TCP timeout (~75 s on macOS, ETIMEDOUT / os error 60).
+            .connect_timeout(Duration::from_secs(10))
+            // Send TCP keepalive probes so stalled mid-transfer connections are
+            // detected in seconds rather than waiting for the full OS TCP timeout
+            // (~75 s on macOS, ETIMEDOUT / os error 60).
+            .tcp_keepalive(Duration::from_secs(10))
             .build()
             .expect("failed to build HTTP client");
         Self { http, base_url, sid: RwLock::new(None) }
@@ -283,40 +290,55 @@ impl SynologyClient {
             }
         }
 
-        let file_part = multipart::Part::bytes(data)
-            .file_name(filename.to_string())
-            .mime_str("application/octet-stream")
-            .map_err(|e| SynoFsError::Io(e.to_string()))?;
+        let mut last_err = SynoFsError::Io("no attempts".into());
+        for attempt in 0..3u8 {
+            if attempt > 0 {
+                debug!("upload retry {} for {}/{}", attempt, folder_path, filename);
+            }
 
-        let form = multipart::Form::new()
-            .text("api", "SYNO.FileStation.Upload")
-            .text("version", "3")
-            .text("method", "upload")
-            .text("path", folder_path.to_string())
-            .text("create_parents", "true")
-            .text("overwrite", "false")
-            .part("file", file_part);
+            let file_part = multipart::Part::bytes(data.clone())
+                .file_name(filename.to_string())
+                .mime_str("application/octet-stream")
+                .map_err(|e| SynoFsError::Io(e.to_string()))?;
 
-        let text = self.http
-            .post(&url)
-            .query(&[("_sid", self.sid())])
-            .multipart(form)
-            .send()
-            .await?
-            .text()
-            .await?;
+            let form = multipart::Form::new()
+                .text("api", "SYNO.FileStation.Upload")
+                .text("version", "3")
+                .text("method", "upload")
+                .text("path", folder_path.to_string())
+                .text("create_parents", "true")
+                .text("overwrite", "false")
+                .part("file", file_part);
 
-        debug!("upload raw response: {}", text);
+            let resp = match self.http
+                .post(&url)
+                .query(&[("_sid", self.sid())])
+                .multipart(form)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => { last_err = e.into(); continue; }
+            };
 
-        let resp: SynoResponse<UploadData> = serde_json::from_str(&text)
-            .map_err(|e| SynoFsError::Io(format!("upload parse error: {e}")))?;
+            let text = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => { last_err = e.into(); continue; }
+            };
 
-        if resp.success {
-            Ok(())
-        } else {
-            let code = resp.error.map(|e| e.code).unwrap_or(0);
-            Err(SynoFsError::ApiError(code))
+            debug!("upload raw response: {}", text);
+
+            let parsed: SynoResponse<UploadData> = serde_json::from_str(&text)
+                .map_err(|e| SynoFsError::Io(format!("upload parse error: {e}")))?;
+
+            return if parsed.success {
+                Ok(())
+            } else {
+                let code = parsed.error.map(|e| e.code).unwrap_or(0);
+                Err(SynoFsError::ApiError(code))
+            };
         }
+        Err(last_err)
     }
 
     /// Delete a file or directory (recursive for directories).
