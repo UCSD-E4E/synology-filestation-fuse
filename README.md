@@ -134,7 +134,7 @@ The mountpoint root is a synthetic directory that does not correspond to any rea
 
 ### macOS WebDAV backend
 
-On macOS the binary starts a local HTTP server (`127.0.0.1:<random port>`) that speaks WebDAV, then calls the macOS built-in `mount_webdav` to attach it at the requested mountpoint. This uses Apple's own `webdavfs` kernel support — no third-party kernel extension is required. The process exits cleanly on Ctrl-C or when the volume is ejected from Finder.
+On macOS the binary starts a local HTTP server (`127.0.0.1:<random port>`) that speaks WebDAV, then uses AppleScript (`osascript -e 'mount volume …'`) to ask Finder to attach it at the requested mountpoint. This uses Apple's own `webdavfs` kernel support — no third-party kernel extension is required. The process exits cleanly on Ctrl-C or when the volume is ejected from Finder.
 
 WebDAV operations map to FileStation API calls:
 

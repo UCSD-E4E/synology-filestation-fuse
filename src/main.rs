@@ -229,10 +229,13 @@ async fn serve_and_mount(
 
     // Start the accept loop BEFORE calling osascript so that Finder's probe
     // requests are answered immediately.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    //
+    // Use a Notify so that either Ctrl-C or a Finder eject can independently
+    // trigger the shutdown without consuming the signal.
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let handler_srv = handler.clone();
+    let shutdown_notify_srv = shutdown_notify.clone();
     let server_task = tokio::spawn(async move {
-        let mut shutdown_rx = shutdown_rx;
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -252,7 +255,7 @@ async fn serve_and_mount(
                         }
                     });
                 }
-                _ = &mut shutdown_rx => {
+                _ = shutdown_notify_srv.notified() => {
                     info!("WebDAV server shutting down");
                     break;
                 }
@@ -275,7 +278,7 @@ async fn serve_and_mount(
         .await?;
 
     if !out.status.success() {
-        let _ = shutdown_tx.send(());
+        let _ = shutdown_notify.notify_one();
         server_task.await.ok();
         anyhow::bail!(
             "osascript mount failed ({}): {}",
@@ -286,8 +289,24 @@ async fn serve_and_mount(
 
     info!("Mounted at {}", mountpoint.display());
 
+    // Watch for Finder eject: poll until the mountpoint disappears, then shut
+    // down the WebDAV server so the process can exit cleanly.
+    let mp_watch = mountpoint.to_path_buf();
+    let shutdown_notify_eject = shutdown_notify.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            if !mp_watch.exists() {
+                info!("Volume ejected from Finder, shutting down");
+                shutdown_notify_eject.notify_one();
+                break;
+            }
+        }
+    });
+
     // Ctrl-C → unmount and stop serving.
     let mp = mountpoint.to_path_buf();
+    let shutdown_notify_ctrlc = shutdown_notify.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         info!("Signal received, unmounting {}…", mp.display());
@@ -298,7 +317,7 @@ async fn serve_and_mount(
         // macOS does not always remove the /Volumes/<name> directory after
         // unmounting a WebDAV volume.  Remove it ourselves if it is now empty.
         let _ = std::fs::remove_dir(&mp);
-        let _ = shutdown_tx.send(());
+        shutdown_notify_ctrlc.notify_one();
     });
 
     server_task.await.ok();
