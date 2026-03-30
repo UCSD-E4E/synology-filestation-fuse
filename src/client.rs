@@ -282,10 +282,31 @@ impl SynologyClient {
 
             // Synology Delete is async on modern DSM: poll get_info until the file is
             // gone (or inaccessible) before uploading, to avoid 418 AlreadyExists.
-            for _ in 0..10u8 {
+            for attempt in 0..10u8 {
                 match self.get_info(&full_path).await {
-                    Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-                    Err(_) => break, // gone or inaccessible — safe to upload
+                    // File still present: wait a bit and poll again.
+                    Ok(_) => {
+                        tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
+                    }
+                    Err(err) => {
+                        match err {
+                            // Definitive "not found" / already gone: safe to proceed.
+                            SynoFsError::NotFound
+                            | SynoFsError::ApiError(414 | 415) => {
+                                break;
+                            }
+                            // Transient or other errors: keep polling until attempts exhausted.
+                            _ => {
+                                debug!(
+                                    "get_info error while waiting for delete of {}: {:?} (attempt {}), retrying",
+                                    full_path,
+                                    err,
+                                    attempt
+                                );
+                                tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
+                            }
+                        }
+                    }
                 }
             }
         }
