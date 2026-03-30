@@ -874,11 +874,17 @@ impl Filesystem for SynologyFS {
         // fully atomic and can lose the destination if a crash occurs between steps.
         if parent == new_parent {
             if old_path != new_path {
-                // Determine source type (file vs. directory) from the metadata cache.
+                // Determine source type (file vs. directory).  Prefer the metadata cache;
+                // fall back to an API call if the entry was TTL-evicted so we never
+                // silently default to "file" for a directory source.
                 let src_ino = self.cache.get_or_alloc_ino(&old_path);
-                let src_is_dir = self.cache.get_by_ino(src_ino)
-                    .map(|e| e.info.isdir)
-                    .unwrap_or(false);
+                let src_is_dir = match self.cache.get_by_ino(src_ino) {
+                    Some(entry) => entry.info.isdir,
+                    None => match self.block(self.client.get_info(&old_path)) {
+                        Ok(info) => info.isdir,
+                        Err(e) => { reply.error(e.to_errno()); return; }
+                    },
+                };
 
                 // Check what is at the destination and enforce POSIX rename(2) semantics.
                 match self.block(self.client.get_info(&new_path)) {
@@ -917,8 +923,9 @@ impl Filesystem for SynologyFS {
                             return;
                         }
                     }
+                    // API codes 414 ("No such file") and 415 ("No such folder") mean the
+                    // destination does not exist — nothing to remove.
                     Err(SynoFsError::NotFound | SynoFsError::ApiError(414 | 415)) => {
-                        // Destination does not exist — nothing to remove.
                         self.cache.invalidate_path(&new_path);
                     }
                     Err(e) => {
