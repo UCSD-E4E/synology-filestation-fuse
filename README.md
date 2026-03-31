@@ -40,6 +40,41 @@ sudo dnf install fuse3-devel
 
 macOS requires no additional build dependencies.
 
+### Linux FUSE configuration (allow_other)
+
+By default, a FUSE mount is only accessible to the user who created it.
+The driver attempts to enable `allow_other` so that other users (and root) can
+also access the mount. On Ubuntu 24.04 and other distributions that ship
+`fusermount3`, this requires `user_allow_other` to be set in `/etc/fuse.conf`.
+
+If that option is not present, the driver falls back to mounting **without**
+`allow_other` and logs a warning — the mount still works for the mounting user.
+
+To enable access for all users, edit `/etc/fuse.conf` and uncomment (or add) the
+`user_allow_other` line:
+
+```bash
+# /etc/fuse.conf
+# Allow non-root users to specify the allow_other or allow_root mount options
+user_allow_other
+```
+
+You can do this in one command:
+
+```bash
+# If the line exists but is commented out, uncomment it;
+# otherwise append it (handles fresh installs where the line is absent).
+if grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null; then
+    : # already enabled — nothing to do
+elif grep -qE '^#[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null; then
+    sudo sed -i 's/^#[[:space:]]*user_allow_other/user_allow_other/' /etc/fuse.conf
+else
+    echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+fi
+```
+
+After saving the file, remount and all users will be able to access the share.
+
 ## Building
 
 ```bash
