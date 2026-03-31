@@ -8,7 +8,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{EIO, ENOENT, ENOSYS};
+use libc::{EISDIR, EIO, ENOENT, ENOTEMPTY, ENOSYS, ENOTDIR};
 use tracing::{debug, error, info, warn};
 
 use crate::cache::{InodeCache, ReadCache};
