@@ -85,6 +85,21 @@ fn prompt(label: &str) -> anyhow::Result<String> {
     Ok(value.trim().to_string())
 }
 
+/// Returns `true` when `/etc/fuse.conf` contains an uncommented
+/// `user_allow_other` line, meaning a non-root user is permitted to pass the
+/// `allow_other` option to `fusermount`/`fusermount3`.
+#[cfg(target_os = "linux")]
+fn fuse_conf_allows_other() -> bool {
+    let contents = match std::fs::read_to_string("/etc/fuse.conf") {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    contents.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with('#') && trimmed == "user_allow_other"
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -153,12 +168,24 @@ fn main() -> anyhow::Result<()> {
 
         let fs = SynologyFS::new(client.clone(), cache, read_cache, handle, uid, gid);
 
-        let options = vec![
+        let mut options = vec![
             MountOption::RW,
             MountOption::FSName("synology-fuse".to_string()),
-            MountOption::AllowOther,
             MountOption::AutoUnmount,
         ];
+
+        // `allow_other` lets other users (and root) access the mount.
+        // As a non-root user this requires `user_allow_other` in /etc/fuse.conf.
+        // Running as root always permits it (short-circuits the file read).
+        if uid == 0 || fuse_conf_allows_other() {
+            options.push(MountOption::AllowOther);
+        } else {
+            tracing::warn!(
+                "allow_other is not enabled: only the mounting user can access the \
+                 filesystem. To allow other users, add or uncomment \
+                 `user_allow_other` in /etc/fuse.conf."
+            );
+        }
 
         info!("Mounting shares on {}", args.mountpoint.display());
         fuser::mount2(fs, &args.mountpoint, &options)?;
