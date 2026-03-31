@@ -198,6 +198,10 @@ async fn serve_and_mount(
     // Extract the desired volume name from the last component of the path
     // (e.g. "/Volumes/nas" → "nas") and use it as a URL path prefix so that
     // macOS names the mounted volume correctly.
+    //
+    // Percent-encode the name so that spaces and other URL-special characters
+    // don't produce a malformed URL.  Only characters that are safe as a URL
+    // path segment (unreserved per RFC 3986) are left unencoded.
     let volume_name = mountpoint
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -209,7 +213,19 @@ async fn serve_and_mount(
                 mountpoint.display()
             )
         })?;
-    let path_prefix = format!("/{}", volume_name);
+    // Percent-encode every byte that is not an RFC 3986 unreserved character.
+    let volume_name_encoded: String = volume_name
+        .bytes()
+        .flat_map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                // Safe ASCII: use char::from to make the ASCII assumption explicit.
+                vec![char::from(b)]
+            } else {
+                format!("%{:02X}", b).chars().collect::<Vec<_>>()
+            }
+        })
+        .collect();
+    let path_prefix = format!("/{}", volume_name_encoded);
 
     let handler = Arc::new(
         DavHandler::builder()
@@ -270,12 +286,27 @@ async fn serve_and_mount(
         let _ = std::fs::remove_dir(mountpoint);
     }
 
-    // Ask Finder to mount the volume via AppleScript.
+    // Ask Finder to mount the volume via AppleScript.  Pass the script via stdin
+    // (rather than -e "...") so that the URL is never interpolated into a shell
+    // command string, eliminating any risk of AppleScript injection.
     let script = format!("mount volume \"{}\"", url);
-    let out = tokio::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .await?;
+    let mut child = tokio::process::Command::new("osascript")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn osascript: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt as _;
+        stdin.write_all(script.as_bytes()).await
+            .map_err(|e| anyhow::anyhow!("failed to write to osascript stdin: {}", e))?;
+        // stdin is dropped/closed here, signalling EOF to osascript
+    }
+
+    let out = child.wait_with_output()
+        .await
+        .map_err(|e| anyhow::anyhow!("osascript wait failed: {}", e))?;
 
     if !out.status.success() {
         let _ = shutdown_notify.notify_one();

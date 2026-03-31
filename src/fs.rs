@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
@@ -155,7 +156,7 @@ impl SynologyFS {
 
         let nas_path = buf.nas_path.clone();
         let ino = buf.ino;
-        let data = std::mem::take(&mut buf.data);
+        let data = Bytes::from(std::mem::take(&mut buf.data));
         let overwrite = !buf.new_file;
         buf.dirty = false;
 
@@ -205,7 +206,7 @@ impl SynologyFS {
             }
             let path = buf.nas_path.clone();
             let ino = buf.ino;
-            let data = buf.data.clone();
+            let data = Bytes::from(std::mem::take(&mut buf.data));
             let overwrite = !buf.new_file;
             buf.dirty = false;
             (handle, true, path, ino, data, overwrite)
@@ -684,9 +685,17 @@ impl Filesystem for SynologyFS {
         reply: ReplyEmpty,
     ) {
         debug!("flush: fh={}", fh);
-        // Kick off the upload in the background; release() will wait for completion.
+        // Kick off the upload and wait for completion so that any errors
+        // are reported back to the caller of close(2) via flush, as FUSE expects.
         self.queue_upload(fh);
-        reply.ok();
+        let result = self.finish_upload(fh);
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                error!("flush fh={}: {}", fh, e);
+                reply.error(e.to_errno());
+            }
+        }
     }
 
     fn release(
@@ -965,8 +974,21 @@ impl Filesystem for SynologyFS {
             return;
         }
 
-        // Cross-directory file move: download, upload, delete
-        // Get the file size first
+        // Cross-directory file move: check destination type, then download→upload→delete.
+        // Check if the destination exists and is a directory; if so, refuse.
+        match self.block(self.client.get_info(&new_path)) {
+            Ok(dst_info) if dst_info.isdir => {
+                reply.error(EISDIR);
+                return;
+            }
+            Ok(_) => {} // destination is a file: safe to overwrite
+            // Synology FileStation API code 414 = "No such file or directory",
+            // 415 = "No such folder": destination simply does not exist, proceed.
+            Err(SynoFsError::NotFound) | Err(SynoFsError::ApiError(414 | 415)) => {} // destination doesn't exist
+            Err(e) => { reply.error(e.to_errno()); return; }
+        }
+
+        // Get the file size for the source
         let file_size = self.cache.get_by_ino(
             self.cache.get_or_alloc_ino(&old_path)
         ).and_then(|e| e.info.additional.as_ref()?.size).unwrap_or(0);
@@ -976,7 +998,7 @@ impl Filesystem for SynologyFS {
             Err(e) => { reply.error(e.to_errno()); return; }
         };
 
-        match self.block(self.client.upload(&new_parent_path, new_name_str, data.to_vec(), true)) {
+        match self.block(self.client.upload(&new_parent_path, new_name_str, data, true)) {
             Ok(()) => {}
             Err(e) => { reply.error(e.to_errno()); return; }
         }
@@ -1032,7 +1054,7 @@ impl Filesystem for SynologyFS {
             let parent = path.rfind('/').map(|i| &path[..i]).unwrap_or("/");
             let filename = &path[path.rfind('/').unwrap_or(0) + 1..];
 
-            match self.block(self.client.upload(parent, filename, data, true)) {
+            match self.block(self.client.upload(parent, filename, Bytes::from(data), true)) {
                 Ok(()) => {
                     self.read_cache.invalidate_ino(ino);
                     self.cache.invalidate_path(&path);

@@ -264,11 +264,13 @@ impl SynologyClient {
     }
 
     /// Upload file contents (replaces entire file).
+    /// Accepts `Bytes` so that retry attempts share the same backing buffer
+    /// (cheap `clone`) rather than making a full copy of the data each time.
     pub async fn upload(
         &self,
         folder_path: &str,
         filename: &str,
-        data: Vec<u8>,
+        data: Bytes,
         overwrite: bool,
     ) -> Result<(), SynoFsError> {
         let url = format!("{}/entry.cgi", self.base_url);
@@ -317,7 +319,8 @@ impl SynologyClient {
                 debug!("upload retry {} for {}/{}", attempt, folder_path, filename);
             }
 
-            let file_part = multipart::Part::bytes(data.clone())
+            // Clone is O(1) for `Bytes` (just bumps the reference count).
+            let file_part = multipart::Part::stream_with_length(data.clone(), data.len() as u64)
                 .file_name(filename.to_string())
                 .mime_str("application/octet-stream")
                 .map_err(|e| SynoFsError::Io(e.to_string()))?;

@@ -442,7 +442,7 @@ impl DavFileSystem for SynologyDavFs {
                     .await
                     .map_err(syno_err)?;
                 self.client
-                    .upload(to_parent, to_name, data.to_vec(), true)
+                    .upload(to_parent, to_name, data, true)
                     .await
                     .map_err(syno_err)?;
                 self.client.delete(&from_nas).await.map_err(syno_err)
@@ -467,7 +467,7 @@ impl DavFileSystem for SynologyDavFs {
                 .map_err(syno_err)?;
             let (to_parent, to_name) = split_path(&to_nas);
             self.client
-                .upload(to_parent, to_name, data.to_vec(), true)
+                .upload(to_parent, to_name, data, true)
                 .await
                 .map_err(syno_err)
         })
