@@ -20,8 +20,16 @@ fn dav_to_nas(path: &DavPath, prefix: &str) -> String {
     let pb = path.as_pathbuf();
     let s = pb.to_string_lossy();
     let s = s.trim_end_matches('/');
+    // Only strip the prefix when it matches at a path-component boundary so
+    // that a prefix of "/nas" does not incorrectly strip "/nasfoo/...".
     let s = if !prefix.is_empty() && s.starts_with(prefix) {
-        &s[prefix.len()..]
+        if s.len() == prefix.len() {
+            ""
+        } else if matches!(s.as_bytes().get(prefix.len()), Some(b'/')) {
+            &s[prefix.len()..]
+        } else {
+            s
+        }
     } else {
         s
     };
@@ -228,6 +236,9 @@ impl DavFile for SynoDavFile {
             let client = self.client.clone();
             let path = self.nas_path.clone();
             let overwrite = !self.is_new;
+            // After this flush, the file exists on the NAS regardless of whether
+            // it was new, so subsequent flushes on the same handle must overwrite.
+            self.is_new = false;
             Box::pin(async move {
                 let (parent, filename) = split_path(&path);
                 client
@@ -436,6 +447,12 @@ impl DavFileSystem for SynologyDavFs {
                 if info.isdir {
                     return Err(FsError::NotImplemented);
                 }
+                // Refuse to overwrite an existing directory at the destination.
+                if let Ok(dest_info) = self.client.get_info(&to_nas).await {
+                    if dest_info.isdir {
+                        return Err(FsError::Forbidden);
+                    }
+                }
                 let size = info.additional.as_ref().and_then(|a| a.size).unwrap_or(0);
                 let data = self.client
                     .download(&from_nas, 0, size)
@@ -459,6 +476,12 @@ impl DavFileSystem for SynologyDavFs {
             let info = self.client.get_info(&from_nas).await.map_err(syno_err)?;
             if info.isdir {
                 return Err(FsError::NotImplemented);
+            }
+            // Refuse to overwrite an existing directory at the destination.
+            if let Ok(dest_info) = self.client.get_info(&to_nas).await {
+                if dest_info.isdir {
+                    return Err(FsError::Forbidden);
+                }
             }
             let size = info.additional.as_ref().and_then(|a| a.size).unwrap_or(0);
             let data = self.client

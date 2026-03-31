@@ -261,13 +261,21 @@ async fn serve_and_mount(
                     };
                     let io = TokioIo::new(stream);
                     let h = handler_srv.clone();
+                    let shutdown_notify_conn = shutdown_notify_srv.clone();
                     tokio::spawn(async move {
                         let svc = hyper::service::service_fn(move |req| {
                             let h = h.clone();
                             async move { Ok::<_, Infallible>(h.handle(req).await) }
                         });
-                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                            tracing::debug!("WebDAV connection closed: {}", e);
+                        tokio::select! {
+                            _ = shutdown_notify_conn.notified() => {
+                                tracing::debug!("WebDAV connection aborted due to shutdown");
+                            }
+                            result = http1::Builder::new().serve_connection(io, svc) => {
+                                if let Err(e) = result {
+                                    tracing::debug!("WebDAV connection closed: {}", e);
+                                }
+                            }
                         }
                     });
                 }

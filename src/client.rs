@@ -280,7 +280,14 @@ impl SynologyClient {
         // Delete the existing file first so we can always upload with overwrite=false.
         if overwrite {
             let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
-            let _ = self.delete(&full_path).await; // ignore error — file may not exist yet
+            // Surface non-NotFound delete errors rather than masking them with
+            // a misleading AlreadyExists/upload error later.
+            match self.delete(&full_path).await {
+                Ok(()) => {}
+                // Treat these as "already gone": proceed to the poll loop.
+                Err(SynoFsError::NotFound) | Err(SynoFsError::ApiError(414 | 415)) => {}
+                Err(e) => return Err(e),
+            }
 
             // Synology Delete is async on modern DSM: poll get_info until the file is
             // gone (or inaccessible) before uploading, to avoid 418 AlreadyExists.
