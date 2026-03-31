@@ -5,6 +5,7 @@ use serde::Deserialize;
 /// the API returns `success:true` but puts `{"code":NNN,"path":"..."}` in the files
 /// array instead of a real entry.  The `code` field captures that per-entry error.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SynoFileInfo {
     #[serde(default)]
     pub name: String,
@@ -17,6 +18,7 @@ pub struct SynoFileInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SynoAdditional {
     pub size: Option<u64>,
     pub owner: Option<SynoOwner>,
@@ -34,6 +36,7 @@ pub struct SynoOwner {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SynoTime {
     pub atime: i64,
     pub mtime: i64,
@@ -42,6 +45,7 @@ pub struct SynoTime {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SynoPerm {
     pub posix: u32,
 }
@@ -78,6 +82,7 @@ pub struct ListShareData {
 }
 
 /// Sentinel path stored in the inode cache for the virtual root (the share listing).
+#[cfg(target_os = "linux")]
 pub const VIRTUAL_ROOT_PATH: &str = "";
 
 /// GetInfo response data
@@ -106,6 +111,7 @@ pub struct UploadData {
 }
 
 /// An entry in the inode cache
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub struct InodeEntry {
     pub ino: u64,

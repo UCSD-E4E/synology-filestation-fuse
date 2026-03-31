@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use libc::{EACCES, EAGAIN, EEXIST, EINVAL, EIO, ENOENT, ENOTEMPTY, ENOSPC, ENOSYS};
 
 #[derive(Debug)]
@@ -16,6 +17,7 @@ pub enum SynoFsError {
 }
 
 impl SynoFsError {
+    #[cfg(target_os = "linux")]
     pub fn to_errno(&self) -> i32 {
         match self {
             Self::NotFound => ENOENT,
@@ -31,6 +33,7 @@ impl SynoFsError {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn syno_code_to_errno(code: u32) -> i32 {
     match code {
         // Common FileStation errors
@@ -88,7 +91,7 @@ impl From<serde_json::Error> for SynoFsError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

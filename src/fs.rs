@@ -26,6 +26,11 @@ struct WriteBuffer {
     ino: u64,
     data: Vec<u8>,
     dirty: bool,
+    /// True when the file was just created and has not yet been uploaded.
+    /// Allows flush to use overwrite=false, skipping the delete-before-upload round trips.
+    new_file: bool,
+    /// In-flight background upload spawned by flush(); waited on in release().
+    upload_handle: Option<tokio::task::JoinHandle<Result<(), SynoFsError>>>,
 }
 
 pub struct SynologyFS {
@@ -138,19 +143,79 @@ impl SynologyFS {
         self.cache.get_path_for_ino(ino)
     }
 
-    fn flush_write_buffer(&self, fh: u64) -> Result<(), SynoFsError> {
-        let (nas_path, ino, data) = {
+    /// Spawn a background upload for `fh` if the buffer is dirty.
+    /// Returns immediately; the actual upload runs on the tokio runtime.
+    /// `release` / `destroy` must call `finish_upload` to wait for completion.
+    fn queue_upload(&self, fh: u64) {
+        let mut buffers = self.write_buffers.lock().unwrap();
+        let buf = match buffers.get_mut(&fh) {
+            Some(b) if b.dirty && b.upload_handle.is_none() => b,
+            _ => return,
+        };
+
+        let nas_path = buf.nas_path.clone();
+        let ino = buf.ino;
+        let data = buf.data.clone();
+        let overwrite = !buf.new_file;
+        buf.dirty = false;
+
+        let parent = match nas_path.rfind('/') {
+            Some(i) => nas_path[..i].to_string(),
+            None => return,
+        };
+        let filename = nas_path[nas_path.rfind('/').unwrap() + 1..].to_string();
+
+        debug!("queue_upload: fh={} parent={:?} filename={:?} size={}", fh, parent, filename, data.len());
+
+        let client = self.client.clone();
+        let cache = self.cache.clone();
+        let read_cache = self.read_cache.clone();
+        let path_for_task = nas_path.clone();
+
+        // Spawn the upload; hold the mutex so the handle is stored before release() can run.
+        let handle = self.rt.spawn(async move {
+            let result = client.upload(&parent, &filename, data, overwrite).await;
+            cache.invalidate_path(&path_for_task);
+            read_cache.invalidate_ino(ino);
+            result
+        });
+
+        buf.upload_handle = Some(handle);
+    }
+
+    /// Wait for any in-flight upload for `fh`, and synchronously upload any
+    /// remaining dirty data.  Called from `release` and `destroy`.
+    fn finish_upload(&self, fh: u64) -> Result<(), SynoFsError> {
+        // Extract both the handle and dirty state without holding the lock while blocking.
+        let (handle, dirty, nas_path, ino, data, overwrite) = {
             let mut buffers = self.write_buffers.lock().unwrap();
             let buf = match buffers.get_mut(&fh) {
-                Some(b) if b.dirty => b,
-                _ => return Ok(()),
+                Some(b) => b,
+                None => return Ok(()),
             };
+            let handle = buf.upload_handle.take();
+            if !buf.dirty {
+                // Nothing new to upload — just wait for any in-flight task.
+                drop(buffers);
+                return if let Some(h) = handle {
+                    self.block(h).map_err(|_| SynoFsError::Io("upload task panicked".into()))?
+                } else {
+                    Ok(())
+                };
+            }
             let path = buf.nas_path.clone();
             let ino = buf.ino;
             let data = buf.data.clone();
+            let overwrite = !buf.new_file;
             buf.dirty = false;
-            (path, ino, data)
+            (handle, true, path, ino, data, overwrite)
         };
+        let _ = dirty; // used implicitly — we only reach here when dirty was true
+
+        // Wait for any in-flight upload of older data before uploading the newer data.
+        if let Some(h) = handle {
+            self.block(h).map_err(|_| SynoFsError::Io("upload task panicked".into()))??;
+        }
 
         let parent = match nas_path.rfind('/') {
             Some(i) => &nas_path[..i],
@@ -158,8 +223,8 @@ impl SynologyFS {
         };
         let filename = &nas_path[nas_path.rfind('/').unwrap() + 1..];
 
-        debug!("flush_write_buffer: fh={} parent={:?} filename={:?} size={}", fh, parent, filename, data.len());
-        self.block(self.client.upload(parent, filename, data, true))?;
+        debug!("finish_upload: fh={} parent={:?} filename={:?} size={}", fh, parent, filename, data.len());
+        self.block(self.client.upload(parent, filename, data, overwrite))?;
         self.cache.invalidate_path(&nas_path);
         self.read_cache.invalidate_ino(ino);
         Ok(())
@@ -214,7 +279,7 @@ impl Filesystem for SynologyFS {
         // Flush any remaining write buffers
         let fhs: Vec<u64> = self.write_buffers.lock().unwrap().keys().cloned().collect();
         for fh in fhs {
-            if let Err(e) = self.flush_write_buffer(fh) {
+            if let Err(e) = self.finish_upload(fh) {
                 warn!("destroy: failed to flush fh {}: {}", fh, e);
             }
         }
@@ -406,7 +471,10 @@ impl Filesystem for SynologyFS {
             let block_start = block_idx * block_size;
 
             let block = if let Some(cached) = self.read_cache.get(ino, block_idx) {
-                if cached.is_empty() { break; } // EOF sentinel
+                if cached.is_empty() {
+                    debug!("read: EOF sentinel hit ino={} block={}", ino, block_idx);
+                    break;
+                }
                 cached
             } else if self.read_cache.claim_inflight(ino, block_idx) {
                 // We won the race — download synchronously.
@@ -484,6 +552,19 @@ impl Filesystem for SynologyFS {
         let file_size = self.cache.get_size_for_ino(ino).unwrap_or(0);
         let total_blocks = if file_size > 0 { (file_size + block_size - 1) / block_size } else { 0 };
 
+        // If block 0 is cached as an empty EOF sentinel but the file is known to be
+        // non-empty, evict the stale sentinel so we re-download real data below.
+        // This can happen when a previous read attempt received an empty body or
+        // HTTP 416 for a block that should have content.
+        if total_blocks > 0 {
+            if let Some(b) = self.read_cache.get(ino, 0) {
+                if b.is_empty() {
+                    debug!("open: evicting stale EOF sentinel for ino={} block=0", ino);
+                    self.read_cache.invalidate_block(ino, 0);
+                }
+            }
+        }
+
         // Block 0: download synchronously so VLC's very first read() is a guaranteed cache hit.
         if total_blocks > 0 && !self.read_cache.contains(ino, 0) {
             if self.read_cache.claim_inflight(ino, 0) {
@@ -537,6 +618,8 @@ impl Filesystem for SynologyFS {
             ino,
             data: Vec::new(),
             dirty: false,
+            new_file: false,
+            upload_handle: None,
         });
         // FOPEN_KEEP_CACHE: don't invalidate the kernel page cache between opens.
         reply.opened(fh, FOPEN_KEEP_CACHE);
@@ -555,6 +638,24 @@ impl Filesystem for SynologyFS {
         reply: ReplyWrite,
     ) {
         debug!("write: ino={} fh={} offset={} len={}", ino, fh, offset, data.len());
+
+        // If a background upload is in flight for this fh (started by a prior flush),
+        // wait for it before modifying the buffer — we must not hold the mutex while blocking.
+        let handle = {
+            let mut buffers = self.write_buffers.lock().unwrap();
+            buffers.get_mut(&fh).and_then(|b| b.upload_handle.take())
+        };
+        if let Some(h) = handle {
+            match self.block(h).map_err(|_| SynoFsError::Io("upload task panicked".into())).and_then(|r| r) {
+                Err(e) => { error!("write: prior upload failed: {}", e); reply.error(e.to_errno()); return; }
+                Ok(()) => {}
+            }
+            // The file now exists on the NAS; clear new_file so the next upload uses overwrite=true.
+            if let Some(buf) = self.write_buffers.lock().unwrap().get_mut(&fh) {
+                buf.new_file = false;
+            }
+        }
+
         let mut buffers = self.write_buffers.lock().unwrap();
         let buf = match buffers.get_mut(&fh) {
             Some(b) => b,
@@ -583,10 +684,9 @@ impl Filesystem for SynologyFS {
         reply: ReplyEmpty,
     ) {
         debug!("flush: fh={}", fh);
-        match self.flush_write_buffer(fh) {
-            Ok(()) => reply.ok(),
-            Err(e) => { error!("flush fh={}: {}", fh, e); reply.error(e.to_errno()); }
-        }
+        // Kick off the upload in the background; release() will wait for completion.
+        self.queue_upload(fh);
+        reply.ok();
     }
 
     fn release(
@@ -600,7 +700,7 @@ impl Filesystem for SynologyFS {
         reply: ReplyEmpty,
     ) {
         debug!("release: fh={}", fh);
-        let result = self.flush_write_buffer(fh);
+        let result = self.finish_upload(fh);
         self.write_buffers.lock().unwrap().remove(&fh);
         match result {
             Ok(()) => reply.ok(),
@@ -631,29 +731,20 @@ impl Filesystem for SynologyFS {
         let new_path = format!("{}/{}", parent_path.trim_end_matches('/'), name_str);
         debug!("create: {}", new_path);
 
-        // Upload an empty file to create it
-        match self.block(self.client.upload(&parent_path, name_str, vec![], false)) {
-            Ok(()) => {}
-            Err(e) => {
-                error!("create {}: {}", new_path, e);
-                reply.error(e.to_errno());
-                return;
-            }
-        }
-
-        // Fetch the created file's metadata
-        let info = match self.block(self.client.get_info(&new_path)) {
-            Ok(i) => i,
-            Err(e) => {
-                error!("create getinfo {}: {}", new_path, e);
-                reply.error(e.to_errno());
-                return;
-            }
-        };
-
+        // Defer the actual NAS upload to flush/release.  Allocate an inode and
+        // seed the cache with a synthetic entry so getattr works before the first
+        // flush.  The write buffer is marked new_file=true so flush uses
+        // overwrite=false, skipping the delete-before-upload round trips.
         let ino = self.cache.get_or_alloc_ino(&new_path);
-        let attr = self.syno_to_attr(ino, &info);
-        self.cache.insert(ino, info);
+        let synthetic_info = crate::types::SynoFileInfo {
+            name: name_str.to_string(),
+            path: new_path.clone(),
+            isdir: false,
+            additional: None,
+            code: None,
+        };
+        let attr = self.syno_to_attr(ino, &synthetic_info);
+        self.cache.insert(ino, synthetic_info);
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         self.write_buffers.lock().unwrap().insert(fh, WriteBuffer {
@@ -661,6 +752,8 @@ impl Filesystem for SynologyFS {
             ino,
             data: Vec::new(),
             dirty: false,
+            new_file: true,
+            upload_handle: None,
         });
 
         reply.created(&TTL, &attr, 0, fh, 0);
@@ -775,8 +868,17 @@ impl Filesystem for SynologyFS {
         let new_path = format!("{}/{}", new_parent_path.trim_end_matches('/'), new_name_str);
         debug!("rename: {} -> {}", old_path, new_path);
 
-        // Same directory: use the efficient Rename API
+        // Same directory: use the efficient Rename API.
+        // POSIX rename(2) must atomically replace the destination if it exists.
+        // The Synology Rename API does not overwrite — delete the destination first.
         if parent == new_parent {
+            if old_path != new_path {
+                if let Some(ino) = self.cache.get_ino_for_path(&new_path) {
+                    self.read_cache.invalidate_ino(ino);
+                }
+                self.cache.invalidate_path(&new_path);
+                let _ = self.block(self.client.delete(&new_path)); // ignore error — may not exist
+            }
             match self.block(self.client.rename(&old_path, new_name_str)) {
                 Ok(info) => {
                     if let Some(ino) = self.cache.get_ino_for_path(&old_path) {
@@ -818,7 +920,7 @@ impl Filesystem for SynologyFS {
             Err(e) => { reply.error(e.to_errno()); return; }
         };
 
-        match self.block(self.client.upload(&new_parent_path, new_name_str, data.to_vec(), false)) {
+        match self.block(self.client.upload(&new_parent_path, new_name_str, data.to_vec(), true)) {
             Ok(()) => {}
             Err(e) => { reply.error(e.to_errno()); return; }
         }

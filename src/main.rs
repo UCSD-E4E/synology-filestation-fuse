@@ -1,25 +1,35 @@
-mod cache;
 mod client;
 mod error;
-mod fs;
 mod types;
+
+#[cfg(target_os = "linux")]
+mod cache;
+#[cfg(target_os = "linux")]
+mod fs;
+
+#[cfg(target_os = "macos")]
+mod webdav;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use fuser::MountOption;
 use tracing::info;
 
-use cache::{InodeCache, ReadCache, READ_BLOCK_SIZE};
 use client::SynologyClient;
+
+#[cfg(target_os = "linux")]
+use cache::{InodeCache, ReadCache, READ_BLOCK_SIZE};
+#[cfg(target_os = "linux")]
 use fs::SynologyFS;
+#[cfg(target_os = "linux")]
+use fuser::MountOption;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "synology-fuse",
-    about = "Mount a Synology FileStation share as a local FUSE filesystem"
+    about = "Mount a Synology FileStation share as a local filesystem"
 )]
 struct Args {
     /// Synology NAS hostname or IP address
@@ -50,29 +60,19 @@ struct Args {
     /// Local directory to mount the filesystem on
     mountpoint: PathBuf,
 
-    /// Metadata cache TTL in seconds
+    /// Metadata cache TTL in seconds (Linux/FUSE only)
     #[arg(long, default_value_t = 30)]
     cache_ttl: u64,
 
-    /// Read cache size in MiB (file data blocks cached in memory for fast re-reads)
+    /// Read cache size in MiB (Linux/FUSE only)
     #[arg(long, default_value_t = 256)]
     read_cache_mb: u64,
 
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
     log_level: String,
-
-    /// Use the macFUSE FSKit backend instead of the kernel extension.
-    /// Requires macOS 15.4+ and macFUSE 5.0+. No kernel extension approval needed.
-    /// The mount point must be a directory inside /Volumes.
-    #[cfg(target_os = "macos")]
-    #[arg(long, default_value_t = false)]
-    fskit: bool,
 }
 
-/// Synology API error 403 = "Account disabled" or "Incorrect password", but in the context of
-/// a valid password it means OTP is required. Error 404 = "Permission denied" can also indicate
-/// a missing OTP on some DSM versions. We treat both as "OTP needed".
 fn is_otp_required(e: &error::SynoFsError) -> bool {
     matches!(e, error::SynoFsError::ApiError(403 | 404))
 }
@@ -92,12 +92,20 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(&args.log_level)
         .init();
 
-    // Build a multi-thread Tokio runtime.
-    // The FUSE dispatch loop runs synchronously on the main thread via fuser::mount2.
-    // All async HTTP I/O is dispatched to the Tokio worker pool via handle.block_on().
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+
+    // On macOS we mount via Finder which always places volumes under /Volumes/.
+    // Require that the user provides a path there so they get a predictable name.
+    #[cfg(target_os = "macos")]
+    if !args.mountpoint.starts_with("/Volumes/") {
+        anyhow::bail!(
+            "On macOS the mountpoint must be under /Volumes/ (e.g. /Volumes/nas), \
+             got: {}",
+            args.mountpoint.display()
+        );
+    }
 
     info!(
         "Connecting to Synology NAS at {}://{}:{}",
@@ -108,8 +116,6 @@ fn main() -> anyhow::Result<()> {
 
     let client = Arc::new(SynologyClient::new(&args.host, args.port, args.https));
 
-    // Synology API error code 403 means an OTP code is required.
-    // If the user didn't supply one via --otp / SYNO_OTP, prompt interactively.
     let password = match args.password {
         Some(p) => p,
         None => rpassword::prompt_password("Password: ")?,
@@ -129,49 +135,165 @@ fn main() -> anyhow::Result<()> {
 
     info!("Logged in successfully");
 
-    let cache = Arc::new(InodeCache::new(args.cache_ttl));
-    let max_blocks = (args.read_cache_mb * 1024 * 1024) / READ_BLOCK_SIZE;
-    let read_cache = Arc::new(ReadCache::new(READ_BLOCK_SIZE, max_blocks.max(1)));
-    let handle = rt.handle().clone();
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-
-    info!("Read cache: {} MiB ({} blocks × {} MiB)",
-          args.read_cache_mb, max_blocks, READ_BLOCK_SIZE / (1024 * 1024));
-
-    let fs = SynologyFS::new(client.clone(), cache, read_cache, handle, uid, gid);
-
-    // AutoUnmount is Linux-only; macFUSE unmounts automatically when the process exits.
     #[cfg(target_os = "linux")]
-    let options = vec![
-        MountOption::RW,
-        MountOption::FSName("synology-fuse".to_string()),
-        MountOption::AllowOther,
-        MountOption::AutoUnmount,
-    ];
-    #[cfg(not(target_os = "linux"))]
-    let mut options = vec![
-        MountOption::RW,
-        MountOption::FSName("synology-fuse".to_string()),
-        MountOption::AllowOther,
-    ];
-    // FSKit backend: no kernel extension required, but needs macOS 15.4+ and macFUSE 5.0+.
-    // Mount point must be inside /Volumes.
-    #[cfg(target_os = "macos")]
-    if args.fskit {
-        if !args.mountpoint.starts_with("/Volumes") {
-            eprintln!("warning: --fskit requires the mount point to be inside /Volumes");
-        }
-        options.push(MountOption::CUSTOM("backend=fskit".to_string()));
+    {
+        let cache = Arc::new(InodeCache::new(args.cache_ttl));
+        let max_blocks = (args.read_cache_mb * 1024 * 1024) / READ_BLOCK_SIZE;
+        let read_cache = Arc::new(ReadCache::new(READ_BLOCK_SIZE, max_blocks.max(1)));
+        let handle = rt.handle().clone();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
+        info!(
+            "Read cache: {} MiB ({} blocks × {} MiB)",
+            args.read_cache_mb,
+            max_blocks,
+            READ_BLOCK_SIZE / (1024 * 1024)
+        );
+
+        let fs = SynologyFS::new(client.clone(), cache, read_cache, handle, uid, gid);
+
+        let options = vec![
+            MountOption::RW,
+            MountOption::FSName("synology-fuse".to_string()),
+            MountOption::AllowOther,
+            MountOption::AutoUnmount,
+        ];
+
+        info!("Mounting shares on {}", args.mountpoint.display());
+        fuser::mount2(fs, &args.mountpoint, &options)?;
     }
 
-    info!("Mounting shares on {}", args.mountpoint.display());
-
-    // mount2 blocks until the filesystem is unmounted (e.g. via `fusermount -u <mountpoint>`)
-    fuser::mount2(fs, &args.mountpoint, &options)?;
+    #[cfg(target_os = "macos")]
+    {
+        info!("Mounting shares on {} via WebDAV", args.mountpoint.display());
+        rt.block_on(serve_and_mount(client.clone(), &args.mountpoint))?;
+    }
 
     info!("Unmounted, logging out");
     rt.block_on(client.logout())?;
 
+    Ok(())
+}
+
+/// Start a local WebDAV server, then ask macOS Finder to mount it via
+/// AppleScript `mount volume`.  This works for regular users on any modern
+/// macOS version without root or kernel extensions.
+///
+/// The WebDAV server advertises the last path component of `mountpoint` as its
+/// `DAV:displayname`, which macOS Finder uses as the volume name.  The volume
+/// therefore appears at exactly the `/Volumes/<name>` path the user requested.
+#[cfg(target_os = "macos")]
+async fn serve_and_mount(
+    client: Arc<SynologyClient>,
+    mountpoint: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::convert::Infallible;
+
+    use dav_server::{fakels::FakeLs, DavHandler};
+    use hyper::server::conn::http1;
+    use hyper_util::rt::TokioIo;
+    use webdav::SynologyDavFs;
+
+    // Extract the desired volume name from the last component of the path
+    // (e.g. "/Volumes/nas" → "nas") and use it as a URL path prefix so that
+    // macOS names the mounted volume correctly.
+    let volume_name = mountpoint
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let path_prefix = format!("/{}", volume_name);
+
+    let handler = Arc::new(
+        DavHandler::builder()
+            .filesystem(Box::new(SynologyDavFs::new(client, path_prefix.clone())))
+            .locksystem(FakeLs::new())
+            .build_handler(),
+    );
+
+    // Bind to a kernel-assigned port on localhost.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    // Include the volume name as a path component so macOS uses it as the
+    // volume name when mounting (e.g. http://127.0.0.1:PORT/nas/ → /Volumes/nas).
+    let url = format!("http://127.0.0.1:{}{}/", port, path_prefix);
+
+    info!("WebDAV server listening on {}", url);
+
+    // Start the accept loop BEFORE calling osascript so that Finder's probe
+    // requests are answered immediately.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let handler_srv = handler.clone();
+    let server_task = tokio::spawn(async move {
+        let mut shutdown_rx = shutdown_rx;
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _addr) = match result {
+                        Ok(r) => r,
+                        Err(e) => { tracing::debug!("accept error: {}", e); break; }
+                    };
+                    let io = TokioIo::new(stream);
+                    let h = handler_srv.clone();
+                    tokio::spawn(async move {
+                        let svc = hyper::service::service_fn(move |req| {
+                            let h = h.clone();
+                            async move { Ok::<_, Infallible>(h.handle(req).await) }
+                        });
+                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                            tracing::debug!("WebDAV connection closed: {}", e);
+                        }
+                    });
+                }
+                _ = &mut shutdown_rx => {
+                    info!("WebDAV server shutting down");
+                    break;
+                }
+            }
+        }
+    });
+
+    // Remove a stale mount-point directory left over from a previous run.
+    // If the directory is actually still mounted this will fail (EBUSY/EPERM),
+    // which is fine — we leave it alone and let osascript fail with a clear message.
+    if mountpoint.is_dir() && !mountpoint.is_symlink() {
+        let _ = std::fs::remove_dir(mountpoint);
+    }
+
+    // Ask Finder to mount the volume via AppleScript.
+    let script = format!("mount volume \"{}\"", url);
+    let out = tokio::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .await?;
+
+    if !out.status.success() {
+        let _ = shutdown_tx.send(());
+        server_task.await.ok();
+        anyhow::bail!(
+            "osascript mount failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    info!("Mounted at {}", mountpoint.display());
+
+    // Ctrl-C → unmount and stop serving.
+    let mp = mountpoint.to_path_buf();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("Signal received, unmounting {}…", mp.display());
+        let _ = tokio::process::Command::new("diskutil")
+            .args(["unmount", &mp.to_string_lossy()])
+            .status()
+            .await;
+        // macOS does not always remove the /Volumes/<name> directory after
+        // unmounting a WebDAV volume.  Remove it ourselves if it is now empty.
+        let _ = std::fs::remove_dir(&mp);
+        let _ = shutdown_tx.send(());
+    });
+
+    server_task.await.ok();
     Ok(())
 }
