@@ -231,7 +231,7 @@ impl DavFile for SynoDavFile {
             Box::pin(async move {
                 let (parent, filename) = split_path(&path);
                 client
-                    .upload(parent, filename, data, overwrite)
+                    .upload(parent, filename, Bytes::from(data), overwrite)
                     .await
                     .map_err(syno_err)
             })
