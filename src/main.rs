@@ -10,6 +10,30 @@ mod fs;
 #[cfg(target_os = "macos")]
 mod webdav;
 
+#[cfg(target_os = "windows")]
+mod winfs;
+
+/// Add WinFsp's bin directory to PATH so the Windows loader can find
+/// winfsp-x64.dll when the delay-load triggers on the first WinFsp call.
+/// WinFsp installs to a non-standard location and does not add itself to PATH.
+#[cfg(target_os = "windows")]
+fn ensure_winfsp_in_path() {
+    let candidates = [
+        r"C:\Program Files (x86)\WinFsp\bin",
+        r"C:\Program Files\WinFsp\bin",
+    ];
+    for dir in &candidates {
+        if std::path::Path::new(dir).join("winfsp-x64.dll").exists() {
+            let current = std::env::var_os("PATH").unwrap_or_default();
+            let current_str = current.to_string_lossy();
+            if !current_str.to_lowercase().contains(&dir.to_lowercase()) {
+                std::env::set_var("PATH", format!("{};{}", dir, current_str));
+            }
+            return;
+        }
+    }
+}
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -111,6 +135,21 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
+    // On Windows the mountpoint must be a drive letter, e.g. "Z:" or "Z:\".
+    #[cfg(target_os = "windows")]
+    {
+        let s = args.mountpoint.to_string_lossy();
+        let valid = s.len() >= 2
+            && s.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+            && s.as_bytes()[1] == b':';
+        if !valid {
+            anyhow::bail!(
+                "On Windows the mountpoint must be a drive letter (e.g. Z:), got: {}",
+                args.mountpoint.display()
+            );
+        }
+    }
+
     // On macOS we mount via Finder which always places volumes under /Volumes/.
     // Require that the user provides a path there so they get a predictable name.
     #[cfg(target_os = "macos")]
@@ -195,6 +234,49 @@ fn main() -> anyhow::Result<()> {
     {
         info!("Mounting shares on {} via WebDAV", args.mountpoint.display());
         rt.block_on(serve_and_mount(client.clone(), &args.mountpoint))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
+
+        info!("Mounting shares on {} via WinFsp", args.mountpoint.display());
+
+        ensure_winfsp_in_path();
+        let _fsp = winfsp::winfsp_init().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to initialise WinFsp ({:?}). \
+                 Ensure WinFsp is installed from https://winfsp.dev/rel/ \
+                 and the WinFsp.Launcher service is running.",
+                e
+            )
+        })?;
+
+        let mut volume_params = VolumeParams::new();
+        volume_params.filesystem_name("SynoFS");
+        volume_params.sector_size(512);
+        volume_params.sectors_per_allocation_unit(1);
+        volume_params.max_component_length(255);
+        volume_params.file_info_timeout(1000);
+        volume_params.case_sensitive_search(false);
+        volume_params.unicode_on_disk(true);
+        volume_params.persistent_acls(false);
+
+        let fs_params = FileSystemParams::default_params(volume_params);
+        let fs_ctx = winfs::SynologyWinFs::new(client.clone(), rt.handle().clone());
+        let mut host = FileSystemHost::new_with_options(fs_params, fs_ctx)
+            .map_err(|e| anyhow::anyhow!("Failed to create WinFsp filesystem ({:?})", e))?;
+        host.mount(&args.mountpoint)
+            .map_err(|e| anyhow::anyhow!("Failed to mount on {} ({:?}): ensure the drive letter is not already in use", args.mountpoint.display(), e))?;
+        host.start()
+            .map_err(|e| anyhow::anyhow!("Failed to start WinFsp dispatcher ({:?})", e))?;
+
+        info!("Mounted at {}", args.mountpoint.display());
+        rt.block_on(tokio::signal::ctrl_c())?;
+
+        info!("Signal received, unmounting {}…", args.mountpoint.display());
+        host.stop();
+        host.unmount();
     }
 
     info!("Unmounted, logging out");
