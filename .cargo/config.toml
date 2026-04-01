@@ -1,0 +1,13 @@
+# (intentionally empty)
+#
+# If you build from Git Bash on Windows, Git's own link.exe (a hard-link
+# utility) may shadow MSVC's linker.  Instead of committing a machine-specific
+# path here, build from a Developer Command Prompt, Developer PowerShell, or
+# any terminal where `ilammy/msvc-dev-cmd` (or vcvarsall.bat) has already been
+# run.  Alternatively, set the linker in a local, uncommitted override:
+#
+#   .cargo/config.local.toml   (not supported by Cargo — use the env var below)
+#
+# or set the environment variable:
+#
+#   CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=C:\path\to\link.exe

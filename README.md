@@ -4,6 +4,7 @@ A filesystem driver that mounts a [Synology FileStation](https://www.synology.co
 
 - **Linux** — FUSE via the `fuser` crate
 - **macOS** — local WebDAV proxy; no kernel extension required
+- **Windows** — user-mode filesystem via [WinFsp](https://winfsp.dev/)
 
 ## Features
 
@@ -16,6 +17,7 @@ A filesystem driver that mounts a [Synology FileStation](https://www.synology.co
 - Uses `rustls` — no OpenSSL dependency required
 - **Linux:** metadata cache with configurable TTL; block-level read cache (default 256 MiB) with background prefetch
 - **macOS:** no kernel extension; uses macOS's built-in WebDAV filesystem support
+- **Windows:** user-mode filesystem via WinFsp; mounts as a drive letter (e.g. `Z:`)
 
 ## Requirements
 
@@ -23,12 +25,14 @@ A filesystem driver that mounts a [Synology FileStation](https://www.synology.co
 
 - **Linux:** kernel with FUSE support (`/dev/fuse`) and `libfuse3` runtime (`libfuse3-3` on Ubuntu/Debian)
 - **macOS:** macOS 10.15+ (no third-party kernel extension needed)
+- **Windows:** [WinFsp](https://winfsp.dev/rel/) installed (free, open-source); the `WinFsp.Launcher` service must be running
 - A Synology NAS running DSM with FileStation API enabled
 
 ### Build
 
 - Rust toolchain (1.70+) — install via [rustup](https://rustup.rs)
 - **Linux only:** `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL)
+- **Windows only:** [WinFsp](https://winfsp.dev/rel/) installed (the build links against `winfsp-x64.dll`)
 
 ```bash
 # Ubuntu / Debian
@@ -39,6 +43,12 @@ sudo dnf install fuse3-devel
 ```
 
 macOS requires no additional build dependencies.
+
+**Windows note:** build from a **Developer Command Prompt**, **Developer PowerShell**, or any terminal where `vcvarsall.bat` has been sourced. Git Bash ships its own `link.exe` (a hard-link utility) that shadows MSVC's linker and will cause a build failure. If you must use Git Bash, set the linker explicitly via the environment variable:
+
+```bash
+export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="C:/Program Files/Microsoft Visual Studio/.../link.exe"
+```
 
 ### Linux FUSE configuration (allow_other)
 
@@ -93,7 +103,7 @@ synology-filestation-fuse --host <NAS_HOST> -u <USERNAME> [OPTIONS] <MOUNTPOINT>
 
 | Argument | Description | Default |
 |---|---|---|
-| `<MOUNTPOINT>` | Directory to mount on. On macOS must be under `/Volumes/` (e.g. `/Volumes/nas`) | *(required)* |
+| `<MOUNTPOINT>` | Directory to mount on. On macOS must be under `/Volumes/` (e.g. `/Volumes/nas`). On Windows must be an empty directory (e.g. `C:\mnt\nas`) | *(required)* |
 | `--host <HOST>` | NAS hostname or IP address | *(required)* |
 | `-u, --username` | NAS account username | *(required)* |
 | `-p, --password` | NAS account password (or `SYNO_PASSWORD` env var; prompted with hidden input if omitted) | *(optional)* |
@@ -115,6 +125,9 @@ synology-filestation-fuse --host 192.168.1.100 -u admin /mnt/nas
 # macOS (mountpoint must be under /Volumes/)
 synology-filestation-fuse --host 192.168.1.100 -u admin /Volumes/nas
 # Password: ********
+
+# Windows (mountpoint must be an empty directory)
+synology-filestation-fuse.exe --host 192.168.1.100 -u admin C:\mnt\nas
 
 # Pass password via flag
 synology-filestation-fuse --host 192.168.1.100 -u admin -p mypassword /mnt/nas
@@ -147,6 +160,9 @@ fusermount -u /mnt/nas
 
 # Unmount (macOS — or eject in Finder)
 diskutil unmount /Volumes/nas
+
+# Unmount (Windows — press Ctrl-C in the terminal running the driver,
+# or right-click the drive in Explorer and choose Eject / Disconnect)
 ```
 
 ## Architecture
@@ -157,10 +173,11 @@ synology-fuse/
     ├── main.rs     CLI argument parsing, Tokio runtime, platform dispatch
     ├── client.rs   Async Synology FileStation HTTP API client
     ├── types.rs    Serde types for API JSON responses
-    ├── error.rs    Synology API error code → POSIX errno translation
+    ├── error.rs    Synology API error code → POSIX errno / NTSTATUS translation
     ├── fs.rs       fuser::Filesystem trait (Linux FUSE backend)
     ├── cache.rs    Inode ↔ path metadata cache + block-level read cache (Linux)
-    └── webdav.rs   dav_server::DavFileSystem trait (macOS WebDAV backend)
+    ├── webdav.rs   dav_server::DavFileSystem trait (macOS WebDAV backend)
+    └── winfs.rs    winfsp::FileSystemContext trait (Windows WinFsp backend)
 ```
 
 ### Virtual root
@@ -184,24 +201,50 @@ WebDAV operations map to FileStation API calls:
 | `MOVE` (same dir) | `rename` |
 | `MOVE` (cross dir) | `download` → `upload` → `delete` |
 
+### Windows WinFsp backend
+
+On Windows the binary registers a user-mode filesystem with WinFsp and mounts it at the specified drive letter (e.g. `Z:`). WinFsp acts as a kernel-mode bridge: the Windows kernel forwards filesystem requests to our process via the WinFsp driver, which calls our `FileSystemContext` callbacks synchronously.
+
+WinFsp callbacks map to FileStation API calls:
+
+| WinFsp callback | FileStation |
+|---|---|
+| `get_security_by_name` | `getinfo` (or pending-file registry hit) |
+| `open` | `getinfo` |
+| `create` | *(deferred — file data buffered in memory)* |
+| `read` | `download` (byte-range) |
+| `write` | *(buffered in memory)* |
+| `flush` / `close` | `upload` |
+| `rename` (same dir, buffered) | `upload` direct to new name |
+| `rename` (same dir, on NAS) | `rename` |
+| `rename` (cross dir) | `download` → `upload` → `delete` |
+| `cleanup` (delete flag) | `delete` |
+| `read_directory` | `list_share` or `list` |
+| `create` (directory) | `CreateFolder` |
+
+Because the Synology Upload API requires the complete file body in a single multipart request, new and modified files are buffered in memory and uploaded atomically on `flush()`, `rename()`, or `close()`. During the write phase the file is tracked in an in-process pending-file registry so that concurrent opens (e.g. from an atomic write pattern) can locate the buffered data without a NAS round-trip.
+
+Rename handling normalises the destination path case: Windows may supply the destination in a different case than the NAS directories (which are on a Linux, case-sensitive filesystem). The driver always uses the source path's parent (correct mixed-case) for uploads and same-directory renames.
+
 ### Linux FUSE backend
 
 The FUSE dispatch loop (inside `fuser::mount2`) is synchronous. All Synology API calls are async via `reqwest`. The driver bridges these by holding a `tokio::runtime::Handle` and calling `handle.block_on(future)` inside each FUSE callback.
 
 File data is cached in fixed-size 256 KiB blocks using a `moka` LRU cache (default 256 MiB). Background prefetch of the next 16 blocks keeps streaming reads smooth.
 
-### Write buffering (both platforms)
+### Write buffering (all platforms)
 
 The Synology Upload API requires the complete file body as a single multipart upload. Write data is accumulated in an in-memory buffer per open file handle and flushed to the NAS on close. Large file writes consume proportional memory.
 
 ## Known Limitations
 
-- **Cross-directory directory moves are not supported.** Moving a directory to a different parent returns `ENOSYS`. Only same-directory renames use the efficient `SYNO.FileStation.Rename` API.
+- **Cross-directory directory moves are not supported.** Moving a directory to a different parent returns `ENOSYS` / `STATUS_UNSUCCESSFUL`. Only same-directory renames use the efficient `SYNO.FileStation.Rename` API.
 - **Cross-directory file moves are not atomic.** They are implemented as download → upload → delete. A failure mid-sequence may leave data duplicated or missing.
 - **Large files require large in-memory write buffers.** Writing to a file buffers the entire file content in process memory until the file is closed or flushed.
 - **Overwriting a file is not atomic.** The existing file is deleted before the new content is uploaded; a crash between those two steps would result in data loss.
 - **No support for symlinks, hard links, or special files.**
 - **Linux only:** Inode numbers are not stable across remounts. Permissions and timestamps are read-only (`chmod`, `chown`, `utimens` appear to succeed but are not persisted).
+- **Windows only:** The mountpoint must be an empty directory (e.g. `C:\mnt\nas`); mounting directly as a drive letter (e.g. `Z:`) is not currently supported.
 
 ## Synology API Reference
 

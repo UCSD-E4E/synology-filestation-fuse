@@ -419,7 +419,7 @@ impl SynologyClient {
         let name_json = serde_json::to_string(&[new_name]).unwrap();
         debug!("rename: {} -> {}", old_path, new_name);
 
-        let resp = self.http
+        let text = self.http
             .get(&url)
             .query(&[
                 ("api", "SYNO.FileStation.Rename"),
@@ -432,8 +432,13 @@ impl SynologyClient {
             ])
             .send()
             .await?
-            .json::<SynoResponse<RenameData>>()
+            .text()
             .await?;
+
+        debug!("rename raw response: {}", text);
+
+        let resp: SynoResponse<RenameData> = serde_json::from_str(&text)
+            .map_err(|e| SynoFsError::Io(format!("rename parse error: {e}")))?;
 
         if resp.success {
             let mut files = resp.data.ok_or(SynoFsError::Io("no rename data".into()))?.files;
