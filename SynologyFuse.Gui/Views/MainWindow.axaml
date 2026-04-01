@@ -1,0 +1,186 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:SynologyFuse.Gui.ViewModels"
+        x:Class="SynologyFuse.Gui.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="Synology FileStation Mount"
+        Width="520"
+        MinWidth="400"
+        SizeToContent="Height"
+        CanResize="True">
+
+  <DockPanel>
+
+    <!-- Status bar -->
+    <Border DockPanel.Dock="Bottom"
+            Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}"
+            Padding="12,6">
+      <TextBlock Text="{Binding StatusText}"
+                 FontSize="12"
+                 Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+    </Border>
+
+    <!-- Log output -->
+    <Border DockPanel.Dock="Bottom" Height="160" BorderThickness="0,1,0,0"
+            BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}">
+      <ScrollViewer>
+        <TextBox Text="{Binding LogOutput}"
+                 IsReadOnly="True"
+                 AcceptsReturn="True"
+                 Background="Transparent"
+                 BorderThickness="0"
+                 FontFamily="Consolas,Menlo,monospace"
+                 FontSize="12"
+                 TextWrapping="Wrap"
+                 Padding="8" />
+      </ScrollViewer>
+    </Border>
+
+    <!-- Main form -->
+    <ScrollViewer>
+      <StackPanel Margin="20" Spacing="4">
+
+        <!-- Connection section -->
+        <TextBlock Text="Connection"
+                   FontWeight="SemiBold"
+                   FontSize="14"
+                   Margin="0,0,0,4" />
+
+        <!-- Host -->
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+          <TextBlock Grid.Column="0" Text="Host" VerticalAlignment="Center" />
+          <TextBox   Grid.Column="1" Text="{Binding Host}"
+                     Watermark="192.168.1.100 or nas.local"
+                     IsEnabled="{Binding IsDisconnected}" />
+        </Grid>
+
+        <!-- Username -->
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+          <TextBlock Grid.Column="0" Text="Username" VerticalAlignment="Center" />
+          <TextBox   Grid.Column="1" Text="{Binding Username}"
+                     Watermark="admin"
+                     IsEnabled="{Binding IsDisconnected}" />
+        </Grid>
+
+        <!-- Password -->
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+          <TextBlock Grid.Column="0" Text="Password" VerticalAlignment="Center" />
+          <TextBox   Grid.Column="1" Text="{Binding Password}"
+                     PasswordChar="●"
+                     IsEnabled="{Binding IsDisconnected}" />
+        </Grid>
+
+        <!-- OTP -->
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+          <TextBlock Grid.Column="0" Text="OTP / 2FA" VerticalAlignment="Center" />
+          <TextBox   Grid.Column="1" Text="{Binding Otp}"
+                     Watermark="Leave blank if not using 2FA"
+                     IsEnabled="{Binding IsDisconnected}" />
+        </Grid>
+
+        <!-- Port -->
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+          <TextBlock Grid.Column="0" Text="Port" VerticalAlignment="Center" />
+          <NumericUpDown Grid.Column="1"
+                         Value="{Binding Port}"
+                         Minimum="1" Maximum="65535" Increment="1"
+                         FormatString="0"
+                         IsEnabled="{Binding IsDisconnected}" />
+        </Grid>
+
+        <!-- HTTPS -->
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+          <TextBlock Grid.Column="0" Text="HTTPS" VerticalAlignment="Center" />
+          <CheckBox  Grid.Column="1"
+                     IsChecked="{Binding UseHttps}"
+                     Content="Use HTTPS"
+                     IsEnabled="{Binding IsDisconnected}" />
+        </Grid>
+
+        <!-- Mount section -->
+        <TextBlock Text="Mount"
+                   FontWeight="SemiBold"
+                   FontSize="14"
+                   Margin="0,12,0,4" />
+
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+          <TextBlock Grid.Column="0" Text="Mountpoint" VerticalAlignment="Center" />
+          <TextBox   Grid.Column="1" Text="{Binding Mountpoint}"
+                     Watermark="/mnt/nas  •  /Volumes/nas  •  Z:\"
+                     IsEnabled="{Binding IsDisconnected}" />
+        </Grid>
+
+        <!-- Advanced section -->
+        <Expander Header="Advanced" Margin="0,10,0,0" IsEnabled="{Binding IsDisconnected}">
+          <StackPanel Margin="0,8,0,0" Spacing="0">
+
+            <!-- Cache TTL -->
+            <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+              <TextBlock Grid.Column="0" Text="Cache TTL (s)" VerticalAlignment="Center" />
+              <NumericUpDown Grid.Column="1"
+                             Value="{Binding CacheTtl}"
+                             Minimum="0" Maximum="3600" FormatString="0" />
+            </Grid>
+
+            <!-- Read cache -->
+            <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+              <TextBlock Grid.Column="0" Text="Read cache (MiB)" VerticalAlignment="Center" />
+              <NumericUpDown Grid.Column="1"
+                             Value="{Binding ReadCacheMb}"
+                             Minimum="0" Maximum="65536" FormatString="0" />
+            </Grid>
+
+            <!-- Log level -->
+            <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+              <TextBlock Grid.Column="0" Text="Log level" VerticalAlignment="Center" />
+              <ComboBox  Grid.Column="1"
+                         ItemsSource="{Binding LogLevels}"
+                         SelectedItem="{Binding LogLevel}"
+                         HorizontalAlignment="Stretch" />
+            </Grid>
+
+          </StackPanel>
+        </Expander>
+
+        <!-- 2FA banner: appears when the CLI is blocked waiting for the OTP on stdin -->
+        <Border IsVisible="{Binding ShowOtpPrompt}"
+                Background="#FFF3CD"
+                CornerRadius="4"
+                Padding="12,8"
+                Margin="0,10,0,0">
+          <StackPanel Spacing="6">
+            <TextBlock Text="Two-factor authentication code required."
+                       FontWeight="SemiBold"
+                       Foreground="#856404" />
+            <TextBlock Text="Enter your TOTP code below. The mount process is waiting."
+                       TextWrapping="Wrap"
+                       Foreground="#856404" />
+            <Grid ColumnDefinitions="*,Auto">
+              <TextBox Grid.Column="0" Text="{Binding PendingOtp}"
+                       Watermark="6-digit TOTP code"
+                       Margin="0,0,8,0" />
+              <Button Grid.Column="1"
+                      Content="Submit"
+                      Command="{Binding SubmitOtpCommand}"
+                      Classes="accent" />
+            </Grid>
+          </StackPanel>
+        </Border>
+
+        <!-- Buttons -->
+        <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,20,0,4"
+                    HorizontalAlignment="Right">
+          <Button Content="Connect"
+                  Command="{Binding ConnectCommand}"
+                  Classes="accent"
+                  Width="110" />
+          <Button Content="Disconnect"
+                  Command="{Binding DisconnectCommand}"
+                  Width="110" />
+        </StackPanel>
+
+      </StackPanel>
+    </ScrollViewer>
+
+  </DockPanel>
+</Window>
