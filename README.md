@@ -42,7 +42,13 @@ sudo apt-get install libfuse3-dev
 sudo dnf install fuse3-devel
 ```
 
-macOS and Windows require no additional build dependencies beyond WinFsp on Windows.
+macOS requires no additional build dependencies.
+
+**Windows note:** build from a **Developer Command Prompt**, **Developer PowerShell**, or any terminal where `vcvarsall.bat` has been sourced. Git Bash ships its own `link.exe` (a hard-link utility) that shadows MSVC's linker and will cause a build failure. If you must use Git Bash, set the linker explicitly via the environment variable:
+
+```bash
+export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="C:/Program Files/Microsoft Visual Studio/.../link.exe"
+```
 
 ### Linux FUSE configuration (allow_other)
 
