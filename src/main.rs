@@ -135,19 +135,13 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    // On Windows the mountpoint must be a drive letter, e.g. "Z:" or "Z:\".
+    // On Windows the mountpoint must be an existing empty directory.
     #[cfg(target_os = "windows")]
-    {
-        let s = args.mountpoint.to_string_lossy();
-        let valid = s.len() >= 2
-            && s.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
-            && s.as_bytes()[1] == b':';
-        if !valid {
-            anyhow::bail!(
-                "On Windows the mountpoint must be a drive letter (e.g. Z:), got: {}",
-                args.mountpoint.display()
-            );
-        }
+    if !args.mountpoint.is_dir() {
+        anyhow::bail!(
+            "On Windows the mountpoint must be an existing empty directory, got: {}",
+            args.mountpoint.display()
+        );
     }
 
     // On macOS we mount via Finder which always places volumes under /Volumes/.
