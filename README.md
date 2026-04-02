@@ -29,7 +29,7 @@ The easiest way to install on Windows is to download the bundle installer from t
 SynologyFuse-<version>-Setup.exe
 ```
 
-The installer automatically downloads and installs [WinFsp](https://winfsp.dev/) if it is not already present, then installs SynologyFuse to `%ProgramFiles%\SynologyFuse\` and adds it to the system `PATH`. A **SynologyFuse GUI** shortcut is placed in the Start Menu.
+The installer includes [WinFsp](https://winfsp.dev/) and automatically installs it if it is not already present, then installs SynologyFuse to `%ProgramFiles%\SynologyFuse\` and adds it to the system `PATH`. A **SynologyFuse GUI** shortcut is placed in the Start Menu.
 
 To build the installer yourself, see [Building the installer](#building-the-installer) below.
 
