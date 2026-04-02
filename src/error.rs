@@ -91,6 +91,32 @@ impl From<serde_json::Error> for SynoFsError {
     }
 }
 
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn display_all_variants() {
+        assert_eq!(SynoFsError::NotFound.to_string(), "not found");
+        assert_eq!(SynoFsError::PermissionDenied.to_string(), "permission denied");
+        assert_eq!(SynoFsError::AlreadyExists.to_string(), "already exists");
+        assert_eq!(SynoFsError::NotEmpty.to_string(), "directory not empty");
+        assert_eq!(SynoFsError::InvalidArg.to_string(), "invalid argument");
+        assert_eq!(SynoFsError::NoSpace.to_string(), "no space left");
+        assert_eq!(SynoFsError::NotSupported.to_string(), "not supported");
+        assert_eq!(SynoFsError::Io("detail".into()).to_string(), "I/O error: detail");
+        assert_eq!(SynoFsError::ApiError(408).to_string(), "Synology API error 408");
+    }
+
+    #[test]
+    fn from_serde_json_error_gives_io_variant() {
+        let json_err: serde_json::Error =
+            serde_json::from_str::<serde_json::Value>("{bad}").unwrap_err();
+        let syno: SynoFsError = json_err.into();
+        assert!(matches!(syno, SynoFsError::Io(_)));
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

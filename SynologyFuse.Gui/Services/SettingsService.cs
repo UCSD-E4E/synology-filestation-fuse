@@ -28,13 +28,14 @@ public static class SettingsService
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    public static PersistedSettings Load()
+    public static PersistedSettings Load(string? path = null)
     {
+        var filePath = path ?? SettingsPath;
         try
         {
-            if (File.Exists(SettingsPath))
+            if (File.Exists(filePath))
             {
-                var json = File.ReadAllText(SettingsPath);
+                var json = File.ReadAllText(filePath);
                 return JsonSerializer.Deserialize<PersistedSettings>(json) ?? new();
             }
         }
@@ -43,12 +44,13 @@ public static class SettingsService
         return new();
     }
 
-    public static void Save(PersistedSettings settings)
+    public static void Save(PersistedSettings settings, string? path = null)
     {
+        var filePath = path ?? SettingsPath;
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
-            File.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings, JsonOptions));
+            Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+            File.WriteAllText(filePath, JsonSerializer.Serialize(settings, JsonOptions));
         }
         catch { /* non-fatal — best effort */ }
     }

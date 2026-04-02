@@ -449,3 +449,486 @@ impl SynologyClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Build a client pointed at the given mock server.
+    fn client_for(server: &MockServer) -> SynologyClient {
+        let uri = server.uri(); // "http://127.0.0.1:PORT"
+        let without_scheme = uri.trim_start_matches("http://");
+        let (host, port_str) = without_scheme.rsplit_once(':').unwrap();
+        let port: u16 = port_str.parse().unwrap();
+        SynologyClient::new(host, port, false)
+    }
+
+    // ── login ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn login_stores_sid_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "abc123def"}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        assert_eq!(client.sid(), "abc123def");
+    }
+
+    #[tokio::test]
+    async fn login_returns_api_error_on_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 400}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client.login("alice", "wrong", None).await.unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(400)));
+    }
+
+    #[tokio::test]
+    async fn login_with_otp_includes_otp_param() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .and(query_param("otp_code", "123456"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "otp_sid_xyz"}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client.login("alice", "secret", Some("123456")).await.unwrap();
+        assert_eq!(client.sid(), "otp_sid_xyz");
+    }
+
+    // ── logout ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn logout_clears_sid() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "session_abc"}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        assert_eq!(client.sid(), "session_abc");
+        client.logout().await.unwrap();
+        assert_eq!(client.sid(), "");
+    }
+
+    // ── list_shares ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_shares_returns_shares() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list_share"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"shares": [
+                    {"name": "photos", "path": "/photos", "isdir": true, "additional": null},
+                    {"name": "docs",   "path": "/docs",   "isdir": true, "additional": null}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let shares = client.list_shares().await.unwrap();
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].name, "photos");
+        assert_eq!(shares[1].name, "docs");
+    }
+
+    #[tokio::test]
+    async fn list_shares_returns_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list_share"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 408}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client.list_shares().await.unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(408)));
+    }
+
+    // ── list_dir ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_dir_returns_files() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [
+                    {"name": "file.txt", "path": "/share/file.txt", "isdir": false, "additional": null}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let files = client.list_dir("/share").await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "file.txt");
+    }
+
+    #[tokio::test]
+    async fn list_dir_null_data_returns_empty_vec() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let files = client.list_dir("/empty").await.unwrap();
+        assert!(files.is_empty());
+    }
+
+    // ── get_info ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_info_returns_file_metadata() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{
+                    "name": "notes.txt",
+                    "path": "/share/notes.txt",
+                    "isdir": false,
+                    "additional": {"size": 512, "owner": null, "time": null, "perm": null}
+                }]}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let info = client.get_info("/share/notes.txt").await.unwrap();
+        assert_eq!(info.name, "notes.txt");
+        assert_eq!(info.additional.unwrap().size, Some(512));
+    }
+
+    #[tokio::test]
+    async fn get_info_per_entry_error_returns_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{"code": 408, "path": "/share/missing"}]}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client.get_info("/share/missing").await.unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(408)));
+    }
+
+    #[tokio::test]
+    async fn get_info_envelope_error_returns_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 119}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client.get_info("/share/restricted").await.unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(119)));
+    }
+
+    // ── download ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn download_returns_bytes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let data = client.download("/share/file.txt", 0, 11).await.unwrap();
+        assert_eq!(data.as_ref(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn download_416_returns_empty_bytes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(416))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let data = client.download("/share/file.txt", 9999, 10).await.unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_http_error_returns_io_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client.download("/share/file.txt", 0, 10).await.unwrap_err();
+        assert!(matches!(err, SynoFsError::Io(_)));
+    }
+
+    // ── upload ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upload_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client
+            .upload("/share", "test.txt", b"content".to_vec(), false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_returns_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 1805}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client
+            .upload("/share", "test.txt", b"data".to_vec(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(1805)));
+    }
+
+    #[tokio::test]
+    async fn upload_with_overwrite_deletes_then_polls_then_uploads() {
+        let server = MockServer::start().await;
+        // DELETE call (GET method=delete)
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "delete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .mount(&server)
+            .await;
+        // Poll for file gone (GET method=getinfo) — return error so upload proceeds
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 414}
+            })))
+            .mount(&server)
+            .await;
+        // Actual upload (POST)
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client
+            .upload("/share", "test.txt", b"new content".to_vec(), true)
+            .await
+            .unwrap();
+    }
+
+    // ── delete ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "delete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client.delete("/share/file.txt").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_returns_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "delete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 414}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client.delete("/share/missing.txt").await.unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(414)));
+    }
+
+    // ── create_folder ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_folder_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "create"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"folders": [
+                    {"name": "newdir", "path": "/share/newdir", "isdir": true, "additional": null}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let info = client.create_folder("/share", "newdir").await.unwrap();
+        assert_eq!(info.name, "newdir");
+        assert!(info.isdir);
+    }
+
+    #[tokio::test]
+    async fn create_folder_returns_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "create"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 1101}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client.create_folder("/share", "existing").await.unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(1101)));
+    }
+
+    // ── rename ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rename_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "rename"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [
+                    {"name": "new.txt", "path": "/share/new.txt", "isdir": false, "additional": null}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let info = client.rename("/share/old.txt", "new.txt").await.unwrap();
+        assert_eq!(info.name, "new.txt");
+    }
+
+    #[tokio::test]
+    async fn rename_returns_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "rename"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 418}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client
+            .rename("/share/old.txt", "existing.txt")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(418)));
+    }
+}

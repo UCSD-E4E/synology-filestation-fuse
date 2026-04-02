@@ -215,7 +215,7 @@ public sealed class MountService : IDisposable
             "or add it to PATH.");
     }
 
-    private static string? FindRepoRoot(string startDir)
+    internal static string? FindRepoRoot(string startDir)
     {
         var dir = new DirectoryInfo(startDir);
         while (dir is not null)
@@ -227,7 +227,7 @@ public sealed class MountService : IDisposable
         return null;
     }
 
-    private static string BuildArgs(MountConfig config)
+    internal static string BuildArgs(MountConfig config)
     {
         var parts = new List<string>
         {
@@ -251,7 +251,7 @@ public sealed class MountService : IDisposable
         return string.Join(" ", parts);
     }
 
-    private static string ExpandPath(string path)
+    internal static string ExpandPath(string path)
     {
         // Expand ~ to the user's home directory (shells do this, direct process spawn doesn't).
         if (path == "~" || path.StartsWith("~/") || path.StartsWith(@"~\"))
@@ -269,7 +269,7 @@ public sealed class MountService : IDisposable
     private static readonly Regex EnvVarUnix =
         new(@"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.Compiled);
 
-    private static string ExpandEnvVars(string path)
+    internal static string ExpandEnvVars(string path)
     {
         // %VAR% — Windows style (also works on Linux in case someone types it).
         path = Environment.ExpandEnvironmentVariables(path);
@@ -284,7 +284,7 @@ public sealed class MountService : IDisposable
         return path;
     }
 
-    private static string Quote(string s) =>
+    internal static string Quote(string s) =>
         s.Contains(' ') ? $"\"{s}\"" : s;
 
     // Matches ESC [ ... <letter>  (CSI sequences, covers colors, dim, bold, etc.)
@@ -292,5 +292,5 @@ public sealed class MountService : IDisposable
     private static readonly Regex AnsiEscapeRegex =
         new(@"\x1b(\[[0-9;]*[A-Za-z]|.)", RegexOptions.Compiled);
 
-    private static string StripAnsi(string s) => AnsiEscapeRegex.Replace(s, "");
+    internal static string StripAnsi(string s) => AnsiEscapeRegex.Replace(s, "");
 }
