@@ -2,7 +2,7 @@
   MSBuild wrapper around the wix CLI tool.
 
   Install the wix CLI (one-time):
-    dotnet tool install --global wix
+    dotnet tool install -g wix
 
   Build prerequisites (run from repo root):
     cargo build -r
