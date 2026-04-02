@@ -26,7 +26,7 @@
   </PropertyGroup>
 
   <Target Name="Build">
-    <Exec Command="wix build &quot;$(WxsFile)&quot; -d Version=$(Version) -d RustBin=$(RustBin) -d GuiPublishDir=$(GuiPublishDir) -o &quot;$(OutFile)&quot;" />
+    <Exec Command="wix build &quot;$(WxsFile)&quot; -d Version=$(Version) -d &quot;RustBin=$(RustBin)&quot; -d &quot;GuiPublishDir=$(GuiPublishDir)&quot; -o &quot;$(OutFile)&quot;" />
   </Target>
 
   <Target Name="Clean">
