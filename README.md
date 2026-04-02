@@ -1,10 +1,11 @@
 # synology-fuse
 
-A filesystem driver that mounts a [Synology FileStation](https://www.synology.com/en-global/dsm/feature/file_station) share as a local directory. Written in Rust.
+A filesystem driver that mounts a [Synology FileStation](https://www.synology.com/en-global/dsm/feature/file_station) share as a local directory. Written in Rust, with an optional cross-platform GUI.
 
 - **Linux** — FUSE via the `fuser` crate
 - **macOS** — local WebDAV proxy; no kernel extension required
 - **Windows** — user-mode filesystem via [WinFsp](https://winfsp.dev/)
+- **GUI (all platforms)** — Avalonia desktop app for point-and-click mounting
 
 ## Features
 
@@ -18,6 +19,19 @@ A filesystem driver that mounts a [Synology FileStation](https://www.synology.co
 - **Linux:** metadata cache with configurable TTL; block-level read cache (default 256 MiB) with background prefetch
 - **macOS:** no kernel extension; uses macOS's built-in WebDAV filesystem support
 - **Windows:** user-mode filesystem via WinFsp; mounts as a drive letter (e.g. `Z:`)
+- **GUI (all platforms):** Avalonia app that wraps the CLI with live log output, inline 2FA prompt, and settings persistence
+
+## Windows installation
+
+The easiest way to install on Windows is to download the bundle installer from the [Releases](../../releases) page:
+
+```
+SynologyFuse-<version>-Setup.exe
+```
+
+The installer automatically downloads and installs [WinFsp](https://winfsp.dev/) if it is not already present, then installs SynologyFuse to `%ProgramFiles%\SynologyFuse\` and adds it to the system `PATH`. A **SynologyFuse GUI** shortcut is placed in the Start Menu.
+
+To build the installer yourself, see [Building the installer](#building-the-installer) below.
 
 ## Requirements
 
@@ -33,6 +47,8 @@ A filesystem driver that mounts a [Synology FileStation](https://www.synology.co
 - Rust toolchain (1.70+) — install via [rustup](https://rustup.rs)
 - **Linux only:** `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL)
 - **Windows only:** [WinFsp](https://winfsp.dev/rel/) installed (the build links against `winfsp-x64.dll`)
+- **GUI (all platforms):** [.NET 10 SDK](https://dotnet.microsoft.com/download)
+- **Windows installer only:** `wix` dotnet tool (`dotnet tool install --global wix`)
 
 ```bash
 # Ubuntu / Debian
@@ -87,11 +103,73 @@ After saving the file, remount and all users will be able to access the share.
 
 ## Building
 
+### CLI (all platforms)
+
 ```bash
 cargo build --release
 ```
 
 The binary will be at `target/release/synology-filestation-fuse`.
+
+### GUI (all platforms)
+
+The GUI is a self-contained .NET 10 / Avalonia application. Build it for any platform with:
+
+```bash
+# Linux (x64)
+dotnet publish SynologyFuse.Gui -c Release -r linux-x64 -p:SelfContained=true
+
+# macOS (Apple Silicon)
+dotnet publish SynologyFuse.Gui -c Release -r osx-arm64 -p:SelfContained=true
+
+# macOS (Intel)
+dotnet publish SynologyFuse.Gui -c Release -r osx-x64 -p:SelfContained=true
+
+# Windows (x64)
+dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
+```
+
+Output goes to `SynologyFuse.Gui/bin/Release/net10.0/<rid>/publish/`. The GUI locates the Rust CLI automatically: first beside itself (deployed layout), then in `target/release/` relative to the repo root (development layout), then on `PATH`.
+
+### Building the installer
+
+Two installers are available:
+
+| File | What it contains | Use when |
+|---|---|---|
+| `SynologyFuse-<ver>.msi` | SynologyFuse only | WinFsp is already installed |
+| `SynologyFuse-<ver>-Setup.exe` | WinFsp + SynologyFuse | Fresh Windows machine |
+
+**Prerequisites (one-time):**
+
+```powershell
+dotnet tool install --global wix
+wix extension add WixToolset.BootstrapperApplications.wixext
+wix extension add WixToolset.Util.wixext
+```
+
+**Build the MSI only:**
+
+```powershell
+# From repo root — build Rust CLI and .NET GUI first
+cargo build -r
+dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
+
+msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj
+# Produces: SynologyFuse.Installer\SynologyFuse-0.1.2.msi
+```
+
+**Build the bundle (MSI + WinFsp):**
+
+```powershell
+# Build Rust CLI and .NET GUI first (same as above), then:
+msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj
+.\SynologyFuse.Installer\Build-Bundle.ps1
+# Downloads WinFsp automatically, then produces:
+# SynologyFuse.Installer\SynologyFuse-0.1.2-Setup.exe
+```
+
+The bundle script downloads `winfsp-2.1.25156.msi` from GitHub to `SynologyFuse.Installer\redist\` (cached for subsequent builds).
 
 ## Usage
 
@@ -169,16 +247,30 @@ diskutil unmount /Volumes/nas
 
 ```
 synology-fuse/
-└── src/
-    ├── main.rs     CLI argument parsing, Tokio runtime, platform dispatch
-    ├── client.rs   Async Synology FileStation HTTP API client
-    ├── types.rs    Serde types for API JSON responses
-    ├── error.rs    Synology API error code → POSIX errno / NTSTATUS translation
-    ├── fs.rs       fuser::Filesystem trait (Linux FUSE backend)
-    ├── cache.rs    Inode ↔ path metadata cache + block-level read cache (Linux)
-    ├── webdav.rs   dav_server::DavFileSystem trait (macOS WebDAV backend)
-    └── winfs.rs    winfsp::FileSystemContext trait (Windows WinFsp backend)
+├── src/
+│   ├── main.rs          CLI argument parsing, Tokio runtime, platform dispatch
+│   ├── client.rs        Async Synology FileStation HTTP API client
+│   ├── types.rs         Serde types for API JSON responses
+│   ├── error.rs         Synology API error code → POSIX errno / NTSTATUS translation
+│   ├── fs.rs            fuser::Filesystem trait (Linux FUSE backend)
+│   ├── cache.rs         Inode ↔ path metadata cache + block-level read cache (Linux)
+│   ├── webdav.rs        dav_server::DavFileSystem trait (macOS WebDAV backend)
+│   └── winfs.rs         winfsp::FileSystemContext trait (Windows WinFsp backend)
+├── SynologyFuse.Gui/    Windows GUI (Avalonia / .NET 10)
+├── SynologyFuse.Installer/  Windows MSI + bundle installer (WiX 6)
+└── SynologyFuse.Tests/  xUnit tests for the GUI project
 ```
+
+### GUI
+
+`SynologyFuse.Gui` is a cross-platform Avalonia application that wraps the CLI. It provides:
+
+- Form fields for host, username, password, OTP, mountpoint, and advanced options (cache TTL, read cache size, log level)
+- Connect / Disconnect buttons that launch and terminate the CLI subprocess
+- Live log output streamed from the CLI's stdout/stderr
+- Inline 2FA prompt: when the CLI pauses waiting for a TOTP code on stdin, the GUI shows an input banner so the user can submit the code without restarting
+- Settings persistence — connection parameters are saved to the platform settings directory and reloaded on next launch
+- Platform-aware argument building: Linux-only flags (`--cache-ttl`, `--read-cache-mb`) are omitted on macOS and Windows
 
 ### Virtual root
 

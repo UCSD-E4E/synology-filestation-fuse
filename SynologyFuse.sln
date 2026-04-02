@@ -7,6 +7,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SynologyFuse.Gui", "Synolog
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SynologyFuse.Tests", "SynologyFuse.Tests\SynologyFuse.Tests.csproj", "{D1A6688E-D766-4BD5-97AE-D0B51D79EAE6}"
 EndProject
+Project("{930C7802-8A8C-48F9-8165-68863BCCD9DD}") = "SynologyFuse.Installer", "SynologyFuse.Installer\SynologyFuse.Installer.wixproj", "{C2D3E4F5-A6B7-8C9D-0E1F-2A3B4C5D6E7F}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -41,6 +43,9 @@ Global
 		{D1A6688E-D766-4BD5-97AE-D0B51D79EAE6}.Release|x64.Build.0 = Release|Any CPU
 		{D1A6688E-D766-4BD5-97AE-D0B51D79EAE6}.Release|x86.ActiveCfg = Release|Any CPU
 		{D1A6688E-D766-4BD5-97AE-D0B51D79EAE6}.Release|x86.Build.0 = Release|Any CPU
+		{C2D3E4F5-A6B7-8C9D-0E1F-2A3B4C5D6E7F}.Debug|Any CPU.ActiveCfg = Release|Any CPU
+		{C2D3E4F5-A6B7-8C9D-0E1F-2A3B4C5D6E7F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C2D3E4F5-A6B7-8C9D-0E1F-2A3B4C5D6E7F}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
