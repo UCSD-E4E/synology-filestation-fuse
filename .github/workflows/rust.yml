@@ -20,8 +20,16 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
     - name: Build
       run: cargo build --verbose
-    - name: Run tests
+    - name: Run Rust tests
       run: cargo test --verbose
+    - name: Set up .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+    - name: Run dotnet tests
+      run: dotnet test SynologyFuse.Tests --verbosity normal
+    - name: Publish GUI
+      run: dotnet publish SynologyFuse.Gui -c Release -r linux-x64 -p:SelfContained=true
 
   build-macos:
 
@@ -31,8 +39,16 @@ jobs:
     - uses: actions/checkout@v4
     - name: Build
       run: cargo build --verbose
-    - name: Run tests
+    - name: Run Rust tests
       run: cargo test --verbose
+    - name: Set up .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+    - name: Run dotnet tests
+      run: dotnet test SynologyFuse.Tests --verbosity normal
+    - name: Publish GUI
+      run: dotnet publish SynologyFuse.Gui -c Release -r osx-arm64 -p:SelfContained=true
 
   build-windows:
 
@@ -46,5 +62,19 @@ jobs:
       run: choco install winfsp
     - name: Build
       run: cargo build --verbose
-    - name: Run tests
+    - name: Run Rust tests
       run: cargo test --verbose
+    - name: Build release (required for installer)
+      run: cargo build --release --verbose
+    - name: Set up .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+    - name: Run dotnet tests
+      run: dotnet test SynologyFuse.Tests --verbosity normal
+    - name: Publish GUI
+      run: dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
+    - name: Install WiX
+      run: dotnet tool install --global wix
+    - name: Build installer
+      run: msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj
