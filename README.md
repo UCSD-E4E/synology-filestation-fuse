@@ -256,7 +256,7 @@ synology-fuse/
 │   ├── cache.rs         Inode ↔ path metadata cache + block-level read cache (Linux)
 │   ├── webdav.rs        dav_server::DavFileSystem trait (macOS WebDAV backend)
 │   └── winfs.rs         winfsp::FileSystemContext trait (Windows WinFsp backend)
-├── SynologyFuse.Gui/    Windows GUI (Avalonia / .NET 10)
+├── SynologyFuse.Gui/    Cross-platform GUI (Avalonia / .NET 10)
 ├── SynologyFuse.Installer/  Windows MSI + bundle installer (WiX 6)
 └── SynologyFuse.Tests/  xUnit tests for the GUI project
 ```
