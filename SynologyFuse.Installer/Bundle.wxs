@@ -19,18 +19,19 @@
     .\SynologyFuse.Installer\Build-Bundle.ps1
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
 
   <Bundle Name="SynologyFuse"
           Version="$(var.Version)"
           Manufacturer="Engineers for Exploration, UC San Diego"
-          UpgradeCode="F6388200-C935-4C69-9145-C094E64D26E2">
+          UpgradeCode="F6388200-C935-4C69-9145-C094E64D26E2"
+          IconSourceFile="$(sys.SOURCEFILEDIR)app.ico">
 
-    <!--
-      WixPrereqBootstrapperApplication provides a minimal installation UI.
-      It shows progress and allows cancel while chained packages are installed.
-    -->
-    <BootstrapperApplicationRef Id="WixPrereqBootstrapperApplication.Primary_X64" />
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+        Theme="hyperlinkLicense"
+        LicenseUrl="https://github.com/UCSD-E4E/synology-filestation-fuse/blob/main/LICENSE" />
+    </BootstrapperApplication>
 
     <Chain>
       <!--
@@ -44,10 +45,14 @@
                   ForcePerMachine="yes" />
 
       <!-- SynologyFuse MSI -->
+      <!-- LAUNCHED_FROM_BUNDLE bypasses the MSI's standalone WinFsp check;
+           WinFsp is guaranteed installed by the bundle chain above. -->
       <MsiPackage Id="SynologyFuse"
                   Name="SynologyFuse"
                   SourceFile="$(var.SynologyFuseMsi)"
-                  Vital="yes" />
+                  Vital="yes">
+        <MsiProperty Name="LAUNCHED_FROM_BUNDLE" Value="1" />
+      </MsiPackage>
     </Chain>
   </Bundle>
 

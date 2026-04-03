@@ -3,6 +3,7 @@
         xmlns:vm="using:SynologyFuse.Gui.ViewModels"
         x:Class="SynologyFuse.Gui.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
+        Icon="/Assets/app.ico"
         Title="Synology FileStation Mount"
         Width="520"
         MinWidth="400"

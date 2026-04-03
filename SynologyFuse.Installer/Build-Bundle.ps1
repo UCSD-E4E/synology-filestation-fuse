@@ -8,8 +8,7 @@
 
     One-time setup:
         dotnet tool install --global wix
-        wix extension add WixToolset.BootstrapperApplications.wixext
-        wix extension add WixToolset.Util.wixext
+        wix extension add -g WixToolset.Bal.wixext
 
     Run from the repo root before calling this script:
         cargo build -r
@@ -83,8 +82,7 @@ Write-Host "  Out:    $OutFile"
 Push-Location $RepoRoot
 try {
     wix build $BundleWxs `
-        -ext WixToolset.BootstrapperApplications.wixext `
-        -ext WixToolset.Util.wixext `
+        -ext WixToolset.Bal.wixext `
         -d "Version=$Version" `
         -d "WinFspInstaller=$WinFspInstaller" `
         -d "SynologyFuseMsi=$SynologyFuseMsi" `

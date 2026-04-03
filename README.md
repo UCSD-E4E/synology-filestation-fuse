@@ -1,4 +1,4 @@
-# synology-fuse
+# synology-filestation-fuse
 
 A filesystem driver that mounts a [Synology FileStation](https://www.synology.com/en-global/dsm/feature/file_station) share as a local directory. Written in Rust, with an optional cross-platform GUI.
 
