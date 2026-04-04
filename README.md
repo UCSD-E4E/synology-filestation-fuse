@@ -144,7 +144,7 @@ Two installers are available:
 
 ```powershell
 dotnet tool install --global wix
-wix extension add WixToolset.BootstrapperApplications.wixext
+wix extension add WixToolset.Bal.wixext
 wix extension add WixToolset.Util.wixext
 ```
 
