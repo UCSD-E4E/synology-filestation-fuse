@@ -21,6 +21,10 @@
 .PARAMETER WinFspVersion
     WinFsp release to download if not already cached (default: 2.1.25156).
 
+.PARAMETER WinFspSha256
+    Expected SHA-256 hash (hex) of the WinFsp MSI. Must be updated together with
+    WinFspVersion. Default is the published hash for winfsp-2.1.25156.msi.
+
 .PARAMETER OutDir
     Directory to write the EXE to (default: same directory as this script).
 
@@ -31,6 +35,9 @@
 param(
     [string]$Version       = "0.1.2",
     [string]$WinFspVersion = "2.1.25156",
+    # Pinned SHA-256 for winfsp-2.1.25156.msi (update when bumping WinFspVersion).
+    # Source: https://github.com/winfsp/winfsp/releases/tag/v2.1
+    [string]$WinFspSha256  = "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A",
     [string]$OutDir        = $PSScriptRoot
 )
 
@@ -66,10 +73,33 @@ if (-not (Test-Path $WinFspInstaller)) {
     Write-Host "  To:   $WinFspInstaller"
 
     $null = New-Item -ItemType Directory -Force -Path $RedistDir
-    Invoke-WebRequest -Uri $WinFspUrl -OutFile $WinFspInstaller -UseBasicParsing
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        Invoke-WebRequest -Uri $WinFspUrl -OutFile $WinFspInstaller -UseBasicParsing
+    } else {
+        Invoke-WebRequest -Uri $WinFspUrl -OutFile $WinFspInstaller
+    }
+
+    $actualHash = (Get-FileHash -Path $WinFspInstaller -Algorithm SHA256).Hash
+    if ($actualHash -ne $WinFspSha256.ToUpper()) {
+        Remove-Item $WinFspInstaller -Force
+        throw "WinFsp installer SHA-256 mismatch.`n" +
+              "  Expected: $($WinFspSha256.ToUpper())`n" +
+              "  Actual:   $actualHash`n" +
+              "The downloaded file has been removed. " +
+              "Verify -WinFspSha256 matches the release at https://github.com/winfsp/winfsp/releases/tag/v$WinFspMajorMinor"
+    }
+    Write-Host "  SHA-256 verified."
     Write-Host "  Done."
 } else {
     Write-Host "Using cached WinFsp installer: $WinFspInstaller"
+    $actualHash = (Get-FileHash -Path $WinFspInstaller -Algorithm SHA256).Hash
+    if ($actualHash -ne $WinFspSha256.ToUpper()) {
+        throw "Cached WinFsp installer SHA-256 mismatch.`n" +
+              "  Expected: $($WinFspSha256.ToUpper())`n" +
+              "  Actual:   $actualHash`n" +
+              "Remove '$WinFspInstaller' and retry."
+    }
+    Write-Host "  SHA-256 verified."
 }
 
 # ── Build bundle ──────────────────────────────────────────────────────────────
