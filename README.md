@@ -21,6 +21,20 @@ A filesystem driver that mounts a [Synology FileStation](https://www.synology.co
 - **Windows:** user-mode filesystem via WinFsp; mounts as a drive letter (e.g. `Z:`)
 - **GUI (all platforms):** Avalonia app that wraps the CLI with live log output, inline 2FA prompt, and settings persistence
 
+## macOS installation
+
+Download the `.pkg` installer from the [Releases](../../releases) page:
+
+```
+SynologyFuse-<version>.pkg
+```
+
+The installer places `SynologyFuse.app` in `/Applications/` and symlinks the CLI to `/usr/local/bin/synology-filestation-fuse`. Administrator privileges are required. macOS 12 (Monterey) or later is required.
+
+> **Gatekeeper note:** Because the package is currently unsigned, macOS may block it on first open. Right-click the `.pkg` and choose **Open**, then confirm in the dialog.
+
+To build the installer yourself, see [Building the installer](#building-the-installer) below.
+
 ## Windows installation
 
 The easiest way to install on Windows is to download the bundle installer from the [Releases](../../releases) page:
@@ -48,6 +62,7 @@ To build the installer yourself, see [Building the installer](#building-the-inst
 - **Linux only:** `libfuse3-dev` (Ubuntu/Debian) or `fuse3-devel` (Fedora/RHEL)
 - **Windows only:** [WinFsp](https://winfsp.dev/rel/) installed (the build links against `winfsp-x64.dll`)
 - **GUI (all platforms):** [.NET 10 SDK](https://dotnet.microsoft.com/download)
+- **macOS installer only:** Xcode Command Line Tools — provides `pkgbuild`, `productbuild`, and `iconutil` (`xcode-select --install`)
 - **Windows installer only:** `wix` dotnet tool (`dotnet tool install --global wix`)
 
 ```bash
@@ -133,7 +148,26 @@ Output goes to `SynologyFuse.Gui/bin/Release/net10.0/<rid>/publish/`. The GUI lo
 
 ### Building the installer
 
-Two installers are available:
+#### macOS
+
+**Prerequisites (one-time):**
+
+```bash
+xcode-select --install   # provides pkgbuild, productbuild, iconutil
+```
+
+**Build (all-in-one):**
+
+```bash
+./SynologyFuse.MacInstaller/Build-Installer.sh --build
+# Produces: SynologyFuse.MacInstaller/SynologyFuse-0.1.2.pkg
+```
+
+Pass `--build` to compile the Rust CLI and publish the .NET GUI automatically. Omit it if you have already run `cargo build --release` and `dotnet publish` yourself. Use `--arch x86_64` to target Intel Macs instead of Apple Silicon (default: `arm64`).
+
+#### Windows
+
+Two Windows installers are available:
 
 | File | What it contains | Use when |
 |---|---|---|
@@ -256,9 +290,10 @@ synology-fuse/
 │   ├── cache.rs         Inode ↔ path metadata cache + block-level read cache (Linux)
 │   ├── webdav.rs        dav_server::DavFileSystem trait (macOS WebDAV backend)
 │   └── winfs.rs         winfsp::FileSystemContext trait (Windows WinFsp backend)
-├── SynologyFuse.Gui/    Cross-platform desktop GUI (Avalonia / .NET 10)
-├── SynologyFuse.Installer/  Windows MSI + bundle installer (WiX 6)
-└── SynologyFuse.Tests/  xUnit tests for the GUI project
+├── SynologyFuse.Gui/         Cross-platform desktop GUI (Avalonia / .NET 10)
+├── SynologyFuse.MacInstaller/ macOS .pkg installer (pkgbuild / productbuild)
+├── SynologyFuse.Installer/   Windows MSI + bundle installer (WiX 6)
+└── SynologyFuse.Tests/       xUnit tests for the GUI project
 ```
 
 ### GUI

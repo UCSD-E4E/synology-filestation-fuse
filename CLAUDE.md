@@ -29,7 +29,26 @@ dotnet test SynologyFuse.Tests --verbosity normal
 dotnet format SynologyFuse.Gui
 ```
 
-### Windows Installer (WiX 4)
+### macOS Installer (pkgbuild / productbuild)
+
+```bash
+# One-time: Xcode Command Line Tools (provides pkgbuild, productbuild, iconutil)
+xcode-select --install
+
+# Build .pkg (--build also compiles Rust CLI and publishes .NET GUI)
+./SynologyFuse.MacInstaller/Build-Installer.sh --build
+
+# Explicit version or Intel target
+./SynologyFuse.MacInstaller/Build-Installer.sh --build --version 1.0.0 --arch x86_64
+```
+
+Key files in `SynologyFuse.MacInstaller/`:
+- `Build-Installer.sh` — assembles `.app` bundle, runs `pkgbuild` + `productbuild`
+- `Info.plist` — `.app` bundle template (`__VERSION__` / `__GUI_BINARY__` substituted at build time)
+- `distribution.xml` — installer UI config (welcome screen, license, macOS 12+ requirement)
+- `scripts/postinstall` — symlinks CLI to `/usr/local/bin/` after payload is placed
+
+### Windows Installer (WiX 6)
 
 ```powershell
 # One-time tool setup
