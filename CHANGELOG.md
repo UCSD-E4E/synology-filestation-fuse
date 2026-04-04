@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.1.3](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.2...synology-filestation-fuse-v0.1.3) (2026-04-04)
+
+
+### Features
+
+* build on windows as well ([e96b1f5](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/e96b1f59ff8c74cbd1c080da3e1a67eb19523e11))
+* cleanup ([3ee31a4](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/3ee31a4c72a1f322a0221952a3137f42e80a5857))
+* dotnet UI ([7af6f0b](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/7af6f0ba2ccd46719b141feb6d3523168d5d4416))
+* introduce deb installer ([1002943](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/100294375902bca5d52fca74b336e13e249f4d9c))
+* introduce dotnet builds ([544ee76](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/544ee76cb654f79054179b3a15eee996d35043f4))
+* introduce unit tests ([b11f43d](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/b11f43d87df03b6363bfdb85236bfeca08f704c8))
+* introduce windows installer ([967f27a](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/967f27a860911330bb108e60d43a4b2c3c5c954c))
+* macfuse ([370f8ea](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/370f8ea76f1762063d07ce05d75c319bc1b715f4))
+* macos installer ([2328442](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/2328442150421f91a38f72b9b02de4d0baedcb14))
+* macos installer ([0f83628](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/0f83628168f81c73086499bee974e767f244bd89))
+* notify user when NAS is mounted and ready for use ([5299a31](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/5299a3113db9f4f416009bf2eccd8f31f241cdd7))
+* performance improvements ([9fb38f4](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/9fb38f44f0167e628e2821d9c231ca60874754a5))
+* windows support ([cb6d8fd](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/cb6d8fd9ed940acdb65b71ebc68a128acf80a423))
+* windows support ([dc7f552](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/dc7f5522a34a27c2e997f4a774ee88823255fce0))
+
+
+### Bug Fixes
+
+* add pinned SHA-256 verification for WinFsp MSI download in Build-Bundle.ps1 ([9a4e095](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/9a4e0951314651f9befc85eb091ee8dc13a0b3f9))
+* build errors ([bf632d6](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/bf632d6b721f5d1976f8db692a4edf148a7510d2))
+* build issues for macos and windows on github actions ([e6c9a32](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/e6c9a32df6db2b774b5d4817c5f11261ee827ff4))
+* can now launch executable after install.  better error handling.  folder path is now created ([4dd46b0](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/4dd46b013f1fab75ee37058190a6d10e499bbbfc))
+* make sure we include the assets folder ([bbdefbe](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/bbdefbeb7d146c086094024f81ac9c5752a03d6c))
+* remove bad comment ([c86fb29](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/c86fb296ed1f50893e913c72d784e2bdaf7e93a1))
+* rust buildtime checks for windows ([199e5ce](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/199e5ce44f9b45c87dcf5b094cae1e4e11a8a2c5))
+* timeout errors ([b0b7b12](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/b0b7b12e21d0abdce96a43bb0ac236ac31c3300e))
+* windows build error ([7b5cf70](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/7b5cf70f3057e4365041202b86a516bebb843b4b))
+* working installer ([fcb7f07](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/fcb7f072fdebc2bafd3dcedc0f01b66991e9c188))
+
 ## [0.1.2](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.1...synology-filestation-fuse-v0.1.2) (2026-03-27)
 
 
