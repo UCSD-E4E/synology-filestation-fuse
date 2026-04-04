@@ -48,6 +48,32 @@ Key files in `SynologyFuse.MacInstaller/`:
 - `distribution.xml` — installer UI config (welcome screen, license, macOS 12+ requirement)
 - `scripts/postinstall` — symlinks CLI to `/usr/local/bin/` after payload is placed
 
+### Debian/Ubuntu Package (.deb)
+
+```bash
+# One-time: dpkg-dev (provides dpkg-deb)
+sudo apt-get install dpkg-dev
+
+# Build .deb (--build also compiles Rust CLI and publishes .NET GUI)
+./SynologyFuse.DebInstaller/Build-Package.sh --build
+
+# Explicit version or arm64 target
+./SynologyFuse.DebInstaller/Build-Package.sh --build --version 1.0.0 --arch arm64
+```
+
+Key files in `SynologyFuse.DebInstaller/`:
+- `Build-Package.sh` — stages the payload tree, writes `DEBIAN/control`, runs `dpkg-deb`
+- `scripts/postinst` — refreshes icon and desktop-entry caches after install
+- `scripts/prerm` — placeholder pre-removal hook
+
+The package installs:
+- CLI binary → `/usr/bin/synology-filestation-fuse`
+- GUI and .NET runtime → `/opt/SynologyFuse/`
+- Desktop launcher → `/usr/share/applications/synologyfuse.desktop`
+- Icon → `/usr/share/icons/hicolor/256x256/apps/synologyfuse.png`
+
+Runtime dependency: `libfuse3-3`
+
 ### Windows Installer (WiX 6)
 
 ```powershell

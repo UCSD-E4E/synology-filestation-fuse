@@ -12,9 +12,102 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  release-linux:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Build release CLI
+        run: cargo build --release
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Publish GUI
+        run: dotnet publish SynologyFuse.Gui -c Release -r linux-x64 -p:SelfContained=true
+      - name: Build deb package
+        run: |
+          ./SynologyFuse.DebInstaller/Build-Package.sh \
+            --version "${{ needs.release-please.outputs.version }}" \
+            --out-dir .
+      - name: Upload deb to release
+        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" synologyfuse-*.deb
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-macos:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release CLI
+        run: cargo build --release
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Publish GUI
+        run: dotnet publish SynologyFuse.Gui -c Release -r osx-arm64 -p:SelfContained=true
+      - name: Build macOS installer
+        run: |
+          ./SynologyFuse.MacInstaller/Build-Installer.sh \
+            --version "${{ needs.release-please.outputs.version }}" \
+            --out-dir .
+      - name: Upload pkg to release
+        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" SynologyFuse-*.pkg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-windows:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Install WinFsp
+        run: choco install winfsp
+      - name: Build release CLI
+        run: cargo build --release
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Publish GUI
+        run: dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
+      - name: Install WiX and extensions
+        run: |
+          dotnet tool install --global wix
+          wix extension add -g WixToolset.Bal.wixext
+          wix extension add -g WixToolset.Util.wixext
+      - name: Build MSI
+        run: msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj
+      - name: Build bundle
+        run: |
+          .\SynologyFuse.Installer\Build-Bundle.ps1 `
+            -Version "${{ needs.release-please.outputs.version }}" `
+            -OutDir SynologyFuse.Installer
+      - name: Upload installers to release
+        run: |
+          gh release upload "${{ needs.release-please.outputs.tag_name }}" `
+            (Get-Item SynologyFuse.Installer\SynologyFuse-*.msi).FullName `
+            (Get-Item SynologyFuse.Installer\SynologyFuse-*-Setup.exe).FullName
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

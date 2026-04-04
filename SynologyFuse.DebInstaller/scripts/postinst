@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# postinst — runs after the package payload is placed on disk.
+#
+# Refreshes the icon cache and desktop database so the SynologyFuse launcher
+# appears in the application menu immediately without a logout/login.
+set -euo pipefail
+
+if command -v gtk-update-icon-cache &>/dev/null; then
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
+fi
+
+if command -v update-desktop-database &>/dev/null; then
+    update-desktop-database /usr/share/applications || true
+fi
+
+exit 0

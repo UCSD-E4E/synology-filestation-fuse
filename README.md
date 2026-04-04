@@ -21,6 +21,24 @@ A filesystem driver that mounts a [Synology FileStation](https://www.synology.co
 - **Windows:** user-mode filesystem via WinFsp; mounts as a drive letter (e.g. `Z:`)
 - **GUI (all platforms):** Avalonia app that wraps the CLI with live log output, inline 2FA prompt, and settings persistence
 
+## Linux installation
+
+Download the `.deb` package from the [Releases](../../releases) page:
+
+```
+synologyfuse-<version>_amd64.deb
+```
+
+Install with `apt` (which also satisfies the `libfuse3-3` dependency automatically):
+
+```bash
+sudo apt install ./synologyfuse-<version>_amd64.deb
+```
+
+This places the CLI at `/usr/bin/synology-filestation-fuse`, the GUI and its .NET runtime at `/opt/SynologyFuse/`, and a desktop launcher in your application menu.
+
+To build the package yourself, see [Building the installer](#building-the-installer) below.
+
 ## macOS installation
 
 Download the `.pkg` installer from the [Releases](../../releases) page:
@@ -147,6 +165,34 @@ dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
 Output goes to `SynologyFuse.Gui/bin/Release/net10.0/<rid>/publish/`. The GUI locates the Rust CLI automatically: first beside itself (deployed layout), then in `target/release/` relative to the repo root (development layout), then on `PATH`.
 
 ### Building the installer
+
+#### Linux (Debian/Ubuntu .deb)
+
+**Prerequisites (one-time):**
+
+```bash
+sudo apt-get install dpkg-dev
+```
+
+**Build (all-in-one):**
+
+```bash
+./SynologyFuse.DebInstaller/Build-Package.sh --build
+# Produces: SynologyFuse.DebInstaller/synologyfuse-0.1.2_amd64.deb
+```
+
+Pass `--build` to compile the Rust CLI and publish the .NET GUI automatically. Omit it if you have already run `cargo build --release` and `dotnet publish` yourself. Use `--arch arm64` to target 64-bit ARM instead of x86-64 (default: `amd64`).
+
+The package installs:
+
+| Path | Contents |
+|---|---|
+| `/usr/bin/synology-filestation-fuse` | CLI binary |
+| `/opt/SynologyFuse/` | GUI executable and .NET runtime |
+| `/usr/share/applications/synologyfuse.desktop` | Application menu entry |
+| `/usr/share/icons/hicolor/256x256/apps/synologyfuse.png` | Application icon |
+
+Runtime dependency: `libfuse3-3` (pulled in automatically by `apt install`).
 
 #### macOS
 
@@ -291,6 +337,7 @@ synology-fuse/
 │   ├── webdav.rs        dav_server::DavFileSystem trait (macOS WebDAV backend)
 │   └── winfs.rs         winfsp::FileSystemContext trait (Windows WinFsp backend)
 ├── SynologyFuse.Gui/         Cross-platform desktop GUI (Avalonia / .NET 10)
+├── SynologyFuse.DebInstaller/ Linux .deb package (dpkg-deb)
 ├── SynologyFuse.MacInstaller/ macOS .pkg installer (pkgbuild / productbuild)
 ├── SynologyFuse.Installer/   Windows MSI + bundle installer (WiX 6)
 └── SynologyFuse.Tests/       xUnit tests for the GUI project

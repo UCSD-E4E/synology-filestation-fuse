@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# prerm — runs before the package files are removed.
+#
+# Placeholder for any pre-removal steps (e.g., stopping background services).
+# Currently a no-op; present so dpkg has a well-formed maintainer script slot.
+set -euo pipefail
+
+exit 0
