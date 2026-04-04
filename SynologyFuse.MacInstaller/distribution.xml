@@ -1,14 +1,4 @@
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
-<!--
-  productbuild distribution script for SynologyFuse.
-
-  Installs:
-    • SynologyFuse.app         → /Applications/
-    • synology-filestation-fuse → /usr/local/bin/  (via postinstall symlink)
-
-  Build (from repo root):
-    ./SynologyFuse.MacInstaller/Build-Installer.sh [--build]
--->
 <installer-gui-script minSpecVersion="2">
 
     <title>Synology NAS Mount</title>
