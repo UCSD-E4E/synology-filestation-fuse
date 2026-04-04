@@ -91,7 +91,7 @@ jobs:
         with:
           dotnet-version: '10.0.x'
       - name: Publish GUI
-        run: dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
+        run: dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true --output SynologyFuse.Gui\bin\Release\net10.0\win-x64\publish
       - name: Install WiX and extensions
         run: |
           dotnet tool install --global wix --version 6.0.2
