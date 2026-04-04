@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS .app bundle Info.plist template for SynologyFuse.
+  Build-Installer.sh substitutes __VERSION__ and __GUI_BINARY__ before use.
+-->
+<plist version="1.0">
+<dict>
+    <!-- The executable inside Contents/MacOS/ that macOS launches -->
+    <key>CFBundleExecutable</key>
+    <string>__GUI_BINARY__</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>edu.ucsd.e4e.synologyfuse</string>
+
+    <key>CFBundleName</key>
+    <string>SynologyFuse</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>Synology NAS Mount</string>
+
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <!-- Icon file (without extension) in Contents/Resources/ -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
+    <!-- Require macOS 12 (Monterey) minimum — .NET 10 requirement -->
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+
+    <!-- Allow the app to appear in Finder and the Dock -->
+    <key>LSUIElement</key>
+    <false/>
+
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+</dict>
+</plist>

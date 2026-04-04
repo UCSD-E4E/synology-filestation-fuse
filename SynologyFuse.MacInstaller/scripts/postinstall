@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# postinstall — runs after the package payload is placed on disk.
+#
+# Creates /usr/local/bin/synology-filestation-fuse as a symlink into the .app
+# bundle so the CLI is available in any terminal without an absolute path.
+set -euo pipefail
+
+CLI_SRC="/Applications/SynologyFuse.app/Contents/MacOS/synology-filestation-fuse"
+CLI_LINK="/usr/local/bin/synology-filestation-fuse"
+
+# /usr/local/bin is present on all modern macOS installs, but create it just
+# in case (e.g., a freshly imaged system).
+mkdir -p /usr/local/bin
+
+# Remove a stale link or file from a previous install before relinking.
+if [[ -L "${CLI_LINK}" || -e "${CLI_LINK}" ]]; then
+    rm -f "${CLI_LINK}"
+fi
+
+ln -sf "${CLI_SRC}" "${CLI_LINK}"
+echo "Linked ${CLI_LINK} → ${CLI_SRC}"
+
+exit 0

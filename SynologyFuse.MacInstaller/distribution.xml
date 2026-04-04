@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<installer-gui-script minSpecVersion="2">
+
+    <title>Synology NAS Mount</title>
+    <organization>edu.ucsd.e4e</organization>
+
+    <!-- Require macOS 12 (Monterey) — minimum for .NET 10 -->
+    <allowed-os-versions>
+        <os-version min="12.0" />
+    </allowed-os-versions>
+
+    <!-- Always install to the boot volume; no user-specific install paths -->
+    <domains enable_localSystem="true" />
+    <options customize="never" rootVolumeOnly="true" />
+
+    <!-- Installer UI pages (files live in resources/) -->
+    <welcome    file="welcome.html" mime-type="text/html" />
+    <license    file="LICENSE"      mime-type="text/plain" />
+
+    <pkg-ref id="edu.ucsd.e4e.synologyfuse" />
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="edu.ucsd.e4e.synologyfuse" />
+        </line>
+    </choices-outline>
+
+    <choice id="default" />
+
+    <choice id="edu.ucsd.e4e.synologyfuse" visible="false">
+        <pkg-ref id="edu.ucsd.e4e.synologyfuse" />
+    </choice>
+
+    <!-- References the component package built by pkgbuild -->
+    <pkg-ref id="edu.ucsd.e4e.synologyfuse" onConclusion="none">SynologyFuse-component.pkg</pkg-ref>
+
+</installer-gui-script>
