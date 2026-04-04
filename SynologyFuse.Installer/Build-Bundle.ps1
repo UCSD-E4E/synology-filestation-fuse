@@ -8,7 +8,7 @@
 
     One-time setup:
         dotnet tool install --global wix
-        wix extension add -g WixToolset.Bal.wixext
+        wix extension add -g WixToolset.Bal.wixext/6.0.2
 
     Run from the repo root before calling this script:
         cargo build -r
