@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SynologyFuse WiX 6 Burn bundle.
+
+  Installs in order:
+    1. WinFsp    (skipped automatically if already installed — Burn detects by ProductCode)
+    2. SynologyFuse MSI
+
+  Build prerequisites (run from repo root):
+    cargo build -r
+    dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
+    # Build the inner MSI first:
+    msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj
+    # Download WinFsp installer to redist\ (Build-Bundle.ps1 does this automatically):
+    Invoke-WebRequest https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi `
+        -OutFile SynologyFuse.Installer\redist\winfsp.msi
+
+  Build the bundle EXE (from repo root):
+    .\SynologyFuse.Installer\Build-Bundle.ps1
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+
+  <Bundle Name="SynologyFuse"
+          Version="$(var.Version)"
+          Manufacturer="Engineers for Exploration, UC San Diego"
+          UpgradeCode="F6388200-C935-4C69-9145-C094E64D26E2"
+          IconSourceFile="$(sys.SOURCEFILEDIR)app.ico">
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+        Theme="hyperlinkLicense"
+        LicenseUrl="https://github.com/UCSD-E4E/synology-filestation-fuse/blob/main/LICENSE" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <!--
+        WinFsp: Burn detects whether it is already installed via its MSI ProductCode
+        and skips installation automatically if present.
+      -->
+      <MsiPackage Id="WinFsp"
+                  Name="WinFsp"
+                  SourceFile="$(var.WinFspInstaller)"
+                  Vital="yes"
+                  ForcePerMachine="yes" />
+
+      <!-- SynologyFuse MSI -->
+      <!-- LAUNCHED_FROM_BUNDLE bypasses the MSI's standalone WinFsp check;
+           WinFsp is guaranteed installed by the bundle chain above. -->
+      <MsiPackage Id="SynologyFuse"
+                  Name="SynologyFuse"
+                  SourceFile="$(var.SynologyFuseMsi)"
+                  Vital="yes">
+        <MsiProperty Name="LAUNCHED_FROM_BUNDLE" Value="1" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+
+</Wix>

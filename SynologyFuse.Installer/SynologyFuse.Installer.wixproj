@@ -1,0 +1,36 @@
+<!--
+  MSBuild wrapper around the wix CLI tool.
+
+  Install the wix CLI (one-time):
+    dotnet tool install -g wix
+
+  Build prerequisites (run from repo root):
+    cargo build -r
+    dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
+
+  Build the MSI:
+    msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj
+    msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj /p:Version=1.2.3
+-->
+<Project DefaultTargets="Build">
+
+  <PropertyGroup>
+    <!-- Package version — override with /p:Version=X.Y.Z -->
+    <Version Condition="'$(Version)' == ''">0.1.2</Version>
+
+    <RustBin Condition="'$(RustBin)' == ''">$(MSBuildThisFileDirectory)..\target\release</RustBin>
+    <GuiPublishDir Condition="'$(GuiPublishDir)' == ''">$(MSBuildThisFileDirectory)..\SynologyFuse.Gui\bin\Release\net10.0\win-x64\publish</GuiPublishDir>
+
+    <OutFile>$(MSBuildThisFileDirectory)SynologyFuse-$(Version).msi</OutFile>
+    <WxsFile>$(MSBuildThisFileDirectory)Package.wxs</WxsFile>
+  </PropertyGroup>
+
+  <Target Name="Build">
+    <Exec Command="wix build &quot;$(WxsFile)&quot; -d Version=$(Version) -d &quot;RustBin=$(RustBin)&quot; -d &quot;GuiPublishDir=$(GuiPublishDir)&quot; -o &quot;$(OutFile)&quot;" />
+  </Target>
+
+  <Target Name="Clean">
+    <Delete Files="$(OutFile)" />
+  </Target>
+
+</Project>

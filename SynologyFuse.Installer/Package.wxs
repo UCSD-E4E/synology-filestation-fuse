@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SynologyFuse WiX 6 installer package.
+
+  Installs:
+    • synology-filestation-fuse.exe  (Rust CLI)
+    • SynologyFuse.Gui.exe + Avalonia DLLs  (self-contained .NET GUI)
+
+  to %ProgramFiles%\SynologyFuse\ and adds that directory to the system PATH.
+
+  Prerequisites:
+    • WinFsp  https://winfsp.dev/  (checked at install time)
+
+  Build prerequisites (run from repo root):
+    cargo build -r
+    dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
+
+  Build the MSI (from repo root):
+    msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj -c Release
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Package Name="SynologyFuse"
+           Version="$(var.Version)"
+           Manufacturer="Engineers for Exploration, UC San Diego"
+           UpgradeCode="A7F3C2B1-D4E5-48A9-B6C3-E2F1A9D8C7B6"
+           Language="1033"
+           Compressed="yes">
+
+    <SummaryInformation Description="SynologyFuse — mount a Synology FileStation share as a local drive" />
+
+    <!-- Icon shown in Programs and Features (Add/Remove Programs) -->
+    <Icon Id="AppIcon" SourceFile="$(sys.SOURCEFILEDIR)app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <!-- Uninstall the old version before installing the new one. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <!-- Embed the cabinet inside the MSI. -->
+    <MediaTemplate EmbedCab="yes" />
+
+    <!--
+      WinFsp prerequisite check.
+      WinFsp registers HKLM\SOFTWARE\WinFsp (64-bit hive) with an InstallDir value.
+      "Installed OR ..." lets upgrades and repairs proceed even if WinFsp was removed.
+    -->
+    <Property Id="WINFSP_INSTALLDIR">
+      <RegistrySearch Id="FindWinFsp"
+                      Root="HKLM"
+                      Key="SOFTWARE\WinFsp"
+                      Name="InstallDir"
+                      Type="raw"
+                      Bitness="always64" />
+    </Property>
+    <Launch Condition="Installed OR WINFSP_INSTALLDIR OR LAUNCHED_FROM_BUNDLE"
+            Message="WinFsp must be installed before SynologyFuse. Download it from https://winfsp.dev/ and re-run this installer." />
+
+    <!-- Feature set — single feature containing everything. -->
+    <Feature Id="ProductFeature" Title="SynologyFuse" Level="1">
+      <!-- .NET GUI: all published files harvested from GuiPublishDir -->
+      <ComponentGroupRef Id="GuiComponents" />
+      <!-- Rust CLI binary -->
+      <ComponentRef Id="CliComponent" />
+      <!-- System PATH entry -->
+      <ComponentRef Id="PathComponent" />
+      <!-- Start Menu shortcut -->
+      <ComponentRef Id="ShortcutComponent" />
+    </Feature>
+
+  </Package>
+
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       Directory layout
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <Fragment>
+    <!-- C:\Program Files\SynologyFuse\ -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="SynologyFuse" />
+    </StandardDirectory>
+
+    <!-- Start Menu\Programs\SynologyFuse\ -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="SynologyFuse" />
+    </StandardDirectory>
+  </Fragment>
+
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       .NET GUI — all files from the self-contained publish output.
+       WiX generates one Component per file automatically.
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <Fragment>
+    <ComponentGroup Id="GuiComponents" Directory="INSTALLFOLDER">
+      <Files Include="$(var.GuiPublishDir)\**" />
+    </ComponentGroup>
+  </Fragment>
+
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       Rust CLI binary
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <Fragment>
+    <Component Id="CliComponent" Directory="INSTALLFOLDER" Guid="*">
+      <File Id="CliExe"
+            Source="$(var.RustBin)\synology-filestation-fuse.exe"
+            KeyPath="yes" />
+    </Component>
+  </Fragment>
+
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       Add install folder to the system PATH so the CLI is available in any
+       terminal without an absolute path.
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <Fragment>
+    <Component Id="PathComponent" Directory="INSTALLFOLDER" Guid="*">
+      <!--
+        A registry value is required as the KeyPath for components whose only
+        content is an environment-variable action.
+      -->
+      <RegistryValue Root="HKLM"
+                     Key="Software\SynologyFuse"
+                     Name="PathAdded"
+                     Value="1"
+                     Type="integer"
+                     KeyPath="yes" />
+      <Environment Id="SynoPath"
+                   Action="set"
+                   Name="PATH"
+                   Part="last"
+                   Permanent="no"
+                   System="yes"
+                   Value="[INSTALLFOLDER]" />
+    </Component>
+  </Fragment>
+
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       Start Menu shortcut for the GUI
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <Fragment>
+    <Component Id="ShortcutComponent" Directory="ApplicationProgramsFolder" Guid="*">
+      <Shortcut Id="AppStartMenuShortcut"
+                Name="Synology NAS Mount"
+                Description="Mount a Synology FileStation share as a local drive"
+                Target="[INSTALLFOLDER]SynologyFuse.Gui.exe"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="AppIcon" />
+      <!-- Remove Programs\SynologyFuse\ folder on uninstall. -->
+      <RemoveFolder Id="CleanUpStartMenu"
+                    Directory="ApplicationProgramsFolder"
+                    On="uninstall" />
+      <!--
+        Shortcuts live in a per-user folder, so the KeyPath must be a
+        per-user (HKCU) registry value.
+      -->
+      <RegistryValue Root="HKCU"
+                     Key="Software\SynologyFuse"
+                     Name="ShortcutInstalled"
+                     Value="1"
+                     Type="integer"
+                     KeyPath="yes" />
+    </Component>
+  </Fragment>
+
+</Wix>

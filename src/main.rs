@@ -38,6 +38,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
 use tracing::info;
 
@@ -135,13 +136,28 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    // On Windows the mountpoint must be an existing empty directory.
+    // On Windows, WinFsp creates the mountpoint directory itself (FILE_CREATE
+    // disposition) and deletes it on unmount.  The parent must exist but the
+    // directory itself must NOT exist when mounting.
     #[cfg(target_os = "windows")]
-    if !args.mountpoint.is_dir() {
-        anyhow::bail!(
-            "On Windows the mountpoint must be an existing empty directory, got: {}",
-            args.mountpoint.display()
-        );
+    {
+        if let Some(parent) = args.mountpoint.parent() {
+            if !parent.as_os_str().is_empty() && !parent.is_dir() {
+                anyhow::bail!(
+                    "On Windows the mountpoint's parent directory must exist, got: {}",
+                    args.mountpoint.display()
+                );
+            }
+        }
+        if args.mountpoint.exists() {
+            std::fs::remove_dir(&args.mountpoint).with_context(|| {
+                format!(
+                    "Mountpoint {} already exists and could not be removed \
+                     (is it still mounted?)",
+                    args.mountpoint.display()
+                )
+            })?;
+        }
     }
 
     // On macOS we mount via Finder which always places volumes under /Volumes/.
@@ -255,6 +271,14 @@ fn main() -> anyhow::Result<()> {
         volume_params.case_sensitive_search(false);
         volume_params.unicode_on_disk(true);
         volume_params.persistent_acls(false);
+        // Unique serial per mount so the Windows MountManager never reuses a
+        // stale Volume GUID from a previous (now-dead) WinFsp mount, which
+        // would cause STATUS_OBJECT_NAME_COLLISION on the next mount attempt.
+        let serial = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0xdeadbeef);
+        volume_params.volume_serial_number(serial);
 
         let fs_params = FileSystemParams::default_params(volume_params);
         let fs_ctx = winfs::SynologyWinFs::new(client.clone(), rt.handle().clone());

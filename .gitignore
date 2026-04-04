@@ -772,3 +772,10 @@ $RECYCLE.BIN/
 # End of https://www.toptal.com/developers/gitignore/api/linux,windows,macos,visualstudiocode,rust,rust-analyzer,csharp,rider,visualstudio,dotnetcore
 
 .claude
+# WiX build output
+*.wixpdb
+# Downloaded redistribution packages (fetched by build scripts)
+SynologyFuse.Installer/redist/
+# Bundle EXE (built artifact, contains the MSI)
+*-Setup.exe
+.wix
