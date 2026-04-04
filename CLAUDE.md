@@ -29,12 +29,12 @@ dotnet test SynologyFuse.Tests --verbosity normal
 dotnet format SynologyFuse.Gui
 ```
 
-### Windows Installer (WiX 6)
+### Windows Installer (WiX 4)
 
 ```powershell
 # One-time tool setup
 dotnet tool install --global wix
-wix extension add WixToolset.BootstrapperApplications.wixext
+wix extension add WixToolset.Bal.wixext
 wix extension add WixToolset.Util.wixext
 
 # Build MSI
