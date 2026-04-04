@@ -41,6 +41,8 @@ jobs:
       run: cargo build --verbose
     - name: Run Rust tests
       run: cargo test --verbose
+    - name: Build release (required for installer)
+      run: cargo build --release --verbose
     - name: Set up .NET 10
       uses: actions/setup-dotnet@v4
       with:
@@ -49,6 +51,15 @@ jobs:
       run: dotnet test SynologyFuse.Tests --verbosity normal
     - name: Publish GUI
       run: dotnet publish SynologyFuse.Gui -c Release -r osx-arm64 -p:SelfContained=true
+    - name: Build macOS installer
+      run: |
+        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+        ./SynologyFuse.MacInstaller/Build-Installer.sh --version "$VERSION" --out-dir .
+    - name: Upload macOS installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: SynologyFuse-macos-pkg
+        path: SynologyFuse-*.pkg
 
   build-windows:
 
