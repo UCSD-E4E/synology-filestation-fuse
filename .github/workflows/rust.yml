@@ -31,7 +31,7 @@ jobs:
     - name: Run dotnet tests
       run: dotnet test SynologyFuse.Tests --verbosity normal
     - name: Publish GUI
-      run: dotnet publish SynologyFuse.Gui -c Release -r linux-x64 -p:SelfContained=true
+      run: dotnet publish SynologyFuse.Gui -c Release -r linux-x64 -p:SelfContained=true --output SynologyFuse.Gui/bin/Release/net10.0/linux-x64/publish
     - name: Build deb package
       run: |
         VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
@@ -61,7 +61,7 @@ jobs:
     - name: Run dotnet tests
       run: dotnet test SynologyFuse.Tests --verbosity normal
     - name: Publish GUI
-      run: dotnet publish SynologyFuse.Gui -c Release -r osx-arm64 -p:SelfContained=true
+      run: dotnet publish SynologyFuse.Gui -c Release -r osx-arm64 -p:SelfContained=true --output SynologyFuse.Gui/bin/Release/net10.0/osx-arm64/publish
     - name: Build macOS installer
       run: |
         VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
@@ -95,8 +95,10 @@ jobs:
     - name: Run dotnet tests
       run: dotnet test SynologyFuse.Tests --verbosity normal
     - name: Publish GUI
-      run: dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
+      run: dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true --output SynologyFuse.Gui\bin\Release\net10.0\win-x64\publish
     - name: Install WiX
-      run: dotnet tool install --global wix
+      run: dotnet tool install --global wix --version 6.0.2
     - name: Build installer
-      run: msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj
+      run: |
+        $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=' | Select-Object -First 1).Line -replace '.*=\s*"(.*)"','$1'
+        .\SynologyFuse.Installer\Build-Installer.ps1 -Version $version
