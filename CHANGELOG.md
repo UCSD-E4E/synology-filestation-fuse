@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.6](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.5...synology-filestation-fuse-v0.1.6) (2026-04-04)
+
+
+### Bug Fixes
+
+* make sure everythign releases to the expected location ([2e3d8ad](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/2e3d8ad2ef337f71f1bfb769012b12f3be53d3e1))
+* more windows build fixes for release ([51ab9cd](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/51ab9cdbc25ea3bd7e097779672d0549308560c3))
+
 ## [0.1.5](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.4...synology-filestation-fuse-v0.1.5) (2026-04-04)
 
 
