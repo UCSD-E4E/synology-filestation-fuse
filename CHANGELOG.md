@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.7...synology-filestation-fuse-v0.1.8) (2026-04-05)
+
+
+### Bug Fixes
+
+* windows again ([82b5088](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/82b5088ab7d7621f5a4c8e5e1272d22718272474))
+
 ## [0.1.7](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.6...synology-filestation-fuse-v0.1.7) (2026-04-05)
 
 
