@@ -78,9 +78,7 @@ Runtime dependency: `libfuse3-3`
 
 ```powershell
 # One-time tool setup
-dotnet tool install --global wix --version 4.0.5
-wix extension add WixToolset.Bal.wixext/4.0.5
-wix extension add WixToolset.Util.wixext/4.0.5
+dotnet tool install --global wix --version 6.0.2
 
 # Build MSI
 .\SynologyFuse.Installer\Build-Installer.ps1 -Version 1.0.0

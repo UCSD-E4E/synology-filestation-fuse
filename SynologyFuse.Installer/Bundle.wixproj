@@ -1,0 +1,29 @@
+<!--
+  WiX SDK project for the SynologyFuse Burn bundle (EXE installer).
+
+  Builds a bootstrapper EXE that installs WinFsp (if absent) followed by the
+  SynologyFuse MSI.  Using PackageReference for WixToolset.Bal.wixext lets
+  NuGet restore locate the extension DLL correctly — the alternative
+  "wix extension add + wix build -ext" path relies on a specific folder layout
+  inside the NuGet cache that the published 6.x packages do not provide.
+
+  Called by Build-Bundle.ps1; do not invoke directly.
+-->
+<Project Sdk="WixToolset.Sdk/6.0.2">
+
+  <PropertyGroup>
+    <OutputType>Bundle</OutputType>
+    <Version Condition="'$(Version)' == ''">0.0.0</Version>
+    <!-- Expose MSBuild properties as WiX preprocessor variables. -->
+    <DefineConstants>$(DefineConstants);Version=$(Version);WinFspInstaller=$(WinFspInstaller);SynologyFuseMsi=$(SynologyFuseMsi)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Bundle.wxs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Bal.wixext" Version="6.0.2" />
+  </ItemGroup>
+
+</Project>

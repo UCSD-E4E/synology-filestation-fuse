@@ -44,17 +44,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$RepoRoot       = (Resolve-Path "$PSScriptRoot\..").Path
-$RedistDir      = Join-Path $PSScriptRoot "redist"
+$RepoRoot        = (Resolve-Path "$PSScriptRoot\..").Path
+$RedistDir       = Join-Path $PSScriptRoot "redist"
 $WinFspInstaller = Join-Path $RedistDir "winfsp.msi"
 $SynologyFuseMsi = Join-Path $PSScriptRoot "SynologyFuse-$Version.msi"
-$BundleWxs      = Join-Path $PSScriptRoot "Bundle.wxs"
-$OutFile        = Join-Path $OutDir "SynologyFuse-$Version-Setup.exe"
+$BundleProj      = Join-Path $PSScriptRoot "Bundle.wixproj"
+$OutFile         = Join-Path $OutDir "SynologyFuse-$Version-Setup.exe"
 
 # ── Verify prerequisites ──────────────────────────────────────────────────────
 
-if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
-    throw "wix CLI not found. Install it with: dotnet tool install --global wix"
+if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+    throw "dotnet CLI not found. Install the .NET SDK from https://dotnet.microsoft.com/"
 }
 
 if (-not (Test-Path $SynologyFuseMsi)) {
@@ -109,21 +109,28 @@ Write-Host "  WinFsp: $WinFspInstaller"
 Write-Host "  MSI:    $SynologyFuseMsi"
 Write-Host "  Out:    $OutFile"
 
-Push-Location $RepoRoot
-try {
-    wix build $BundleWxs `
-        -ext WixToolset.Bal.wixext `
-        -d "Version=$Version" `
-        -d "WinFspInstaller=$WinFspInstaller" `
-        -d "SynologyFuseMsi=$SynologyFuseMsi" `
-        -o $OutFile
-} finally {
-    Pop-Location
-}
+$BundleOutDir = Join-Path $PSScriptRoot "bundle-out"
+
+dotnet build $BundleProj `
+    -c Release `
+    /p:Version=$Version `
+    /p:WinFspInstaller=$WinFspInstaller `
+    /p:SynologyFuseMsi=$SynologyFuseMsi `
+    /p:OutputPath="$BundleOutDir\" `
+    /p:IntermediateOutputPath="$BundleOutDir\obj\"
 
 if ($LASTEXITCODE -ne 0) {
-    throw "wix build failed (exit code $LASTEXITCODE)"
+    throw "dotnet build failed (exit code $LASTEXITCODE)"
 }
+
+$builtExe = Get-ChildItem $BundleOutDir -Recurse -Filter "*.exe" | Select-Object -First 1
+if (-not $builtExe) {
+    throw "Bundle EXE not found in '$BundleOutDir' after build"
+}
+
+$null = New-Item -ItemType Directory -Force (Split-Path $OutFile)
+Move-Item $builtExe.FullName $OutFile -Force
+Remove-Item $BundleOutDir -Recurse -Force -ErrorAction SilentlyContinue
 
 $size = (Get-Item $OutFile).Length / 1MB
 Write-Host ("Bundle ready: {0} ({1:F1} MB)" -f $OutFile, $size)

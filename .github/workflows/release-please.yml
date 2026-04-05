@@ -94,9 +94,7 @@ jobs:
         run: dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true --output SynologyFuse.Gui\bin\Release\net10.0\win-x64\publish
       - name: Install WiX and extensions
         run: |
-          dotnet tool install --global wix --version 4.0.5
-          wix extension add -g WixToolset.Bal.wixext/4.0.5
-          wix extension add -g WixToolset.Util.wixext/4.0.5
+          dotnet tool install --global wix --version 6.0.2
       - name: Build MSI
         run: .\SynologyFuse.Installer\Build-Installer.ps1 -Version "${{ needs.release-please.outputs.version }}"
       - name: Build bundle
