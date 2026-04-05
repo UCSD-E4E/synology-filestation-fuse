@@ -105,7 +105,6 @@ jobs:
       - name: Upload installers to release
         run: |
           gh release upload "${{ needs.release-please.outputs.tag_name }}" `
-            (Get-Item SynologyFuse.Installer\SynologyFuse-*.msi).FullName `
             (Get-Item SynologyFuse.Installer\SynologyFuse-*-Setup.exe).FullName
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
