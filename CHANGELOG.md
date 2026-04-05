@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.9...synology-filestation-fuse-v0.1.10) (2026-04-05)
+
+
+### Bug Fixes
+
+* try again ([a97816a](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/a97816a8a81a840b47c573d11b9ab663baeeff28))
+
 ## [0.1.9](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.8...synology-filestation-fuse-v0.1.9) (2026-04-05)
 
 
