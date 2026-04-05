@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.10...synology-filestation-fuse-v0.1.11) (2026-04-05)
+
+
+### Bug Fixes
+
+* don't release the msi ([bd7f0cb](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/bd7f0cb57794592b05d73cf00231cc0508e910f5))
+
 ## [0.1.10](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.9...synology-filestation-fuse-v0.1.10) (2026-04-05)
 
 
