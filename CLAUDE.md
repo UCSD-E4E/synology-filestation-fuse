@@ -74,16 +74,16 @@ The package installs:
 
 Runtime dependency: `libfuse3-3`
 
-### Windows Installer (WiX 6)
+### Windows Installer (WiX 4)
 
 ```powershell
 # One-time tool setup
-dotnet tool install --global wix
-wix extension add WixToolset.Bal.wixext/6.0.2
-wix extension add WixToolset.Util.wixext/6.0.2
+dotnet tool install --global wix --version 4.0.5
+wix extension add WixToolset.Bal.wixext/4.0.5
+wix extension add WixToolset.Util.wixext/4.0.5
 
 # Build MSI
-msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj
+.\SynologyFuse.Installer\Build-Installer.ps1 -Version 1.0.0
 
 # Build full bundle (MSI + WinFsp bootstrapper)
 .\SynologyFuse.Installer\Build-Bundle.ps1

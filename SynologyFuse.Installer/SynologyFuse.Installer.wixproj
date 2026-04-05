@@ -16,7 +16,7 @@
 
   <PropertyGroup>
     <!-- Package version — override with /p:Version=X.Y.Z -->
-    <Version Condition="'$(Version)' == ''">0.1.2</Version>
+    <Version Condition="'$(Version)' == ''">0.0.0</Version>
 
     <RustBin Condition="'$(RustBin)' == ''">$(MSBuildThisFileDirectory)..\target\release</RustBin>
     <GuiPublishDir Condition="'$(GuiPublishDir)' == ''">$(MSBuildThisFileDirectory)..\SynologyFuse.Gui\bin\Release\net10.0\win-x64\publish</GuiPublishDir>

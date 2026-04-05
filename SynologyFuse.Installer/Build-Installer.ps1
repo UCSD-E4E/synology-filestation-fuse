@@ -24,7 +24,7 @@
     .\SynologyFuse.Installer\Build-Installer.ps1 -Version 1.0.0
 #>
 param(
-    [string]$Version  = "0.1.2",
+    [string]$Version  = "0.0.0",
     [string]$OutDir   = $PSScriptRoot
 )
 

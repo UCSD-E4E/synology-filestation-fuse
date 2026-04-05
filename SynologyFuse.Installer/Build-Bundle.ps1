@@ -33,7 +33,7 @@
     .\SynologyFuse.Installer\Build-Bundle.ps1 -Version 1.0.0
 #>
 param(
-    [string]$Version       = "0.1.2",
+    [string]$Version       = "0.0.0",
     [string]$WinFspVersion = "2.1.25156",
     # Pinned SHA-256 for winfsp-2.1.25156.msi (update when bumping WinFspVersion).
     # Source: https://github.com/winfsp/winfsp/releases/tag/v2.1
