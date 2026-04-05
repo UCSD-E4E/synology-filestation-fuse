@@ -16,11 +16,12 @@
     <Version Condition="'$(Version)' == ''">0.0.0</Version>
     <!-- Expose MSBuild properties as WiX preprocessor variables. -->
     <DefineConstants>$(DefineConstants);Version=$(Version);WinFspInstaller=$(WinFspInstaller);SynologyFuseMsi=$(SynologyFuseMsi)</DefineConstants>
+    <!-- Disable the SDK's automatic *.wxs glob so only Bundle.wxs is compiled. -->
+    <EnableDefaultItems>false</EnableDefaultItems>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Include="Bundle.wxs" />
-    <Compile Remove="Package.wxs" />
   </ItemGroup>
 
   <ItemGroup>
