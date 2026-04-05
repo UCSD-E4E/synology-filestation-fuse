@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.6...synology-filestation-fuse-v0.1.7) (2026-04-05)
+
+
+### Bug Fixes
+
+* additional windows fixes.  use older wix ([36dea6e](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/36dea6e4cc9b891db61d1f8c373de03d4ee5e97c))
+
 ## [0.1.6](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.5...synology-filestation-fuse-v0.1.6) (2026-04-04)
 
 
