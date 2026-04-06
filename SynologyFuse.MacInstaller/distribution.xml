@@ -9,9 +9,9 @@
         <os-version min="12.0" />
     </allowed-os-versions>
 
-    <!-- Always install to the boot volume; no user-specific install paths -->
+    <!-- Install to the local system (/Applications); no user-specific install paths -->
     <domains enable_localSystem="true" />
-    <options customize="never" rootVolumeOnly="true" />
+    <options customize="never" />
 
     <!-- Installer UI pages (files live in resources/) -->
     <welcome    file="welcome.html" mime-type="text/html" />
