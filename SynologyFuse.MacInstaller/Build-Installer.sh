@@ -126,7 +126,7 @@ STAGE_DIR="$(mktemp -d)"
 cleanup() { rm -rf "${STAGE_DIR}" "${COMPONENT_PKG}"; }
 trap cleanup EXIT
 
-APP_CONTENTS="${STAGE_DIR}/Applications/${APP_NAME}.app/Contents"
+APP_CONTENTS="${STAGE_DIR}/${APP_NAME}.app/Contents"
 mkdir -p "${APP_CONTENTS}/MacOS"
 mkdir -p "${APP_CONTENTS}/Resources"
 
@@ -165,7 +165,7 @@ sed "s/__VERSION__/${VERSION}/g; s/__GUI_BINARY__/${GUI_BINARY}/g" \
 echo "Running pkgbuild..."
 pkgbuild \
     --root          "${STAGE_DIR}" \
-    --install-location "/" \
+    --install-location "/Applications" \
     --identifier    "${BUNDLE_ID}" \
     --version       "${VERSION}" \
     --scripts       "${SCRIPT_DIR}/scripts" \
