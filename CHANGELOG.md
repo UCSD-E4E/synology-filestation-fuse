@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.13](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.12...synology-filestation-fuse-v0.1.13) (2026-04-12)
+
+
+### Bug Fixes
+
+* macos installer on modern mac ([d12d03d](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/d12d03d177340adf39d46bab2731d535e75f9db5))
+
 ## [0.1.12](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.11...synology-filestation-fuse-v0.1.12) (2026-04-07)
 
 
