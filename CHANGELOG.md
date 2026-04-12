@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.12](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.11...synology-filestation-fuse-v0.1.12) (2026-04-07)
+
+
+### Bug Fixes
+
+* **macos:** remove rootVolumeOnly to resolve system volume install error ([5f0b589](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/5f0b5898c8144bdc2d6134ca47c9a528d20126f7))
+* remove rootVolumeOnly from macOS installer distribution.xml ([26e36f3](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/26e36f3b66fd3df7172dbbc3b9c58571ad2fbfb8))
+
 ## [0.1.11](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.10...synology-filestation-fuse-v0.1.11) (2026-04-05)
 
 
