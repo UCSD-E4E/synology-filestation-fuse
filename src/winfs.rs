@@ -231,6 +231,12 @@ pub struct SynologyWinFs {
     /// Keyed by NAS path.  Entries are removed after a successful upload or
     /// when the last handle to the file is closed.
     pending_files: RwLock<HashMap<String, PendingEntry>>,
+    /// Per-path locks serializing the get_info → create_folder sequence.
+    /// Without these, parallel mkdirs on the same path (e.g. from Rust's
+    /// create_dir_all racing on the same parent) can both pass the existence
+    /// check and call CreateFolder, which Synology resolves by silently
+    /// creating a sibling with "_Conflict" appended.
+    folder_create_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl SynologyWinFs {
@@ -239,7 +245,17 @@ impl SynologyWinFs {
             client,
             runtime,
             pending_files: RwLock::new(HashMap::new()),
+            folder_create_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn folder_lock(&self, path: &str) -> Arc<Mutex<()>> {
+        self.folder_create_locks
+            .lock()
+            .unwrap()
+            .entry(path.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
@@ -343,6 +359,18 @@ impl FileSystemContext for SynologyWinFs {
         let is_dir = create_options & FILE_DIRECTORY_FILE != 0;
 
         if is_dir {
+            let lock = self.folder_lock(&nas);
+            let _guard = lock.lock().unwrap();
+
+            // Race protection: get_security_by_name returned NotFound, but a
+            // parallel thread may have created this folder since. If we skip
+            // this check, Synology's CreateFolder silently creates a sibling
+            // with "_Conflict" appended instead of erroring.
+            if self.runtime.block_on(self.client.get_info(&nas)).is_ok() {
+                tracing::debug!("create: {} already exists, returning collision", nas);
+                return Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_COLLISION));
+            }
+
             let (parent, name) = split_path(&nas);
             self.runtime
                 .block_on(self.client.create_folder(parent, name))

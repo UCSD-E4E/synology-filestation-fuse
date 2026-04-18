@@ -8,7 +8,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{EIO, ENOENT, ENOSYS};
+use libc::{EEXIST, EIO, ENOENT, ENOSYS};
 use tracing::{debug, error, info, warn};
 
 use crate::cache::{InodeCache, ReadCache};
@@ -822,6 +822,23 @@ impl Filesystem for SynologyFS {
             None => { reply.error(ENOENT); return; }
         };
         debug!("mkdir: {}/{}", parent_path, name_str);
+
+        // Pre-check existence: Synology's CreateFolder silently creates a
+        // sibling with "_Conflict" appended if the target name already exists,
+        // so we must error out before calling it. The kernel's parent-inode
+        // lock serializes mkdir against itself, but a stale negative dentry,
+        // a parallel lookup race, or another client touching the NAS can all
+        // leave a folder present here that the caller didn't see.
+        let child_path = if parent_path == "/" {
+            format!("/{}", name_str)
+        } else {
+            format!("{}/{}", parent_path, name_str)
+        };
+        if self.block(self.client.get_info(&child_path)).is_ok() {
+            debug!("mkdir: {} already exists, returning EEXIST", child_path);
+            reply.error(EEXIST);
+            return;
+        }
 
         match self.block(self.client.create_folder(&parent_path, name_str)) {
             Ok(info) => {

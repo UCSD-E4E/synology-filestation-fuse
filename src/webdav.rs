@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5,6 +6,7 @@ use bytes::{Buf, Bytes};
 use dav_server::davpath::DavPath;
 use dav_server::fs::*;
 use futures_util::stream;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::debug;
 
 use crate::client::SynologyClient;
@@ -249,15 +251,35 @@ pub struct SynologyDavFs {
     /// URL path prefix stripped before forwarding to the NAS API.
     /// e.g. "/nas" when the WebDAV server is mounted at `http://host/nas/`.
     path_prefix: String,
+    /// Per-path locks serializing the get_info → create_folder sequence.
+    /// dav-server runs requests concurrently, so without this two parallel
+    /// mkdirs on the same path would both pass the existence check, hit
+    /// Synology's CreateFolder, and one would silently land as a sibling
+    /// with "_Conflict" appended. Wrapped in Arc so clones of SynologyDavFs
+    /// share the same lock map.
+    folder_create_locks: Arc<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl SynologyDavFs {
     pub fn new(client: Arc<SynologyClient>, path_prefix: String) -> Self {
-        Self { client, path_prefix }
+        Self {
+            client,
+            path_prefix,
+            folder_create_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
     }
 
     fn nas_path(&self, path: &DavPath) -> String {
         dav_to_nas(path, &self.path_prefix)
+    }
+
+    fn folder_lock(&self, path: &str) -> Arc<AsyncMutex<()>> {
+        self.folder_create_locks
+            .lock()
+            .unwrap()
+            .entry(path.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 }
 
@@ -382,6 +404,19 @@ impl DavFileSystem for SynologyDavFs {
         Box::pin(async move {
             let nas = self.nas_path(path);
             debug!("webdav create_dir: {}", nas);
+
+            let lock = self.folder_lock(&nas);
+            let _guard = lock.lock().await;
+
+            // Race protection: Synology's CreateFolder silently creates a
+            // sibling with "_Conflict" appended if the target already exists,
+            // so we must error before calling it. The per-path lock above
+            // makes the get_info → create_folder pair atomic per path.
+            if self.client.get_info(&nas).await.is_ok() {
+                debug!("webdav create_dir: {} already exists", nas);
+                return Err(FsError::Exists);
+            }
+
             let (parent, name) = split_path(&nas);
             self.client
                 .create_folder(parent, name)
@@ -467,5 +502,172 @@ impl DavFileSystem for SynologyDavFs {
                 .await
                 .map_err(syno_err)
         })
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::SynologyClient;
+    use wiremock::matchers::{method, path as wm_path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn client_for(server: &MockServer) -> SynologyClient {
+        let uri = server.uri();
+        let without_scheme = uri.trim_start_matches("http://");
+        let (host, port_str) = without_scheme.rsplit_once(':').unwrap();
+        let port: u16 = port_str.parse().unwrap();
+        SynologyClient::new(host, port, false)
+    }
+
+    fn dp(p: &str) -> DavPath {
+        DavPath::new(p).unwrap()
+    }
+
+    /// Count how many requests arrived at SYNO.FileStation.CreateFolder.
+    async fn create_folder_call_count(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.url
+                    .query()
+                    .unwrap_or("")
+                    .contains("api=SYNO.FileStation.CreateFolder")
+            })
+            .count()
+    }
+
+    async fn mount_get_info_not_found(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(wm_path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{"code": 408, "path": "/share/newdir"}]}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_get_info_exists(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(wm_path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{
+                    "name": "newdir",
+                    "path": "/share/newdir",
+                    "isdir": true,
+                    "additional": null
+                }]}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_create_folder_success(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(wm_path("/webapi/entry.cgi"))
+            .and(query_param("method", "create"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"folders": [{
+                    "name": "newdir",
+                    "path": "/share/newdir",
+                    "isdir": true,
+                    "additional": null
+                }]}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn create_dir_creates_folder_when_absent() {
+        let server = MockServer::start().await;
+        mount_get_info_not_found(&server).await;
+        mount_create_folder_success(&server).await;
+
+        let fs = SynologyDavFs::new(Arc::new(client_for(&server)), String::new());
+        DavFileSystem::create_dir(&fs, &dp("/share/newdir"))
+            .await
+            .unwrap();
+
+        assert_eq!(create_folder_call_count(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn create_dir_returns_exists_when_folder_already_present() {
+        let server = MockServer::start().await;
+        mount_get_info_exists(&server).await;
+        // CreateFolder is mounted but should never be hit — if it is, that's
+        // exactly the bug this test exists to prevent (Synology silently
+        // creating a "_Conflict" sibling).
+        mount_create_folder_success(&server).await;
+
+        let fs = SynologyDavFs::new(Arc::new(client_for(&server)), String::new());
+        let err = DavFileSystem::create_dir(&fs, &dp("/share/newdir"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::Exists));
+
+        assert_eq!(create_folder_call_count(&server).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_create_dir_calls_create_folder_only_once() {
+        let server = MockServer::start().await;
+
+        // First get_info hit returns "not found"; later hits return success
+        // (because by then the first task has created the folder).
+        Mock::given(method("GET"))
+            .and(wm_path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{"code": 408, "path": "/share/newdir"}]}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_get_info_exists(&server).await;
+        mount_create_folder_success(&server).await;
+
+        let fs = Arc::new(SynologyDavFs::new(
+            Arc::new(client_for(&server)),
+            String::new(),
+        ));
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let fs = fs.clone();
+            handles.push(tokio::spawn(async move {
+                DavFileSystem::create_dir(&*fs, &dp("/share/newdir")).await
+            }));
+        }
+
+        let mut ok = 0;
+        let mut exists = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(()) => ok += 1,
+                Err(FsError::Exists) => exists += 1,
+                Err(other) => panic!("unexpected error: {:?}", other),
+            }
+        }
+
+        assert_eq!(ok, 1, "exactly one task should win the race");
+        assert_eq!(exists, 4, "the rest should observe the folder already exists");
+        assert_eq!(
+            create_folder_call_count(&server).await,
+            1,
+            "CreateFolder must be called exactly once — otherwise Synology would create a _Conflict sibling"
+        );
     }
 }
