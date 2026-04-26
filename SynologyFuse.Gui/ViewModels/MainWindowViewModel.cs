@@ -40,9 +40,6 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     private string _password = "";
 
     [ObservableProperty]
-    private string _otp = "";
-
-    [ObservableProperty]
     private decimal _port;
 
     [ObservableProperty]
@@ -128,7 +125,6 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
                 Host = Host,
                 Username = Username,
                 Password = Password,
-                Otp = Otp,
                 Port = (ushort)Port,
                 UseHttps = UseHttps,
                 Mountpoint = Mountpoint,

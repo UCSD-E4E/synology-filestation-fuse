@@ -5,7 +5,6 @@ public sealed class MountConfig
     public string Host { get; init; } = "";
     public string Username { get; init; } = "";
     public string Password { get; init; } = "";
-    public string Otp { get; init; } = "";
     public ushort Port { get; init; } = 5001;
     public bool UseHttps { get; init; } = true;
     public string Mountpoint { get; init; } = "";

@@ -49,8 +49,6 @@ public sealed class MountService : IDisposable
 
         // Pass credentials via environment variables to avoid exposure in process list.
         psi.Environment["SYNO_PASSWORD"] = config.Password;
-        if (!string.IsNullOrEmpty(config.Otp))
-            psi.Environment["SYNO_OTP"] = config.Otp;
 
         _cts = new CancellationTokenSource();
         _process = new Process { StartInfo = psi, EnableRaisingEvents = true };

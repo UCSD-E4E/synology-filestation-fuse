@@ -71,14 +71,6 @@
                      IsEnabled="{Binding IsDisconnected}" />
         </Grid>
 
-        <!-- OTP -->
-        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
-          <TextBlock Grid.Column="0" Text="OTP / 2FA" VerticalAlignment="Center" />
-          <TextBox   Grid.Column="1" Text="{Binding Otp}"
-                     Watermark="Leave blank if not using 2FA"
-                     IsEnabled="{Binding IsDisconnected}" />
-        </Grid>
-
         <!-- Port -->
         <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
           <TextBlock Grid.Column="0" Text="Port" VerticalAlignment="Center" />
@@ -157,9 +149,13 @@
                        TextWrapping="Wrap"
                        Foreground="#856404" />
             <Grid ColumnDefinitions="*,Auto">
-              <TextBox Grid.Column="0" Text="{Binding PendingOtp}"
+              <TextBox Grid.Column="0" Text="{Binding PendingOtp, UpdateSourceTrigger=PropertyChanged}"
                        Watermark="6-digit TOTP code"
-                       Margin="0,0,8,0" />
+                       Margin="0,0,8,0">
+                <TextBox.KeyBindings>
+                  <KeyBinding Gesture="Enter" Command="{Binding SubmitOtpCommand}" />
+                </TextBox.KeyBindings>
+              </TextBox>
               <Button Grid.Column="1"
                       Content="Submit"
                       Command="{Binding SubmitOtpCommand}"
@@ -174,6 +170,7 @@
           <Button Content="Connect"
                   Command="{Binding ConnectCommand}"
                   Classes="accent"
+                  IsDefault="True"
                   Width="110" />
           <Button Content="Disconnect"
                   Command="{Binding DisconnectCommand}"
