@@ -41,6 +41,31 @@
     <ScrollViewer>
       <StackPanel Margin="20" Spacing="4">
 
+        <!-- Update available banner -->
+        <Border IsVisible="{Binding ShowUpdateBanner}"
+                Background="#D1ECF1"
+                CornerRadius="4"
+                Padding="12,8"
+                Margin="0,0,0,10">
+          <Grid ColumnDefinitions="*,Auto,Auto">
+            <StackPanel Grid.Column="0" VerticalAlignment="Center">
+              <TextBlock FontWeight="SemiBold" Foreground="#0C5460">
+                <Run Text="Update available: v" /><Run Text="{Binding UpdateVersion}" />
+              </TextBlock>
+              <TextBlock Text="A newer release is available on GitHub."
+                         Foreground="#0C5460"
+                         TextWrapping="Wrap" />
+            </StackPanel>
+            <Button Grid.Column="1"
+                    Content="View"
+                    Command="{Binding OpenUpdateUrlCommand}"
+                    Margin="8,0,4,0" />
+            <Button Grid.Column="2"
+                    Content="Dismiss"
+                    Command="{Binding DismissUpdateBannerCommand}" />
+          </Grid>
+        </Border>
+
         <!-- Connection section -->
         <TextBlock Text="Connection"
                    FontWeight="SemiBold"

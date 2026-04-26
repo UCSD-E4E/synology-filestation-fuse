@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading.Tasks;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -24,6 +25,21 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _cacheTtl = s.CacheTtl;
         _readCacheMb = s.ReadCacheMb;
         _logLevel = s.LogLevel;
+
+        _ = CheckForUpdatesAsync();
+    }
+
+    private async Task CheckForUpdatesAsync()
+    {
+        var info = await UpdateCheckService.CheckAsync();
+        if (info is null) return;
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            UpdateVersion = info.Latest.ToString();
+            UpdateUrl = info.HtmlUrl;
+            ShowUpdateBanner = true;
+        });
     }
 
     // ── Connection fields ─────────────────────────────────────────────────────
@@ -91,6 +107,38 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(SubmitOtpCommand))]
     private string _pendingOtp = "";
+
+    // ── Update banner ─────────────────────────────────────────────────────────
+
+    [ObservableProperty]
+    private bool _showUpdateBanner;
+
+    [ObservableProperty]
+    private string _updateVersion = "";
+
+    [ObservableProperty]
+    private string _updateUrl = "";
+
+    [RelayCommand]
+    private void DismissUpdateBanner() => ShowUpdateBanner = false;
+
+    [RelayCommand]
+    private void OpenUpdateUrl()
+    {
+        if (string.IsNullOrEmpty(UpdateUrl)) return;
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = UpdateUrl,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Could not open browser: {ex.Message}");
+        }
+    }
 
     // ── Commands ──────────────────────────────────────────────────────────────
 
