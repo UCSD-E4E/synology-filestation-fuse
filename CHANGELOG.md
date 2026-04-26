@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.14](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.13...synology-filestation-fuse-v0.1.14) (2026-04-26)
+
+
+### Features
+
+* auto remind about version updates ([c5043c9](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/c5043c91f261289f5a859e722f9e5a7ca5229db8))
+* ui cleanup.  can now use enter to automatically submit password and otp. ([0d49424](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/0d494245057e3e6602ae89a8497812154a02f72b))
+
 ## [0.1.13](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.12...synology-filestation-fuse-v0.1.13) (2026-04-12)
 
 
