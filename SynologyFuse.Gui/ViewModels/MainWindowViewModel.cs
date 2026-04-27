@@ -26,8 +26,13 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _readCacheMb = s.ReadCacheMb;
         _logLevel = s.LogLevel;
 
+        var v = UpdateCheckService.CurrentVersion();
+        Version = $"v{v.Major}.{v.Minor}.{v.Build}";
+
         _ = CheckForUpdatesAsync();
     }
+
+    public string Version { get; }
 
     private async Task CheckForUpdatesAsync()
     {

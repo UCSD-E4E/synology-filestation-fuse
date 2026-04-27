@@ -16,9 +16,16 @@
     <Border DockPanel.Dock="Bottom"
             Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}"
             Padding="12,6">
-      <TextBlock Text="{Binding StatusText}"
-                 FontSize="12"
-                 Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBlock Grid.Column="0"
+                   Text="{Binding StatusText}"
+                   FontSize="12"
+                   Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+        <TextBlock Grid.Column="1"
+                   Text="{Binding Version}"
+                   FontSize="12"
+                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+      </Grid>
     </Border>
 
     <!-- Log output -->
