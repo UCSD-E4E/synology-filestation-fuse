@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.16](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.15...synology-filestation-fuse-v0.1.16) (2026-04-27)
+
+
+### Features
+
+* show version number in status bar ([4632261](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/4632261f53ea41dfea5d0836e28c83a27df1e3aa))
+
 ## [0.1.15](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.14...synology-filestation-fuse-v0.1.15) (2026-04-27)
 
 
