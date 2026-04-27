@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.15](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.14...synology-filestation-fuse-v0.1.15) (2026-04-27)
+
+
+### Bug Fixes
+
+* fuse driver now recovers if we go offline temporarily ([192575a](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/192575abc69fc9f9454bf02a19067d328cd9c52d))
+
 ## [0.1.14](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.13...synology-filestation-fuse-v0.1.14) (2026-04-26)
 
 
