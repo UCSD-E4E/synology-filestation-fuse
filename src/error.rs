@@ -1,5 +1,5 @@
 #[cfg(target_os = "linux")]
-use libc::{EACCES, EAGAIN, EEXIST, EINVAL, EIO, ENOENT, ENOTEMPTY, ENOSPC, ENOSYS};
+use libc::{EACCES, EAGAIN, EEXIST, EINVAL, EIO, ENOENT, ENOSPC, ENOSYS, ENOTEMPTY};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -49,14 +49,14 @@ fn syno_code_to_errno(code: u32) -> i32 {
         418 => EEXIST,    // Already exists
         419 => ENOSPC,    // Not enough quota
         // CreateFolder-specific errors
-        1100 => EIO,      // Failed to create folder
-        1101 => EEXIST,   // Folder already exists
+        1100 => EIO,    // Failed to create folder
+        1101 => EEXIST, // Folder already exists
         // Generic session/privilege errors
-        119 => EACCES,    // Insufficient privilege / session does not have write access
+        119 => EACCES, // Insufficient privilege / session does not have write access
         // Upload-specific errors
-        1800 => EIO,      // Upload failed
-        1804 => ENOSPC,   // Not enough quota
-        1805 => EACCES,   // No permission to upload
+        1800 => EIO,    // Upload failed
+        1804 => ENOSPC, // Not enough quota
+        1805 => EACCES, // No permission to upload
         _ => EIO,
     }
 }
@@ -98,14 +98,23 @@ mod display_tests {
     #[test]
     fn display_all_variants() {
         assert_eq!(SynoFsError::NotFound.to_string(), "not found");
-        assert_eq!(SynoFsError::PermissionDenied.to_string(), "permission denied");
+        assert_eq!(
+            SynoFsError::PermissionDenied.to_string(),
+            "permission denied"
+        );
         assert_eq!(SynoFsError::AlreadyExists.to_string(), "already exists");
         assert_eq!(SynoFsError::NotEmpty.to_string(), "directory not empty");
         assert_eq!(SynoFsError::InvalidArg.to_string(), "invalid argument");
         assert_eq!(SynoFsError::NoSpace.to_string(), "no space left");
         assert_eq!(SynoFsError::NotSupported.to_string(), "not supported");
-        assert_eq!(SynoFsError::Io("detail".into()).to_string(), "I/O error: detail");
-        assert_eq!(SynoFsError::ApiError(408).to_string(), "Synology API error 408");
+        assert_eq!(
+            SynoFsError::Io("detail".into()).to_string(),
+            "I/O error: detail"
+        );
+        assert_eq!(
+            SynoFsError::ApiError(408).to_string(),
+            "Synology API error 408"
+        );
     }
 
     #[test]
@@ -151,7 +160,8 @@ mod tests {
         ];
         for (code, expected) in cases {
             assert_eq!(
-                SynoFsError::ApiError(code).to_errno(), expected,
+                SynoFsError::ApiError(code).to_errno(),
+                expected,
                 "API code {code} should map to errno {expected}"
             );
         }

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use widestring::U16CStr;
 use winfsp::filesystem::{
-    DirBuffer, DirInfo, DirMarker, FileSecurity, FileInfo, FileSystemContext, OpenFileInfo,
+    DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     VolumeInfo, WideNameInfo,
 };
 use winfsp::FspError;
@@ -69,9 +69,7 @@ fn syno_to_fsp(e: SynoFsError) -> FspError {
         SynoFsError::PermissionDenied => FspError::NTSTATUS(STATUS_ACCESS_DENIED),
         SynoFsError::AlreadyExists => FspError::NTSTATUS(STATUS_OBJECT_NAME_COLLISION),
         SynoFsError::NoSpace => FspError::NTSTATUS(STATUS_DISK_FULL),
-        SynoFsError::ApiError(408 | 414 | 415) => {
-            FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)
-        }
+        SynoFsError::ApiError(408 | 414 | 415) => FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND),
         SynoFsError::ApiError(418) => FspError::NTSTATUS(STATUS_OBJECT_NAME_COLLISION),
         SynoFsError::ApiError(419) => FspError::NTSTATUS(STATUS_DISK_FULL),
         _ => FspError::NTSTATUS(STATUS_UNSUCCESSFUL),
@@ -316,13 +314,21 @@ impl FileSystemContext for SynologyWinFs {
         // upload any remaining buffered data before dropping the context.
         let data_opt = context.write_buf.lock().unwrap().take();
         if let Some(data) = data_opt {
-            tracing::debug!("close: last-chance upload {} ({} bytes)", context.nas_path, data.len());
+            tracing::debug!(
+                "close: last-chance upload {} ({} bytes)",
+                context.nas_path,
+                data.len()
+            );
             let (parent, name) = split_path(&context.nas_path);
-            let _ = self.runtime
+            let _ = self
+                .runtime
                 .block_on(self.client.upload(parent, name, data, !context.is_new));
         }
         tracing::debug!("close: removing pending {}", context.nas_path);
-        self.pending_files.write().unwrap().remove(&context.nas_path);
+        self.pending_files
+            .write()
+            .unwrap()
+            .remove(&context.nas_path);
     }
 
     // ── Optional methods ──────────────────────────────────────────────────────
@@ -377,7 +383,10 @@ impl FileSystemContext for SynologyWinFs {
     ) -> winfsp::Result<u32> {
         let bytes = self
             .runtime
-            .block_on(self.client.download(&context.nas_path, offset, buffer.len() as u64))
+            .block_on(
+                self.client
+                    .download(&context.nas_path, offset, buffer.len() as u64),
+            )
             .map_err(syno_to_fsp)?;
         let len = bytes.len().min(buffer.len());
         buffer[..len].copy_from_slice(&bytes[..len]);
@@ -418,7 +427,10 @@ impl FileSystemContext for SynologyWinFs {
             if let Some(data) = data_opt {
                 tracing::debug!("flush: uploading {} ({} bytes)", ctx.nas_path, data.len());
                 let (parent, name) = split_path(&ctx.nas_path);
-                match self.runtime.block_on(self.client.upload(parent, name, data, !ctx.is_new)) {
+                match self
+                    .runtime
+                    .block_on(self.client.upload(parent, name, data, !ctx.is_new))
+                {
                     Ok(()) => {
                         // Upload succeeded — consume the buffer, but keep the pending
                         // entry alive so that a subsequent get_security_by_name() for
@@ -472,16 +484,9 @@ impl FileSystemContext for SynologyWinFs {
         Ok(())
     }
 
-    fn cleanup(
-        &self,
-        context: &Self::FileContext,
-        _file_name: Option<&U16CStr>,
-        flags: u32,
-    ) {
+    fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
         if flags & FSP_CLEANUP_DELETE != 0 && context.delete_pending.load(Ordering::Relaxed) {
-            let _ = self
-                .runtime
-                .block_on(self.client.delete(&context.nas_path));
+            let _ = self.runtime.block_on(self.client.delete(&context.nas_path));
         }
     }
 
@@ -541,24 +546,45 @@ impl FileSystemContext for SynologyWinFs {
         let same_dir = from_parent.eq_ignore_ascii_case(to_parent);
         let upload_parent = if same_dir { from_parent } else { to_parent };
 
-        tracing::debug!("rename: {} -> {} (is_new={}, buf={}, same_dir={})",
-            from, to, context.is_new,
-            if context.write_buf.lock().unwrap().is_some() { "Some" } else { "None" },
-            same_dir);
+        tracing::debug!(
+            "rename: {} -> {} (is_new={}, buf={}, same_dir={})",
+            from,
+            to,
+            context.is_new,
+            if context.write_buf.lock().unwrap().is_some() {
+                "Some"
+            } else {
+                "None"
+            },
+            same_dir
+        );
 
         // If the file has buffered data not yet uploaded (either because this
         // is the original create() handle or a secondary handle that shares
         // the same Arc<Mutex<...>>), upload directly under the new name.
         let data_opt = context.write_buf.lock().unwrap().take();
         if let Some(data) = data_opt {
-            tracing::debug!("rename: uploading pending {} -> {}/{} ({} bytes)", from, upload_parent, to_name, data.len());
+            tracing::debug!(
+                "rename: uploading pending {} -> {}/{} ({} bytes)",
+                from,
+                upload_parent,
+                to_name,
+                data.len()
+            );
             self.runtime
-                .block_on(self.client.upload(upload_parent, to_name, data, !context.is_new))
+                .block_on(
+                    self.client
+                        .upload(upload_parent, to_name, data, !context.is_new),
+                )
                 .map_err(syno_to_fsp)?;
             self.pending_files.write().unwrap().remove(from);
             return Ok(());
         }
-        tracing::debug!("rename: no pending data, calling client.rename {} -> {}", from, to);
+        tracing::debug!(
+            "rename: no pending data, calling client.rename {} -> {}",
+            from,
+            to
+        );
 
         if same_dir {
             // Same-directory rename: use the NAS rename API with the source
@@ -583,7 +609,10 @@ impl FileSystemContext for SynologyWinFs {
                 .block_on(self.client.download(from, 0, size))
                 .map_err(syno_to_fsp)?;
             self.runtime
-                .block_on(self.client.upload(upload_parent, to_name, data.to_vec(), true))
+                .block_on(
+                    self.client
+                        .upload(upload_parent, to_name, data.to_vec(), true),
+                )
                 .map_err(syno_to_fsp)?;
             self.runtime
                 .block_on(self.client.delete(from))

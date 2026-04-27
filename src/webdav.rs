@@ -37,7 +37,11 @@ fn dav_to_nas(path: &DavPath, prefix: &str) -> String {
 /// Synology DSM does not store these as regular files; operations on them
 /// should be silently discarded rather than forwarded to the NAS API.
 fn is_apple_double(nas_path: &str) -> bool {
-    nas_path.rsplit('/').next().map(|n| n.starts_with("._")).unwrap_or(false)
+    nas_path
+        .rsplit('/')
+        .next()
+        .map(|n| n.starts_with("._"))
+        .unwrap_or(false)
 }
 
 /// Split `/parent/name` → `("/parent", "name")`.
@@ -105,12 +109,19 @@ impl DavMetaData for SynoDavMeta {
         if self.info.isdir {
             0
         } else {
-            self.info.additional.as_ref().and_then(|a| a.size).unwrap_or(0)
+            self.info
+                .additional
+                .as_ref()
+                .and_then(|a| a.size)
+                .unwrap_or(0)
         }
     }
 
     fn modified(&self) -> FsResult<SystemTime> {
-        let ts = self.info.additional.as_ref()
+        let ts = self
+            .info
+            .additional
+            .as_ref()
             .and_then(|a| a.time.as_ref())
             .map(|t| t.mtime)
             .unwrap_or(0);
@@ -122,7 +133,10 @@ impl DavMetaData for SynoDavMeta {
     }
 
     fn created(&self) -> FsResult<SystemTime> {
-        let ts = self.info.additional.as_ref()
+        let ts = self
+            .info
+            .additional
+            .as_ref()
             .and_then(|a| a.time.as_ref())
             .map(|t| t.crtime)
             .unwrap_or(0);
@@ -205,15 +219,16 @@ impl DavFile for SynoDavFile {
     }
 
     fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
-        let size = self.info.additional.as_ref().and_then(|a| a.size).unwrap_or(0);
+        let size = self
+            .info
+            .additional
+            .as_ref()
+            .and_then(|a| a.size)
+            .unwrap_or(0);
         let new_offset = match pos {
             std::io::SeekFrom::Start(o) => o,
-            std::io::SeekFrom::Current(o) => {
-                (self.offset as i64).saturating_add(o).max(0) as u64
-            }
-            std::io::SeekFrom::End(o) => {
-                (size as i64).saturating_add(o).max(0) as u64
-            }
+            std::io::SeekFrom::Current(o) => (self.offset as i64).saturating_add(o).max(0) as u64,
+            std::io::SeekFrom::End(o) => (size as i64).saturating_add(o).max(0) as u64,
         };
         self.offset = new_offset;
         Box::pin(async move { Ok(new_offset) })
@@ -253,7 +268,10 @@ pub struct SynologyDavFs {
 
 impl SynologyDavFs {
     pub fn new(client: Arc<SynologyClient>, path_prefix: String) -> Self {
-        Self { client, path_prefix }
+        Self {
+            client,
+            path_prefix,
+        }
     }
 
     fn nas_path(&self, path: &DavPath) -> String {
@@ -309,7 +327,11 @@ impl DavFileSystem for SynologyDavFs {
         })
     }
 
-    fn open<'a>(&'a self, path: &'a DavPath, options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
+    fn open<'a>(
+        &'a self,
+        path: &'a DavPath,
+        options: OpenOptions,
+    ) -> FsFuture<'a, Box<dyn DavFile>> {
         Box::pin(async move {
             let nas = self.nas_path(path);
             debug!(
@@ -345,13 +367,16 @@ impl DavFileSystem for SynologyDavFs {
                 // delete-before-overwrite path for brand-new files.
                 let (info, is_new) = match self.client.get_info(&nas).await {
                     Ok(info) => (info, false),
-                    Err(_) => (SynoFileInfo {
-                        name: nas.rsplit('/').next().unwrap_or("").to_string(),
-                        path: nas.clone(),
-                        isdir: false,
-                        additional: None,
-                        code: None,
-                    }, true),
+                    Err(_) => (
+                        SynoFileInfo {
+                            name: nas.rsplit('/').next().unwrap_or("").to_string(),
+                            path: nas.clone(),
+                            isdir: false,
+                            additional: None,
+                            code: None,
+                        },
+                        true,
+                    ),
                 };
 
                 let file: Box<dyn DavFile> = Box::new(SynoDavFile {
@@ -433,7 +458,8 @@ impl DavFileSystem for SynologyDavFs {
                     return Err(FsError::NotImplemented);
                 }
                 let size = info.additional.as_ref().and_then(|a| a.size).unwrap_or(0);
-                let data = self.client
+                let data = self
+                    .client
                     .download(&from_nas, 0, size)
                     .await
                     .map_err(syno_err)?;
@@ -457,7 +483,8 @@ impl DavFileSystem for SynologyDavFs {
                 return Err(FsError::NotImplemented);
             }
             let size = info.additional.as_ref().and_then(|a| a.size).unwrap_or(0);
-            let data = self.client
+            let data = self
+                .client
                 .download(&from_nas, 0, size)
                 .await
                 .map_err(syno_err)?;

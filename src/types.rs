@@ -172,8 +172,8 @@ mod tests {
         let info: SynoFileInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.code, Some(408));
         assert_eq!(info.path, "/share/missing");
-        assert_eq!(info.name, "");   // defaulted
-        assert!(!info.isdir);         // defaulted
+        assert_eq!(info.name, ""); // defaulted
+        assert!(!info.isdir); // defaulted
     }
 
     #[test]

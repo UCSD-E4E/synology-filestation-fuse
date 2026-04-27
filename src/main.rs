@@ -38,7 +38,6 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context;
 use clap::Parser;
 use tracing::info;
 
@@ -242,7 +241,10 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        info!("Mounting shares on {} via WebDAV", args.mountpoint.display());
+        info!(
+            "Mounting shares on {} via WebDAV",
+            args.mountpoint.display()
+        );
         rt.block_on(serve_and_mount(client.clone(), &args.mountpoint))?;
     }
 
@@ -250,7 +252,10 @@ fn main() -> anyhow::Result<()> {
     {
         use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
-        info!("Mounting shares on {} via WinFsp", args.mountpoint.display());
+        info!(
+            "Mounting shares on {} via WinFsp",
+            args.mountpoint.display()
+        );
 
         ensure_winfsp_in_path();
         let _fsp = winfsp::winfsp_init().map_err(|e| {
@@ -284,8 +289,13 @@ fn main() -> anyhow::Result<()> {
         let fs_ctx = winfs::SynologyWinFs::new(client.clone(), rt.handle().clone());
         let mut host = FileSystemHost::new_with_options(fs_params, fs_ctx)
             .map_err(|e| anyhow::anyhow!("Failed to create WinFsp filesystem ({:?})", e))?;
-        host.mount(&args.mountpoint)
-            .map_err(|e| anyhow::anyhow!("Failed to mount on {} ({:?}): ensure the drive letter is not already in use", args.mountpoint.display(), e))?;
+        host.mount(&args.mountpoint).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to mount on {} ({:?}): ensure the drive letter is not already in use",
+                args.mountpoint.display(),
+                e
+            )
+        })?;
         host.start()
             .map_err(|e| anyhow::anyhow!("Failed to start WinFsp dispatcher ({:?})", e))?;
 

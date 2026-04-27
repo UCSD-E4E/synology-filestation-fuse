@@ -1,13 +1,13 @@
+use bytes::Bytes;
+use reqwest::{multipart, Client};
 use std::sync::RwLock;
 use std::time::Duration;
-use bytes::Bytes;
-use reqwest::{Client, multipart};
 use tracing::debug;
 
 use crate::error::SynoFsError;
 use crate::types::{
-    AuthData, CreateFolderData, GetInfoData, ListData, ListShareData, RenameData, UploadData,
-    SynoFileInfo, SynoResponse, ADDITIONAL_FIELDS, SHARE_ADDITIONAL_FIELDS,
+    AuthData, CreateFolderData, GetInfoData, ListData, ListShareData, RenameData, SynoFileInfo,
+    SynoResponse, UploadData, ADDITIONAL_FIELDS, SHARE_ADDITIONAL_FIELDS,
 };
 
 #[derive(Debug)]
@@ -42,7 +42,11 @@ impl SynologyClient {
             .read_timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
-        Self { http, base_url, sid: RwLock::new(None) }
+        Self {
+            http,
+            base_url,
+            sid: RwLock::new(None),
+        }
     }
 
     fn sid(&self) -> String {
@@ -67,11 +71,16 @@ impl SynologyClient {
             }
             let resp = match self.http.get(url).query(params).send().await {
                 Ok(r) => r,
-                Err(e) => { last_err = e.into(); continue; }
+                Err(e) => {
+                    last_err = e.into();
+                    continue;
+                }
             };
             match resp.text().await {
                 Ok(t) => return Ok(t),
-                Err(e) => { last_err = e.into(); }
+                Err(e) => {
+                    last_err = e.into();
+                }
             }
         }
         Err(last_err)
@@ -100,7 +109,8 @@ impl SynologyClient {
         if let Some(otp) = otp_code {
             params.push(("otp_code", otp));
         }
-        let resp = self.http
+        let resp = self
+            .http
             .get(&url)
             .query(&params)
             .send()
@@ -109,7 +119,10 @@ impl SynologyClient {
             .await?;
 
         if resp.success {
-            let sid = resp.data.ok_or_else(|| SynoFsError::Io("no auth data".into()))?.sid;
+            let sid = resp
+                .data
+                .ok_or_else(|| SynoFsError::Io("no auth data".into()))?
+                .sid;
             debug!("Logged in, SID: {}...", &sid[..8.min(sid.len())]);
             *self.sid.write().unwrap() = Some(sid);
             Ok(())
@@ -122,7 +135,8 @@ impl SynologyClient {
     /// Logout and clear the session ID.
     pub async fn logout(&self) -> Result<(), SynoFsError> {
         let url = format!("{}/auth.cgi", self.base_url);
-        let _ = self.http
+        let _ = self
+            .http
             .get(&url)
             .query(&[
                 ("api", "SYNO.API.Auth"),
@@ -141,15 +155,20 @@ impl SynologyClient {
     pub async fn list_shares(&self) -> Result<Vec<SynoFileInfo>, SynoFsError> {
         let url = format!("{}/entry.cgi", self.base_url);
         debug!("list_shares");
-        let text = self.get_text_retried(&url, &[
-            ("api", "SYNO.FileStation.List"),
-            ("version", "2"),
-            ("method", "list_share"),
-            ("additional", SHARE_ADDITIONAL_FIELDS),
-            ("limit", "500"),
-            ("offset", "0"),
-            ("_sid", &self.sid()),
-        ]).await?;
+        let text = self
+            .get_text_retried(
+                &url,
+                &[
+                    ("api", "SYNO.FileStation.List"),
+                    ("version", "2"),
+                    ("method", "list_share"),
+                    ("additional", SHARE_ADDITIONAL_FIELDS),
+                    ("limit", "500"),
+                    ("offset", "0"),
+                    ("_sid", &self.sid()),
+                ],
+            )
+            .await?;
 
         let resp: SynoResponse<ListShareData> = serde_json::from_str(&text)
             .map_err(|e| SynoFsError::Io(format!("list_shares parse error: {e}")))?;
@@ -168,16 +187,21 @@ impl SynologyClient {
     pub async fn list_dir(&self, folder_path: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
         let url = format!("{}/entry.cgi", self.base_url);
         debug!("list_dir: {}", folder_path);
-        let text = self.get_text_retried(&url, &[
-            ("api", "SYNO.FileStation.List"),
-            ("version", "2"),
-            ("method", "list"),
-            ("folder_path", folder_path),
-            ("additional", ADDITIONAL_FIELDS),
-            ("limit", "5000"),
-            ("offset", "0"),
-            ("_sid", &self.sid()),
-        ]).await?;
+        let text = self
+            .get_text_retried(
+                &url,
+                &[
+                    ("api", "SYNO.FileStation.List"),
+                    ("version", "2"),
+                    ("method", "list"),
+                    ("folder_path", folder_path),
+                    ("additional", ADDITIONAL_FIELDS),
+                    ("limit", "5000"),
+                    ("offset", "0"),
+                    ("_sid", &self.sid()),
+                ],
+            )
+            .await?;
 
         let resp: SynoResponse<ListData> = serde_json::from_str(&text)
             .map_err(|e| SynoFsError::Io(format!("list_dir parse error: {e}")))?;
@@ -195,14 +219,19 @@ impl SynologyClient {
         let url = format!("{}/entry.cgi", self.base_url);
         let path_json = serde_json::to_string(&[path]).unwrap();
         debug!("get_info: {}", path);
-        let text = self.get_text_retried(&url, &[
-            ("api", "SYNO.FileStation.List"),
-            ("version", "2"),
-            ("method", "getinfo"),
-            ("path", &path_json),
-            ("additional", ADDITIONAL_FIELDS),
-            ("_sid", &self.sid()),
-        ]).await?;
+        let text = self
+            .get_text_retried(
+                &url,
+                &[
+                    ("api", "SYNO.FileStation.List"),
+                    ("version", "2"),
+                    ("method", "getinfo"),
+                    ("path", &path_json),
+                    ("additional", ADDITIONAL_FIELDS),
+                    ("_sid", &self.sid()),
+                ],
+            )
+            .await?;
 
         debug!("get_info raw response: {}", text);
 
@@ -248,16 +277,14 @@ impl SynologyClient {
                 debug!("download retry {} for {} offset={}", attempt, path, offset);
             }
 
-            let mut req = self.http
-                .get(&url)
-                .query(&[
-                    ("api", "SYNO.FileStation.Download"),
-                    ("version", "2"),
-                    ("method", "download"),
-                    ("path", &path_json),
-                    ("mode", "download"),
-                    ("_sid", &self.sid()),
-                ]);
+            let mut req = self.http.get(&url).query(&[
+                ("api", "SYNO.FileStation.Download"),
+                ("version", "2"),
+                ("method", "download"),
+                ("path", &path_json),
+                ("mode", "download"),
+                ("_sid", &self.sid()),
+            ]);
 
             if let Some(ref range) = range_header {
                 req = req.header("Range", range.as_str());
@@ -265,7 +292,10 @@ impl SynologyClient {
 
             let resp = match req.send().await {
                 Ok(r) => r,
-                Err(e) => { last_err = e.into(); continue; }
+                Err(e) => {
+                    last_err = e.into();
+                    continue;
+                }
             };
 
             let status = resp.status();
@@ -280,7 +310,9 @@ impl SynologyClient {
 
             match resp.bytes().await {
                 Ok(b) => return Ok(b),
-                Err(e) => { last_err = e.into(); }
+                Err(e) => {
+                    last_err = e.into();
+                }
             }
         }
         Err(last_err)
@@ -295,7 +327,12 @@ impl SynologyClient {
         overwrite: bool,
     ) -> Result<(), SynoFsError> {
         let url = format!("{}/entry.cgi", self.base_url);
-        debug!("upload: {}/{} ({} bytes)", folder_path, filename, data.len());
+        debug!(
+            "upload: {}/{} ({} bytes)",
+            folder_path,
+            filename,
+            data.len()
+        );
 
         // overwrite=true via the multipart API times out on some DSM versions.
         // Delete the existing file first so we can always upload with overwrite=false.
@@ -333,7 +370,8 @@ impl SynologyClient {
                 .text("overwrite", "false")
                 .part("file", file_part);
 
-            let resp = match self.http
+            let resp = match self
+                .http
                 .post(&url)
                 .query(&[("_sid", self.sid())])
                 .multipart(form)
@@ -341,12 +379,18 @@ impl SynologyClient {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => { last_err = e.into(); continue; }
+                Err(e) => {
+                    last_err = e.into();
+                    continue;
+                }
             };
 
             let text = match resp.text().await {
                 Ok(t) => t,
-                Err(e) => { last_err = e.into(); continue; }
+                Err(e) => {
+                    last_err = e.into();
+                    continue;
+                }
             };
 
             debug!("upload raw response: {}", text);
@@ -370,15 +414,20 @@ impl SynologyClient {
         let path_json = serde_json::to_string(&[path]).unwrap();
         debug!("delete: {}", path);
 
-        let text = self.get_text_retried(&url, &[
-            ("api", "SYNO.FileStation.Delete"),
-            ("version", "2"),
-            ("method", "delete"),
-            ("path", &path_json),
-            ("recursive", "true"),
-            ("accurate_progress", "false"),
-            ("_sid", &self.sid()),
-        ]).await?;
+        let text = self
+            .get_text_retried(
+                &url,
+                &[
+                    ("api", "SYNO.FileStation.Delete"),
+                    ("version", "2"),
+                    ("method", "delete"),
+                    ("path", &path_json),
+                    ("recursive", "true"),
+                    ("accurate_progress", "false"),
+                    ("_sid", &self.sid()),
+                ],
+            )
+            .await?;
 
         let resp: SynoResponse<serde_json::Value> = serde_json::from_str(&text)
             .map_err(|e| SynoFsError::Io(format!("delete parse error: {e}")))?;
@@ -402,15 +451,20 @@ impl SynologyClient {
         let name_json = serde_json::to_string(&[name]).unwrap();
         debug!("create_folder: {}/{}", parent, name);
 
-        let text = self.get_text_retried(&url, &[
-            ("api", "SYNO.FileStation.CreateFolder"),
-            ("version", "2"),
-            ("method", "create"),
-            ("folder_path", &parent_json),
-            ("name", &name_json),
-            ("additional", ADDITIONAL_FIELDS),
-            ("_sid", &self.sid()),
-        ]).await?;
+        let text = self
+            .get_text_retried(
+                &url,
+                &[
+                    ("api", "SYNO.FileStation.CreateFolder"),
+                    ("version", "2"),
+                    ("method", "create"),
+                    ("folder_path", &parent_json),
+                    ("name", &name_json),
+                    ("additional", ADDITIONAL_FIELDS),
+                    ("_sid", &self.sid()),
+                ],
+            )
+            .await?;
 
         debug!("create_folder raw response: {}", text);
 
@@ -418,8 +472,13 @@ impl SynologyClient {
             .map_err(|e| SynoFsError::Io(format!("create_folder parse error: {e}")))?;
 
         if resp.success {
-            let mut folders = resp.data.ok_or(SynoFsError::Io("no folder data".into()))?.folders;
-            folders.pop().ok_or(SynoFsError::Io("empty folder list".into()))
+            let mut folders = resp
+                .data
+                .ok_or(SynoFsError::Io("no folder data".into()))?
+                .folders;
+            folders
+                .pop()
+                .ok_or(SynoFsError::Io("empty folder list".into()))
         } else {
             let code = resp.error.map(|e| e.code).unwrap_or(0);
             Err(SynoFsError::ApiError(code))
@@ -427,21 +486,30 @@ impl SynologyClient {
     }
 
     /// Rename a file or directory (same-directory rename only).
-    pub async fn rename(&self, old_path: &str, new_name: &str) -> Result<SynoFileInfo, SynoFsError> {
+    pub async fn rename(
+        &self,
+        old_path: &str,
+        new_name: &str,
+    ) -> Result<SynoFileInfo, SynoFsError> {
         let url = format!("{}/entry.cgi", self.base_url);
         let path_json = serde_json::to_string(&[old_path]).unwrap();
         let name_json = serde_json::to_string(&[new_name]).unwrap();
         debug!("rename: {} -> {}", old_path, new_name);
 
-        let text = self.get_text_retried(&url, &[
-            ("api", "SYNO.FileStation.Rename"),
-            ("version", "2"),
-            ("method", "rename"),
-            ("path", &path_json),
-            ("name", &name_json),
-            ("additional", ADDITIONAL_FIELDS),
-            ("_sid", &self.sid()),
-        ]).await?;
+        let text = self
+            .get_text_retried(
+                &url,
+                &[
+                    ("api", "SYNO.FileStation.Rename"),
+                    ("version", "2"),
+                    ("method", "rename"),
+                    ("path", &path_json),
+                    ("name", &name_json),
+                    ("additional", ADDITIONAL_FIELDS),
+                    ("_sid", &self.sid()),
+                ],
+            )
+            .await?;
 
         debug!("rename raw response: {}", text);
 
@@ -449,7 +517,10 @@ impl SynologyClient {
             .map_err(|e| SynoFsError::Io(format!("rename parse error: {e}")))?;
 
         if resp.success {
-            let mut files = resp.data.ok_or(SynoFsError::Io("no rename data".into()))?.files;
+            let mut files = resp
+                .data
+                .ok_or(SynoFsError::Io("no rename data".into()))?
+                .files;
             files.pop().ok_or(SynoFsError::Io("empty file list".into()))
         } else {
             let code = resp.error.map(|e| e.code).unwrap_or(0);
@@ -523,7 +594,10 @@ mod tests {
             .await;
 
         let client = client_for(&server);
-        client.login("alice", "secret", Some("123456")).await.unwrap();
+        client
+            .login("alice", "secret", Some("123456"))
+            .await
+            .unwrap();
         assert_eq!(client.sid(), "otp_sid_xyz");
     }
 
@@ -893,7 +967,10 @@ mod tests {
             .await;
 
         let client = client_for(&server);
-        let err = client.create_folder("/share", "existing").await.unwrap_err();
+        let err = client
+            .create_folder("/share", "existing")
+            .await
+            .unwrap_err();
         assert!(matches!(err, SynoFsError::ApiError(1101)));
     }
 

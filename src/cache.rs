@@ -1,9 +1,9 @@
+use crate::types::{InodeEntry, SynoFileInfo};
+use bytes::Bytes;
+use moka::sync::Cache;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use bytes::Bytes;
-use moka::sync::Cache;
-use crate::types::{InodeEntry, SynoFileInfo};
 
 #[cfg(test)]
 fn make_file_info(path: &str) -> SynoFileInfo {
@@ -64,7 +64,11 @@ impl InodeCache {
     /// Insert or refresh a cache entry.
     pub fn insert(&self, ino: u64, info: SynoFileInfo) {
         let path = info.path.clone();
-        let entry = Arc::new(InodeEntry { ino, path: path.clone(), info });
+        let entry = Arc::new(InodeEntry {
+            ino,
+            path: path.clone(),
+            info,
+        });
         self.by_ino.insert(ino, entry);
         let key = path.to_lowercase();
         self.path_to_ino.write().unwrap().insert(key, ino);
@@ -74,7 +78,11 @@ impl InodeCache {
     /// Seed inode 1 for the root directory.
     pub fn seed_root(&self, info: SynoFileInfo) {
         let path = info.path.clone();
-        let entry = Arc::new(InodeEntry { ino: 1, path: path.clone(), info });
+        let entry = Arc::new(InodeEntry {
+            ino: 1,
+            path: path.clone(),
+            info,
+        });
         self.by_ino.insert(1, entry);
         let key = path.to_lowercase();
         self.path_to_ino.write().unwrap().insert(key, 1);
@@ -134,7 +142,8 @@ impl InodeCache {
 
     /// Return the file size for `ino` from the metadata cache, if available.
     pub fn get_size_for_ino(&self, ino: u64) -> Option<u64> {
-        self.by_ino.get(&ino)
+        self.by_ino
+            .get(&ino)
             .and_then(|entry| entry.info.additional.as_ref()?.size)
     }
 }
@@ -184,8 +193,11 @@ impl ReadCache {
 
     pub fn insert(&self, ino: u64, block_idx: u64, data: Bytes) {
         self.blocks.insert((ino, block_idx), data);
-        self.ino_blocks.write().unwrap()
-            .entry(ino).or_default()
+        self.ino_blocks
+            .write()
+            .unwrap()
+            .entry(ino)
+            .or_default()
             .insert(block_idx);
         self.in_flight.lock().unwrap().remove(&(ino, block_idx));
     }
@@ -300,7 +312,10 @@ mod tests {
         let info = make_file_info("/share/doc.pdf");
         let ino = cache.get_or_alloc_ino("/share/doc.pdf");
         cache.insert(ino, info);
-        assert_eq!(cache.get_path_for_ino(ino).as_deref(), Some("/share/doc.pdf"));
+        assert_eq!(
+            cache.get_path_for_ino(ino).as_deref(),
+            Some("/share/doc.pdf")
+        );
     }
 
     #[test]
@@ -386,7 +401,7 @@ mod tests {
     #[test]
     fn claim_inflight_grants_exclusive_access() {
         let rc = ReadCache::new(1024, 16);
-        assert!(rc.claim_inflight(1, 0));  // first caller wins
+        assert!(rc.claim_inflight(1, 0)); // first caller wins
         assert!(!rc.claim_inflight(1, 0)); // second caller loses
     }
 
@@ -404,9 +419,7 @@ mod tests {
         assert!(rc.claim_inflight(1, 0));
 
         let rc2 = rc.clone();
-        let handle = std::thread::spawn(move || {
-            rc2.wait_for_block(1, 0)
-        });
+        let handle = std::thread::spawn(move || rc2.wait_for_block(1, 0));
 
         std::thread::sleep(Duration::from_millis(20));
         rc.insert(1, 0, Bytes::from_static(b"payload"));
@@ -421,9 +434,7 @@ mod tests {
         assert!(rc.claim_inflight(1, 0));
 
         let rc2 = rc.clone();
-        let handle = std::thread::spawn(move || {
-            rc2.wait_for_block(1, 0)
-        });
+        let handle = std::thread::spawn(move || rc2.wait_for_block(1, 0));
 
         std::thread::sleep(Duration::from_millis(20));
         rc.cancel_inflight(1, 0);
@@ -438,9 +449,7 @@ mod tests {
         assert!(rc.claim_inflight(1, 5));
 
         let rc2 = rc.clone();
-        let handle = std::thread::spawn(move || {
-            rc2.wait_for_block(1, 5)
-        });
+        let handle = std::thread::spawn(move || rc2.wait_for_block(1, 5));
 
         std::thread::sleep(Duration::from_millis(20));
         rc.insert(1, 5, Bytes::new()); // EOF sentinel

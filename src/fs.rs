@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use libc::{EIO, ENOENT, ENOSYS};
 use tracing::{debug, error, info, warn};
@@ -73,7 +73,11 @@ impl SynologyFS {
     }
 
     fn syno_to_attr(&self, ino: u64, info: &SynoFileInfo) -> FileAttr {
-        let kind = if info.isdir { FileType::Directory } else { FileType::RegularFile };
+        let kind = if info.isdir {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        };
         let size = info.additional.as_ref().and_then(|a| a.size).unwrap_or(0);
         let perm = info
             .additional
@@ -123,7 +127,7 @@ impl SynologyFS {
         FileAttr {
             ino,
             size,
-            blocks: (size + 511) / 512,
+            blocks: size.div_ceil(512),
             atime,
             mtime,
             ctime,
@@ -165,7 +169,13 @@ impl SynologyFS {
         };
         let filename = nas_path[nas_path.rfind('/').unwrap() + 1..].to_string();
 
-        debug!("queue_upload: fh={} parent={:?} filename={:?} size={}", fh, parent, filename, data.len());
+        debug!(
+            "queue_upload: fh={} parent={:?} filename={:?} size={}",
+            fh,
+            parent,
+            filename,
+            data.len()
+        );
 
         let client = self.client.clone();
         let cache = self.cache.clone();
@@ -198,7 +208,8 @@ impl SynologyFS {
                 // Nothing new to upload — just wait for any in-flight task.
                 drop(buffers);
                 return if let Some(h) = handle {
-                    self.block(h).map_err(|_| SynoFsError::Io("upload task panicked".into()))?
+                    self.block(h)
+                        .map_err(|_| SynoFsError::Io("upload task panicked".into()))?
                 } else {
                     Ok(())
                 };
@@ -214,7 +225,8 @@ impl SynologyFS {
 
         // Wait for any in-flight upload of older data before uploading the newer data.
         if let Some(h) = handle {
-            self.block(h).map_err(|_| SynoFsError::Io("upload task panicked".into()))??;
+            self.block(h)
+                .map_err(|_| SynoFsError::Io("upload task panicked".into()))??;
         }
 
         let parent = match nas_path.rfind('/') {
@@ -223,7 +235,13 @@ impl SynologyFS {
         };
         let filename = &nas_path[nas_path.rfind('/').unwrap() + 1..];
 
-        debug!("finish_upload: fh={} parent={:?} filename={:?} size={}", fh, parent, filename, data.len());
+        debug!(
+            "finish_upload: fh={} parent={:?} filename={:?} size={}",
+            fh,
+            parent,
+            filename,
+            data.len()
+        );
         self.block(self.client.upload(parent, filename, data, overwrite))?;
         self.cache.invalidate_path(&nas_path);
         self.read_cache.invalidate_ino(ino);
@@ -289,12 +307,18 @@ impl Filesystem for SynologyFS {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(s) => s,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let parent_path = match self.get_path_for_ino(parent) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         // Looking up a share name directly under the virtual root.
@@ -302,7 +326,10 @@ impl Filesystem for SynologyFS {
             debug!("lookup share: {}", name_str);
             let shares = match self.block(self.client.list_shares()) {
                 Ok(s) => s,
-                Err(e) => { reply.error(e.to_errno()); return; }
+                Err(e) => {
+                    reply.error(e.to_errno());
+                    return;
+                }
             };
             match shares.into_iter().find(|s| s.name == name_str) {
                 Some(info) => {
@@ -320,7 +347,10 @@ impl Filesystem for SynologyFS {
         debug!("lookup: {}", child_path);
 
         // Check cache first
-        if let Some(entry) = self.cache.get_by_ino(self.cache.get_or_alloc_ino(&child_path)) {
+        if let Some(entry) = self
+            .cache
+            .get_by_ino(self.cache.get_or_alloc_ino(&child_path))
+        {
             let attr = self.syno_to_attr(entry.ino, &entry.info);
             reply.entry(&TTL, &attr, 0);
             return;
@@ -333,8 +363,7 @@ impl Filesystem for SynologyFS {
                 self.cache.insert(ino, info);
                 reply.entry(&TTL, &attr, 0);
             }
-            Err(SynoFsError::NotFound)
-            | Err(SynoFsError::ApiError(408 | 414 | 415)) => {
+            Err(SynoFsError::NotFound) | Err(SynoFsError::ApiError(408 | 414 | 415)) => {
                 reply.error(ENOENT);
             }
             Err(e) => {
@@ -363,7 +392,10 @@ impl Filesystem for SynologyFS {
         // Cache miss: look up the path and fetch from API
         let path = match self.get_path_for_ino(ino) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         match self.block(self.client.get_info(&path)) {
@@ -389,7 +421,10 @@ impl Filesystem for SynologyFS {
     ) {
         let path = match self.get_path_for_ino(ino) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         debug!("readdir: ino={} path={} offset={}", ino, path, offset);
 
@@ -397,20 +432,35 @@ impl Filesystem for SynologyFS {
         let (entries, parent_ino) = if path == VIRTUAL_ROOT_PATH {
             let shares = match self.block(self.client.list_shares()) {
                 Ok(s) => s,
-                Err(e) => { error!("readdir shares: {}", e); reply.error(e.to_errno()); return; }
+                Err(e) => {
+                    error!("readdir shares: {}", e);
+                    reply.error(e.to_errno());
+                    return;
+                }
             };
             debug!("readdir root: got {} shares", shares.len());
             (shares, ROOT_INO)
         } else {
             let entries = match self.block(self.client.list_dir(&path)) {
                 Ok(e) => e,
-                Err(e) => { error!("readdir {}: {}", path, e); reply.error(e.to_errno()); return; }
+                Err(e) => {
+                    error!("readdir {}: {}", path, e);
+                    reply.error(e.to_errno());
+                    return;
+                }
             };
-            let parent_ino = path.rfind('/').map(|i| {
-                let parent_path = &path[..i];
-                // parent of a top-level share (e.g. "/homes") is the virtual root
-                if parent_path.is_empty() { ROOT_INO } else { self.cache.get_or_alloc_ino(parent_path) }
-            }).unwrap_or(ROOT_INO);
+            let parent_ino = path
+                .rfind('/')
+                .map(|i| {
+                    let parent_path = &path[..i];
+                    // parent of a top-level share (e.g. "/homes") is the virtual root
+                    if parent_path.is_empty() {
+                        ROOT_INO
+                    } else {
+                        self.cache.get_or_alloc_ino(parent_path)
+                    }
+                })
+                .unwrap_or(ROOT_INO);
             (entries, parent_ino)
         };
 
@@ -421,7 +471,11 @@ impl Filesystem for SynologyFS {
 
         for file_info in entries {
             let child_ino = self.cache.get_or_alloc_ino(&file_info.path);
-            let kind = if file_info.isdir { FileType::Directory } else { FileType::RegularFile };
+            let kind = if file_info.isdir {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
             let name = file_info.name.clone();
             self.cache.insert(child_ino, file_info);
             all_entries.push((child_ino, kind, name));
@@ -453,7 +507,10 @@ impl Filesystem for SynologyFS {
 
         let path = match self.get_path_for_ino(ino) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let offset = offset as u64;
@@ -462,8 +519,10 @@ impl Filesystem for SynologyFS {
         let first_block = offset / block_size;
         let last_block = (offset + size - 1) / block_size;
 
-        debug!("read: ino={} path={} offset={} size={} blocks=[{}..={}]",
-               ino, path, offset, size, first_block, last_block);
+        debug!(
+            "read: ino={} path={} offset={} size={} blocks=[{}..={}]",
+            ino, path, offset, size, first_block, last_block
+        );
 
         let mut result: Vec<u8> = Vec::with_capacity(size as usize);
 
@@ -524,7 +583,9 @@ impl Filesystem for SynologyFS {
 
         // Background prefetch of the next 16 blocks to keep VLC's read-ahead buffer full.
         for prefetch_idx in (last_block + 1)..=(last_block + 16) {
-            if !self.read_cache.contains(ino, prefetch_idx) && self.read_cache.claim_inflight(ino, prefetch_idx) {
+            if !self.read_cache.contains(ino, prefetch_idx)
+                && self.read_cache.claim_inflight(ino, prefetch_idx)
+            {
                 let client = self.client.clone();
                 let rc = self.read_cache.clone();
                 let path_clone = path.clone();
@@ -544,13 +605,20 @@ impl Filesystem for SynologyFS {
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let path = match self.get_path_for_ino(ino) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         debug!("open: ino={} path={} flags={:#o}", ino, path, flags);
 
         let block_size = self.read_cache.block_size;
         let file_size = self.cache.get_size_for_ino(ino).unwrap_or(0);
-        let total_blocks = if file_size > 0 { (file_size + block_size - 1) / block_size } else { 0 };
+        let total_blocks = if file_size > 0 {
+            file_size.div_ceil(block_size)
+        } else {
+            0
+        };
 
         // If block 0 is cached as an empty EOF sentinel but the file is known to be
         // non-empty, evict the stale sentinel so we re-download real data below.
@@ -566,20 +634,23 @@ impl Filesystem for SynologyFS {
         }
 
         // Block 0: download synchronously so VLC's very first read() is a guaranteed cache hit.
-        if total_blocks > 0 && !self.read_cache.contains(ino, 0) {
-            if self.read_cache.claim_inflight(ino, 0) {
-                match self.block(self.client.download(&path, 0, block_size)) {
-                    Ok(data) if !data.is_empty() => self.read_cache.insert(ino, 0, data),
-                    _ => self.read_cache.cancel_inflight(ino, 0),
-                }
+        // If another task already claimed it, skip — it'll be in cache when read() runs.
+        if total_blocks > 0
+            && !self.read_cache.contains(ino, 0)
+            && self.read_cache.claim_inflight(ino, 0)
+        {
+            match self.block(self.client.download(&path, 0, block_size)) {
+                Ok(data) if !data.is_empty() => self.read_cache.insert(ino, 0, data),
+                _ => self.read_cache.cancel_inflight(ino, 0),
             }
-            // If another task already claimed it, skip — it'll be in cache when read() runs.
         }
 
         // Head: blocks 1-15 async — covers container headers and codec init data.
         let head_end = 16u64.min(total_blocks);
         for block_idx in 1..head_end {
-            if !self.read_cache.contains(ino, block_idx) && self.read_cache.claim_inflight(ino, block_idx) {
+            if !self.read_cache.contains(ino, block_idx)
+                && self.read_cache.claim_inflight(ino, block_idx)
+            {
                 let client = self.client.clone();
                 let rc = self.read_cache.clone();
                 let p = path.clone();
@@ -597,7 +668,9 @@ impl Filesystem for SynologyFS {
         if total_blocks > head_end {
             let tail_start = total_blocks.saturating_sub(4).max(head_end);
             for block_idx in tail_start..total_blocks {
-                if !self.read_cache.contains(ino, block_idx) && self.read_cache.claim_inflight(ino, block_idx) {
+                if !self.read_cache.contains(ino, block_idx)
+                    && self.read_cache.claim_inflight(ino, block_idx)
+                {
                     let client = self.client.clone();
                     let rc = self.read_cache.clone();
                     let p = path.clone();
@@ -613,14 +686,17 @@ impl Filesystem for SynologyFS {
         }
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.write_buffers.lock().unwrap().insert(fh, WriteBuffer {
-            nas_path: path,
-            ino,
-            data: Vec::new(),
-            dirty: false,
-            new_file: false,
-            upload_handle: None,
-        });
+        self.write_buffers.lock().unwrap().insert(
+            fh,
+            WriteBuffer {
+                nas_path: path,
+                ino,
+                data: Vec::new(),
+                dirty: false,
+                new_file: false,
+                upload_handle: None,
+            },
+        );
         // FOPEN_KEEP_CACHE: don't invalidate the kernel page cache between opens.
         reply.opened(fh, FOPEN_KEEP_CACHE);
     }
@@ -637,7 +713,13 @@ impl Filesystem for SynologyFS {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        debug!("write: ino={} fh={} offset={} len={}", ino, fh, offset, data.len());
+        debug!(
+            "write: ino={} fh={} offset={} len={}",
+            ino,
+            fh,
+            offset,
+            data.len()
+        );
 
         // If a background upload is in flight for this fh (started by a prior flush),
         // wait for it before modifying the buffer — we must not hold the mutex while blocking.
@@ -646,9 +728,14 @@ impl Filesystem for SynologyFS {
             buffers.get_mut(&fh).and_then(|b| b.upload_handle.take())
         };
         if let Some(h) = handle {
-            match self.block(h).map_err(|_| SynoFsError::Io("upload task panicked".into())).and_then(|r| r) {
-                Err(e) => { error!("write: prior upload failed: {}", e); reply.error(e.to_errno()); return; }
-                Ok(()) => {}
+            if let Err(e) = self
+                .block(h)
+                .map_err(|_| SynoFsError::Io("upload task panicked".into()))
+                .and_then(|r| r)
+            {
+                error!("write: prior upload failed: {}", e);
+                reply.error(e.to_errno());
+                return;
             }
             // The file now exists on the NAS; clear new_file so the next upload uses overwrite=true.
             if let Some(buf) = self.write_buffers.lock().unwrap().get_mut(&fh) {
@@ -659,7 +746,10 @@ impl Filesystem for SynologyFS {
         let mut buffers = self.write_buffers.lock().unwrap();
         let buf = match buffers.get_mut(&fh) {
             Some(b) => b,
-            None => { reply.error(EIO); return; }
+            None => {
+                reply.error(EIO);
+                return;
+            }
         };
 
         // If writing at an offset beyond current buffer, we need the existing file content first.
@@ -704,7 +794,10 @@ impl Filesystem for SynologyFS {
         self.write_buffers.lock().unwrap().remove(&fh);
         match result {
             Ok(()) => reply.ok(),
-            Err(e) => { error!("release fh={}: {}", fh, e); reply.error(e.to_errno()); }
+            Err(e) => {
+                error!("release fh={}: {}", fh, e);
+                reply.error(e.to_errno());
+            }
         }
     }
 
@@ -720,12 +813,18 @@ impl Filesystem for SynologyFS {
     ) {
         let name_str = match name.to_str() {
             Some(s) => s,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let parent_path = match self.get_path_for_ino(parent) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let new_path = format!("{}/{}", parent_path.trim_end_matches('/'), name_str);
@@ -747,14 +846,17 @@ impl Filesystem for SynologyFS {
         self.cache.insert(ino, synthetic_info);
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.write_buffers.lock().unwrap().insert(fh, WriteBuffer {
-            nas_path: new_path,
-            ino,
-            data: Vec::new(),
-            dirty: false,
-            new_file: true,
-            upload_handle: None,
-        });
+        self.write_buffers.lock().unwrap().insert(
+            fh,
+            WriteBuffer {
+                nas_path: new_path,
+                ino,
+                data: Vec::new(),
+                dirty: false,
+                new_file: true,
+                upload_handle: None,
+            },
+        );
 
         reply.created(&TTL, &attr, 0, fh, 0);
     }
@@ -762,11 +864,17 @@ impl Filesystem for SynologyFS {
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = match name.to_str() {
             Some(s) => s,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let parent_path = match self.get_path_for_ino(parent) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let path = format!("{}/{}", parent_path.trim_end_matches('/'), name_str);
         debug!("unlink: {}", path);
@@ -779,18 +887,27 @@ impl Filesystem for SynologyFS {
                 self.cache.invalidate_path(&path);
                 reply.ok();
             }
-            Err(e) => { error!("unlink {}: {}", path, e); reply.error(e.to_errno()); }
+            Err(e) => {
+                error!("unlink {}: {}", path, e);
+                reply.error(e.to_errno());
+            }
         }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = match name.to_str() {
             Some(s) => s,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let parent_path = match self.get_path_for_ino(parent) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let path = format!("{}/{}", parent_path.trim_end_matches('/'), name_str);
         debug!("rmdir: {}", path);
@@ -800,7 +917,10 @@ impl Filesystem for SynologyFS {
                 self.cache.invalidate_prefix(&path);
                 reply.ok();
             }
-            Err(e) => { error!("rmdir {}: {}", path, e); reply.error(e.to_errno()); }
+            Err(e) => {
+                error!("rmdir {}: {}", path, e);
+                reply.error(e.to_errno());
+            }
         }
     }
 
@@ -815,11 +935,17 @@ impl Filesystem for SynologyFS {
     ) {
         let name_str = match name.to_str() {
             Some(s) => s,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let parent_path = match self.get_path_for_ino(parent) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         debug!("mkdir: {}/{}", parent_path, name_str);
 
@@ -849,19 +975,31 @@ impl Filesystem for SynologyFS {
     ) {
         let name_str = match name.to_str() {
             Some(s) => s,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let new_name_str = match new_name.to_str() {
             Some(s) => s,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let parent_path = match self.get_path_for_ino(parent) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let new_parent_path = match self.get_path_for_ino(new_parent) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let old_path = format!("{}/{}", parent_path.trim_end_matches('/'), name_str);
@@ -898,9 +1036,11 @@ impl Filesystem for SynologyFS {
         }
 
         // Cross-directory: check if it's a directory (not supported atomically)
-        let is_dir = self.cache.get_by_ino(
-            self.cache.get_or_alloc_ino(&old_path)
-        ).map(|e| e.info.isdir).unwrap_or(false);
+        let is_dir = self
+            .cache
+            .get_by_ino(self.cache.get_or_alloc_ino(&old_path))
+            .map(|e| e.info.isdir)
+            .unwrap_or(false);
 
         if is_dir {
             // Cross-directory move of directories is not supported
@@ -911,24 +1051,38 @@ impl Filesystem for SynologyFS {
 
         // Cross-directory file move: download, upload, delete
         // Get the file size first
-        let file_size = self.cache.get_by_ino(
-            self.cache.get_or_alloc_ino(&old_path)
-        ).and_then(|e| e.info.additional.as_ref()?.size).unwrap_or(0);
+        let file_size = self
+            .cache
+            .get_by_ino(self.cache.get_or_alloc_ino(&old_path))
+            .and_then(|e| e.info.additional.as_ref()?.size)
+            .unwrap_or(0);
 
         let data = match self.block(self.client.download(&old_path, 0, file_size)) {
             Ok(b) => b,
-            Err(e) => { reply.error(e.to_errno()); return; }
+            Err(e) => {
+                reply.error(e.to_errno());
+                return;
+            }
         };
 
-        match self.block(self.client.upload(&new_parent_path, new_name_str, data.to_vec(), true)) {
+        match self.block(
+            self.client
+                .upload(&new_parent_path, new_name_str, data.to_vec(), true),
+        ) {
             Ok(()) => {}
-            Err(e) => { reply.error(e.to_errno()); return; }
+            Err(e) => {
+                reply.error(e.to_errno());
+                return;
+            }
         }
 
         match self.block(self.client.delete(&old_path)) {
             Ok(()) => {}
             Err(e) => {
-                warn!("rename: uploaded {} but failed to delete {}: {}", new_path, old_path, e);
+                warn!(
+                    "rename: uploaded {} but failed to delete {}: {}",
+                    new_path, old_path, e
+                );
             }
         }
 
@@ -958,9 +1112,15 @@ impl Filesystem for SynologyFS {
         if let Some(new_size) = size {
             let path = match self.get_path_for_ino(ino) {
                 Some(p) => p,
-                None => { reply.error(ENOENT); return; }
+                None => {
+                    reply.error(ENOENT);
+                    return;
+                }
             };
-            debug!("setattr truncate: ino={} path={} new_size={}", ino, path, new_size);
+            debug!(
+                "setattr truncate: ino={} path={} new_size={}",
+                ino, path, new_size
+            );
 
             let new_size = new_size as usize;
 
