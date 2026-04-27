@@ -33,6 +33,13 @@ impl SynologyClient {
             // detected in seconds rather than waiting for the full OS TCP timeout
             // (~75 s on macOS, ETIMEDOUT / os error 60).
             .tcp_keepalive(Duration::from_secs(10))
+            // Bound how long we'll wait for data on a request. Without this, a
+            // silently-dead connection (e.g. routes changed when a VPN comes up
+            // mid-session) hangs the FUSE callback indefinitely — the user sees
+            // their file manager freeze with no error. read_timeout fires when
+            // no bytes have arrived for the duration, so it doesn't cap
+            // legitimately long large-file uploads.
+            .read_timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
         Self { http, base_url, sid: RwLock::new(None) }
@@ -40,6 +47,34 @@ impl SynologyClient {
 
     fn sid(&self) -> String {
         self.sid.read().unwrap().clone().unwrap_or_default()
+    }
+
+    /// Issue a GET request and return the response body as a string, retrying up
+    /// to 3 times on transient connection errors (connection reset, read
+    /// timeout, etc.). Used by every read-only API call so a momentary network
+    /// blip — e.g. a VPN coming up and silently killing existing TCP
+    /// connections — recovers transparently instead of bubbling up as EIO.
+    async fn get_text_retried(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+    ) -> Result<String, SynoFsError> {
+        let mut last_err = SynoFsError::Io("no attempts".into());
+        for attempt in 0..3u8 {
+            if attempt > 0 {
+                debug!("retry {} for GET {}", attempt, url);
+                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+            }
+            let resp = match self.http.get(url).query(params).send().await {
+                Ok(r) => r,
+                Err(e) => { last_err = e.into(); continue; }
+            };
+            match resp.text().await {
+                Ok(t) => return Ok(t),
+                Err(e) => { last_err = e.into(); }
+            }
+        }
+        Err(last_err)
     }
 
     /// Login and store the session ID.
@@ -106,21 +141,18 @@ impl SynologyClient {
     pub async fn list_shares(&self) -> Result<Vec<SynoFileInfo>, SynoFsError> {
         let url = format!("{}/entry.cgi", self.base_url);
         debug!("list_shares");
-        let resp = self.http
-            .get(&url)
-            .query(&[
-                ("api", "SYNO.FileStation.List"),
-                ("version", "2"),
-                ("method", "list_share"),
-                ("additional", SHARE_ADDITIONAL_FIELDS),
-                ("limit", "500"),
-                ("offset", "0"),
-                ("_sid", &self.sid()),
-            ])
-            .send()
-            .await?
-            .json::<SynoResponse<ListShareData>>()
-            .await?;
+        let text = self.get_text_retried(&url, &[
+            ("api", "SYNO.FileStation.List"),
+            ("version", "2"),
+            ("method", "list_share"),
+            ("additional", SHARE_ADDITIONAL_FIELDS),
+            ("limit", "500"),
+            ("offset", "0"),
+            ("_sid", &self.sid()),
+        ]).await?;
+
+        let resp: SynoResponse<ListShareData> = serde_json::from_str(&text)
+            .map_err(|e| SynoFsError::Io(format!("list_shares parse error: {e}")))?;
 
         if resp.success {
             let shares = resp.data.map(|d| d.shares).unwrap_or_default();
@@ -136,22 +168,19 @@ impl SynologyClient {
     pub async fn list_dir(&self, folder_path: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
         let url = format!("{}/entry.cgi", self.base_url);
         debug!("list_dir: {}", folder_path);
-        let resp = self.http
-            .get(&url)
-            .query(&[
-                ("api", "SYNO.FileStation.List"),
-                ("version", "2"),
-                ("method", "list"),
-                ("folder_path", folder_path),
-                ("additional", ADDITIONAL_FIELDS),
-                ("limit", "5000"),
-                ("offset", "0"),
-                ("_sid", &self.sid()),
-            ])
-            .send()
-            .await?
-            .json::<SynoResponse<ListData>>()
-            .await?;
+        let text = self.get_text_retried(&url, &[
+            ("api", "SYNO.FileStation.List"),
+            ("version", "2"),
+            ("method", "list"),
+            ("folder_path", folder_path),
+            ("additional", ADDITIONAL_FIELDS),
+            ("limit", "5000"),
+            ("offset", "0"),
+            ("_sid", &self.sid()),
+        ]).await?;
+
+        let resp: SynoResponse<ListData> = serde_json::from_str(&text)
+            .map_err(|e| SynoFsError::Io(format!("list_dir parse error: {e}")))?;
 
         if resp.success {
             Ok(resp.data.map(|d| d.files).unwrap_or_default())
@@ -166,20 +195,14 @@ impl SynologyClient {
         let url = format!("{}/entry.cgi", self.base_url);
         let path_json = serde_json::to_string(&[path]).unwrap();
         debug!("get_info: {}", path);
-        let text = self.http
-            .get(&url)
-            .query(&[
-                ("api", "SYNO.FileStation.List"),
-                ("version", "2"),
-                ("method", "getinfo"),
-                ("path", &path_json),
-                ("additional", ADDITIONAL_FIELDS),
-                ("_sid", &self.sid()),
-            ])
-            .send()
-            .await?
-            .text()
-            .await?;
+        let text = self.get_text_retried(&url, &[
+            ("api", "SYNO.FileStation.List"),
+            ("version", "2"),
+            ("method", "getinfo"),
+            ("path", &path_json),
+            ("additional", ADDITIONAL_FIELDS),
+            ("_sid", &self.sid()),
+        ]).await?;
 
         debug!("get_info raw response: {}", text);
 
@@ -347,21 +370,18 @@ impl SynologyClient {
         let path_json = serde_json::to_string(&[path]).unwrap();
         debug!("delete: {}", path);
 
-        let resp = self.http
-            .get(&url)
-            .query(&[
-                ("api", "SYNO.FileStation.Delete"),
-                ("version", "2"),
-                ("method", "delete"),
-                ("path", &path_json),
-                ("recursive", "true"),
-                ("accurate_progress", "false"),
-                ("_sid", &self.sid()),
-            ])
-            .send()
-            .await?
-            .json::<SynoResponse<serde_json::Value>>()
-            .await?;
+        let text = self.get_text_retried(&url, &[
+            ("api", "SYNO.FileStation.Delete"),
+            ("version", "2"),
+            ("method", "delete"),
+            ("path", &path_json),
+            ("recursive", "true"),
+            ("accurate_progress", "false"),
+            ("_sid", &self.sid()),
+        ]).await?;
+
+        let resp: SynoResponse<serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|e| SynoFsError::Io(format!("delete parse error: {e}")))?;
 
         if resp.success {
             Ok(())
@@ -382,21 +402,15 @@ impl SynologyClient {
         let name_json = serde_json::to_string(&[name]).unwrap();
         debug!("create_folder: {}/{}", parent, name);
 
-        let text = self.http
-            .get(&url)
-            .query(&[
-                ("api", "SYNO.FileStation.CreateFolder"),
-                ("version", "2"),
-                ("method", "create"),
-                ("folder_path", &parent_json),
-                ("name", &name_json),
-                ("additional", ADDITIONAL_FIELDS),
-                ("_sid", &self.sid()),
-            ])
-            .send()
-            .await?
-            .text()
-            .await?;
+        let text = self.get_text_retried(&url, &[
+            ("api", "SYNO.FileStation.CreateFolder"),
+            ("version", "2"),
+            ("method", "create"),
+            ("folder_path", &parent_json),
+            ("name", &name_json),
+            ("additional", ADDITIONAL_FIELDS),
+            ("_sid", &self.sid()),
+        ]).await?;
 
         debug!("create_folder raw response: {}", text);
 
@@ -419,21 +433,15 @@ impl SynologyClient {
         let name_json = serde_json::to_string(&[new_name]).unwrap();
         debug!("rename: {} -> {}", old_path, new_name);
 
-        let text = self.http
-            .get(&url)
-            .query(&[
-                ("api", "SYNO.FileStation.Rename"),
-                ("version", "2"),
-                ("method", "rename"),
-                ("path", &path_json),
-                ("name", &name_json),
-                ("additional", ADDITIONAL_FIELDS),
-                ("_sid", &self.sid()),
-            ])
-            .send()
-            .await?
-            .text()
-            .await?;
+        let text = self.get_text_retried(&url, &[
+            ("api", "SYNO.FileStation.Rename"),
+            ("version", "2"),
+            ("method", "rename"),
+            ("path", &path_json),
+            ("name", &name_json),
+            ("additional", ADDITIONAL_FIELDS),
+            ("_sid", &self.sid()),
+        ]).await?;
 
         debug!("rename raw response: {}", text);
 
@@ -930,5 +938,97 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SynoFsError::ApiError(418)));
+    }
+
+    // ── retry behaviour ──────────────────────────────────────────────────────
+    //
+    // A VPN coming up mid-session silently kills existing TCP connections.
+    // reqwest's pool happily hands out the dead connection, the request fails,
+    // and without a retry the FUSE callback returns EIO to the user. The retry
+    // helper re-issues the request — pool_idle_timeout(4s) gets us a fresh
+    // connection, which routes correctly over the new VPN interface.
+    //
+    // wiremock can't simulate a connection-layer fault (it only models HTTP
+    // responses), so these tests stand up a tiny tokio TcpListener that closes
+    // the socket without responding to trigger a real reqwest::Error.
+
+    /// Spawn a TCP server that drops the first `failures` connections, then
+    /// answers the next one with `body` as a JSON HTTP/1.1 response.
+    async fn flaky_json_server(
+        failures: usize,
+        body: &'static str,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            for _ in 0..failures {
+                if let Ok((stream, _)) = listener.accept().await {
+                    drop(stream); // close immediately, no HTTP response
+                }
+            }
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn list_dir_recovers_after_transient_connection_drops() {
+        // Simulates the VPN-flap scenario: first 2 connections die, 3rd succeeds.
+        let body = r#"{"success":true,"data":{"files":[{"name":"hi.txt","path":"/share/hi.txt","isdir":false,"additional":null}]}}"#;
+        let (port, handle) = flaky_json_server(2, body).await;
+
+        let client = SynologyClient::new("127.0.0.1", port, false);
+        let files = client.list_dir("/share").await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "hi.txt");
+        handle.await.ok();
+    }
+
+    #[tokio::test]
+    async fn list_dir_returns_io_error_when_all_retries_fail() {
+        // 10 failures > 3 attempts — verifies the helper eventually gives up
+        // with an Io error instead of hanging the FUSE callback forever.
+        let (port, handle) = flaky_json_server(10, "").await;
+
+        let client = SynologyClient::new("127.0.0.1", port, false);
+        let err = client.list_dir("/share").await.unwrap_err();
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn list_dir_does_not_retry_on_api_error() {
+        // API-level failures (success: false) must NOT be retried — they're
+        // deterministic, and retrying would multiply the user's wait on a real
+        // permission denial or rate-limit.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 408}
+            })))
+            .expect(1) // verified when MockServer is dropped
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client.list_dir("/share").await.unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(408)));
     }
 }
