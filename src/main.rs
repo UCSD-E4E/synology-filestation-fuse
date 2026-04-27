@@ -38,6 +38,8 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(target_os = "windows")]
+use anyhow::Context;
 use clap::Parser;
 use tracing::info;
 
