@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.17](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.16...synology-filestation-fuse-v0.1.17) (2026-04-28)
+
+
+### Bug Fixes
+
+* UI should have icon when running on ubuntu ([f540739](https://github.com/UCSD-E4E/synology-filestation-fuse/commit/f540739402d12eade4c367fc919ef2deeccb09f6))
+
 ## [0.1.16](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.15...synology-filestation-fuse-v0.1.16) (2026-04-27)
 
 
