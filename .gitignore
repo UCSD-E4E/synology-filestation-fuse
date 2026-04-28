@@ -779,3 +779,5 @@ SynologyFuse.Installer/redist/
 # Bundle EXE (built artifact, contains the MSI)
 *-Setup.exe
 .wix
+
+*.deb

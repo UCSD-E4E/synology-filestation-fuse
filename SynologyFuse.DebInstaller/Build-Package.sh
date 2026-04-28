@@ -193,6 +193,7 @@ Icon=synologyfuse
 Terminal=false
 Categories=Network;FileManager;
 Keywords=synology;nas;fuse;mount;
+StartupWMClass=${GUI_BINARY}
 EOF
 
 # ── Icon ──────────────────────────────────────────────────────────────────────
