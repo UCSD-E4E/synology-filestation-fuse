@@ -1,0 +1,42 @@
+# Explicit Dependabot config so cargo updates target the workspace root
+# (where Cargo.lock lives). Auto-detection finds each member crate's
+# Cargo.toml separately and then can't locate a lockfile when running
+# security updates — see the pyo3 failure in run 25510755470.
+#
+# https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+
+version: 2
+updates:
+  # Rust workspace — one entry covers all three member crates
+  # (synology-filestation-core, synology-filestation-fuse, synology_filestation)
+  # because they share the workspace Cargo.lock at the repo root.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Python bindings — uv-managed, lockfile is python/synology_filestation/uv.lock.
+  - package-ecosystem: uv
+    directory: /python/synology_filestation
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # GitHub Actions versions used in .github/workflows/*.yml.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # .NET / NuGet for the desktop GUI and its xUnit test project.
+  # SynologyFuse.{Mac,Deb,}Installer projects don't have their own
+  # .csproj-driven NuGet deps — they're shell/PowerShell/WiX builders.
+  - package-ecosystem: nuget
+    directory: /SynologyFuse.Gui
+    schedule:
+      interval: weekly
+  - package-ecosystem: nuget
+    directory: /SynologyFuse.Tests
+    schedule:
+      interval: weekly
