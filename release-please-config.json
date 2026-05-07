@@ -24,6 +24,15 @@
       "package-name": "synology-filestation-fuse",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
+      "include-paths": [
+        "rust/synology-filestation-fuse",
+        "SynologyFuse.Gui",
+        "SynologyFuse.Tests",
+        "SynologyFuse.MacInstaller",
+        "SynologyFuse.DebInstaller",
+        "SynologyFuse.Installer",
+        "SynologyFuse.sln"
+      ],
       "extra-files": [
         {
           "type": "generic",
