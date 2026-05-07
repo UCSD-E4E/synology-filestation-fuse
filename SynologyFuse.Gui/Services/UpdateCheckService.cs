@@ -18,8 +18,16 @@ public sealed record UpdateInfo(Version Latest, string TagName, string HtmlUrl);
 /// </summary>
 public static class UpdateCheckService
 {
-    private const string LatestReleaseUrl =
-        "https://api.github.com/repos/UCSD-E4E/synology-filestation-fuse/releases/latest";
+    // We list releases instead of hitting /releases/latest because the repo
+    // contains three release-please packages (the FUSE crate, the Rust core
+    // library, and the Python bindings). /releases/latest returns whichever
+    // of the three was most recently published — so a Python wheel bump
+    // would trigger a "GUI update available" prompt even when the FUSE
+    // installer hasn't moved. We list and filter to FUSE-prefixed tags.
+    private const string ReleasesUrl =
+        "https://api.github.com/repos/UCSD-E4E/synology-filestation/releases?per_page=20";
+
+    private const string FuseTagPrefix = "synology-filestation-fuse-v";
 
     private static readonly HttpClient Http = CreateClient();
 
@@ -45,8 +53,8 @@ public static class UpdateCheckService
     {
         try
         {
-            var json = await Http.GetFromJsonSafeAsync<GithubRelease>(LatestReleaseUrl, ct);
-            return EvaluateRelease(json, CurrentVersion());
+            var releases = await Http.GetFromJsonSafeAsync<GithubRelease[]>(ReleasesUrl, ct);
+            return EvaluateReleases(releases, CurrentVersion());
         }
         catch
         {
@@ -56,9 +64,43 @@ public static class UpdateCheckService
 
     /// <summary>
     /// Pure version-comparison logic, factored out of <see cref="CheckAsync"/>
-    /// so it can be unit-tested without HTTP. Returns null if the response is
-    /// missing fields, the tag is unparseable, or the latest release is not
-    /// newer than <paramref name="current"/>.
+    /// so it can be unit-tested without HTTP. Walks a list of GitHub
+    /// releases (newest first), finds the newest one whose tag starts with
+    /// <c>synology-filestation-fuse-v</c>, and reports whether it is newer
+    /// than <paramref name="current"/>.
+    /// </summary>
+    internal static UpdateInfo? EvaluateReleases(string json, Version current)
+    {
+        try
+        {
+            var releases = JsonSerializer.Deserialize<GithubRelease[]>(json);
+            return EvaluateReleases(releases, current);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static UpdateInfo? EvaluateReleases(GithubRelease[]? releases, Version current)
+    {
+        if (releases is null) return null;
+        // GitHub returns releases sorted by created_at descending, so the
+        // first FUSE-prefixed tag we encounter is the newest one.
+        foreach (var release in releases)
+        {
+            if (release?.TagName is null) continue;
+            if (!release.TagName.StartsWith(FuseTagPrefix, StringComparison.Ordinal)) continue;
+            return EvaluateRelease(release, current);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Compare a single release against <paramref name="current"/>. Kept
+    /// internal for direct unit testing of the parse+compare path; the
+    /// production code path is <see cref="EvaluateReleases(string, Version)"/>
+    /// (plural), which filters first and then delegates here.
     /// </summary>
     internal static UpdateInfo? EvaluateRelease(string json, Version current)
     {
