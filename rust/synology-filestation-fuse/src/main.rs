@@ -48,7 +48,7 @@ use cache::{InodeCache, ReadCache, READ_BLOCK_SIZE};
 #[cfg(target_os = "linux")]
 use fs::SynologyFS;
 #[cfg(target_os = "linux")]
-use fuser::MountOption;
+use fuser::{Config, MountOption, SessionACL};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -216,27 +216,33 @@ fn main() -> anyhow::Result<()> {
 
         let fs = SynologyFS::new(client.clone(), cache, read_cache, handle, uid, gid);
 
-        let mut options = vec![
+        let mount_options = vec![
             MountOption::RW,
             MountOption::FSName("synology-fuse".to_string()),
             MountOption::AutoUnmount,
         ];
 
-        // `allow_other` lets other users (and root) access the mount.
-        // As a non-root user this requires `user_allow_other` in /etc/fuse.conf.
-        // Running as root always permits it (short-circuits the file read).
-        if uid == 0 || fuse_conf_allows_other() {
-            options.push(MountOption::AllowOther);
+        // `allow_other` (kernel-level access for other users) moved off MountOption
+        // in fuser 0.17 — it's now expressed via Config::acl: SessionACL::All.
+        // As a non-root user this requires `user_allow_other` in /etc/fuse.conf;
+        // running as root always permits it.
+        let acl = if uid == 0 || fuse_conf_allows_other() {
+            SessionACL::All
         } else {
             tracing::warn!(
                 "allow_other is not enabled: only the mounting user can access the \
                  filesystem. To allow other users, add or uncomment \
                  `user_allow_other` in /etc/fuse.conf."
             );
-        }
+            SessionACL::Owner
+        };
+
+        let mut config = Config::default();
+        config.mount_options = mount_options;
+        config.acl = acl;
 
         info!("Mounting shares on {}", args.mountpoint.display());
-        fuser::mount2(fs, &args.mountpoint, &options)?;
+        fuser::mount2(fs, &args.mountpoint, &config)?;
     }
 
     #[cfg(target_os = "macos")]
