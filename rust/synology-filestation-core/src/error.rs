@@ -14,6 +14,11 @@ pub enum SynoFsError {
     Io(String),
     /// Raw Synology API error code
     ApiError(u32),
+    /// A login or re-login attempt failed. Carries the underlying error
+    /// (typically `ApiError(400)` for bad credentials, but any DSM auth-flow
+    /// error can be wrapped). Distinguishes "auth failed" from a contextually
+    /// identical `ApiError(N)` originating from a non-auth call.
+    LoginFailed(Box<SynoFsError>),
 }
 
 impl SynoFsError {
@@ -29,6 +34,7 @@ impl SynoFsError {
             Self::NotSupported => ENOSYS,
             Self::Io(_) => EIO,
             Self::ApiError(code) => syno_code_to_errno(*code),
+            Self::LoginFailed(_) => EACCES,
         }
     }
 }
@@ -73,6 +79,7 @@ impl std::fmt::Display for SynoFsError {
             Self::NotSupported => write!(f, "not supported"),
             Self::Io(msg) => write!(f, "I/O error: {}", msg),
             Self::ApiError(code) => write!(f, "Synology API error {}", code),
+            Self::LoginFailed(inner) => write!(f, "login failed: {}", inner),
         }
     }
 }
