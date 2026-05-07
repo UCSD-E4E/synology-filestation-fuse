@@ -35,14 +35,19 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install Dependencies
       run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+    # We restrict Rust CI to the FUSE crate + its `core` library dependency.
+    # The Python crate (`python/synology_filestation`) has its own workflow
+    # (`python.yml` / `maturin.yml`) and pulling it in here would require
+    # Python development headers on macOS/Windows runners just to compile
+    # an extension we don't ship via this pipeline.
     - name: Clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build --verbose
+      run: cargo build -p synology-filestation-fuse -p synology-filestation-core --verbose
     - name: Run Rust tests
-      run: cargo test --verbose
+      run: cargo test -p synology-filestation-fuse -p synology-filestation-core --verbose
     - name: Build release (required for installer)
-      run: cargo build --release --verbose
+      run: cargo build --release -p synology-filestation-fuse --verbose
     - name: Set up .NET 10
       uses: actions/setup-dotnet@v4
       with:
@@ -53,7 +58,7 @@ jobs:
       run: dotnet publish SynologyFuse.Gui -c Release -r linux-x64 -p:SelfContained=true --output SynologyFuse.Gui/bin/Release/net10.0/linux-x64/publish
     - name: Build deb package
       run: |
-        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+        VERSION=$(grep '^version' rust/synology-filestation-fuse/Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
         ./SynologyFuse.DebInstaller/Build-Package.sh --version "$VERSION" --out-dir .
     - name: Upload deb package
       uses: actions/upload-artifact@v4
@@ -67,14 +72,19 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    # We restrict Rust CI to the FUSE crate + its `core` library dependency.
+    # The Python crate (`python/synology_filestation`) has its own workflow
+    # (`python.yml` / `maturin.yml`) and pulling it in here would require
+    # Python development headers on macOS/Windows runners just to compile
+    # an extension we don't ship via this pipeline.
     - name: Clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build --verbose
+      run: cargo build -p synology-filestation-fuse -p synology-filestation-core --verbose
     - name: Run Rust tests
-      run: cargo test --verbose
+      run: cargo test -p synology-filestation-fuse -p synology-filestation-core --verbose
     - name: Build release (required for installer)
-      run: cargo build --release --verbose
+      run: cargo build --release -p synology-filestation-fuse --verbose
     - name: Set up .NET 10
       uses: actions/setup-dotnet@v4
       with:
@@ -85,7 +95,7 @@ jobs:
       run: dotnet publish SynologyFuse.Gui -c Release -r osx-arm64 -p:SelfContained=true --output SynologyFuse.Gui/bin/Release/net10.0/osx-arm64/publish
     - name: Build macOS installer
       run: |
-        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+        VERSION=$(grep '^version' rust/synology-filestation-fuse/Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
         ./SynologyFuse.MacInstaller/Build-Installer.sh --version "$VERSION" --out-dir .
     - name: Upload macOS installer
       uses: actions/upload-artifact@v4
@@ -103,14 +113,19 @@ jobs:
       uses: ilammy/msvc-dev-cmd@v1
     - name: Install WinFsp
       run: choco install winfsp
+    # We restrict Rust CI to the FUSE crate + its `core` library dependency.
+    # The Python crate (`python/synology_filestation`) has its own workflow
+    # (`python.yml` / `maturin.yml`) and pulling it in here would require
+    # Python development headers on macOS/Windows runners just to compile
+    # an extension we don't ship via this pipeline.
     - name: Clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build --verbose
+      run: cargo build -p synology-filestation-fuse -p synology-filestation-core --verbose
     - name: Run Rust tests
-      run: cargo test --verbose
+      run: cargo test -p synology-filestation-fuse -p synology-filestation-core --verbose
     - name: Build release (required for installer)
-      run: cargo build --release --verbose
+      run: cargo build --release -p synology-filestation-fuse --verbose
     - name: Set up .NET 10
       uses: actions/setup-dotnet@v4
       with:
@@ -123,5 +138,5 @@ jobs:
       run: dotnet tool install --global wix --version 6.0.2
     - name: Build installer
       run: |
-        $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=' | Select-Object -First 1).Line -replace '.*=\s*"(.*)"','$1'
+        $version = (Select-String -Path rust/synology-filestation-fuse/Cargo.toml -Pattern '^version\s*=' | Select-Object -First 1).Line -replace '.*=\s*"(.*)"','$1'
         .\SynologyFuse.Installer\Build-Installer.ps1 -Version $version

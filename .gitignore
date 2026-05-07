@@ -781,3 +781,15 @@ SynologyFuse.Installer/redist/
 .wix
 
 *.deb
+
+# Python crate artifacts (python/synology_filestation/)
+.venv/
+dist/
+target/wheels/
+*.whl
+.pytest_cache/
+.python-version
+# maturin develop drops the compiled extension next to the package source
+python/synology_filestation/synology_filestation/_native*.so
+python/synology_filestation/synology_filestation/_native*.pyd
+python/synology_filestation/synology_filestation/_native*.dylib

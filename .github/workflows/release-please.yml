@@ -4,6 +4,13 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      python_tag:
+        description: "Existing tag to upload the Python wheel to (e.g. synology_filestation-v0.1.16). Leave blank for the normal release-please flow."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -11,11 +18,20 @@ permissions:
 
 jobs:
   release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
+      # Each linked-versions component gets its own outputs, namespaced with
+      # the package path. The FUSE crate drives the .deb / .pkg / .msi
+      # builds (those artifacts have always shipped from this repo); the
+      # Python crate drives the wheel upload. They're version-locked via the
+      # linked-versions plugin so the FUSE 0.1.17 PR and the Python 0.1.17
+      # PR always merge together.
+      fuse_release_created: ${{ steps.release.outputs['rust/synology-filestation-fuse--release_created'] }}
+      fuse_tag_name:        ${{ steps.release.outputs['rust/synology-filestation-fuse--tag_name'] }}
+      fuse_version:         ${{ steps.release.outputs['rust/synology-filestation-fuse--version'] }}
+      python_release_created: ${{ steps.release.outputs['python/synology_filestation--release_created'] }}
+      python_tag_name:        ${{ steps.release.outputs['python/synology_filestation--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
@@ -26,14 +42,14 @@ jobs:
 
   release-linux:
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    if: needs.release-please.outputs.fuse_release_created == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
       - name: Build release CLI
-        run: cargo build --release
+        run: cargo build --release -p synology-filestation-fuse
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v4
         with:
@@ -43,21 +59,21 @@ jobs:
       - name: Build deb package
         run: |
           ./SynologyFuse.DebInstaller/Build-Package.sh \
-            --version "${{ needs.release-please.outputs.version }}" \
+            --version "${{ needs.release-please.outputs.fuse_version }}" \
             --out-dir .
       - name: Upload deb to release
-        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" synologyfuse-*.deb
+        run: gh release upload "${{ needs.release-please.outputs.fuse_tag_name }}" synologyfuse-*.deb
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   release-macos:
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    if: needs.release-please.outputs.fuse_release_created == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build release CLI
-        run: cargo build --release
+        run: cargo build --release -p synology-filestation-fuse
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v4
         with:
@@ -67,16 +83,16 @@ jobs:
       - name: Build macOS installer
         run: |
           ./SynologyFuse.MacInstaller/Build-Installer.sh \
-            --version "${{ needs.release-please.outputs.version }}" \
+            --version "${{ needs.release-please.outputs.fuse_version }}" \
             --out-dir .
       - name: Upload pkg to release
-        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" SynologyFuse-*.pkg
+        run: gh release upload "${{ needs.release-please.outputs.fuse_tag_name }}" SynologyFuse-*.pkg
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   release-windows:
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    if: needs.release-please.outputs.fuse_release_created == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,7 +101,7 @@ jobs:
       - name: Install WinFsp
         run: choco install winfsp
       - name: Build release CLI
-        run: cargo build --release
+        run: cargo build --release -p synology-filestation-fuse
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v4
         with:
@@ -96,15 +112,38 @@ jobs:
         run: |
           dotnet tool install --global wix --version 6.0.2
       - name: Build MSI
-        run: .\SynologyFuse.Installer\Build-Installer.ps1 -Version "${{ needs.release-please.outputs.version }}"
+        run: .\SynologyFuse.Installer\Build-Installer.ps1 -Version "${{ needs.release-please.outputs.fuse_version }}"
       - name: Build bundle
         run: |
           .\SynologyFuse.Installer\Build-Bundle.ps1 `
-            -Version "${{ needs.release-please.outputs.version }}" `
+            -Version "${{ needs.release-please.outputs.fuse_version }}" `
             -OutDir SynologyFuse.Installer
       - name: Upload installers to release
         run: |
-          gh release upload "${{ needs.release-please.outputs.tag_name }}" `
+          gh release upload "${{ needs.release-please.outputs.fuse_tag_name }}" `
             (Get-Item SynologyFuse.Installer\SynologyFuse-*-Setup.exe).FullName
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-python-linux:
+    needs: release-please
+    if: |
+      always() && (
+        needs.release-please.outputs.python_release_created == 'true' ||
+        (github.event_name == 'workflow_dispatch' && inputs.python_tag != '')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --strip --manifest-path python/synology_filestation/Cargo.toml --out target/wheels --find-interpreter
+          target: x86_64-unknown-linux-gnu
+          manylinux: "2_34"
+      - name: Upload wheel to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.python_tag != '' && inputs.python_tag || needs.release-please.outputs.python_tag_name }}
+        run: gh release upload "$TAG" target/wheels/*.whl

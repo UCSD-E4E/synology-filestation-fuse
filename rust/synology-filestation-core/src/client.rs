@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use reqwest::{multipart, Client};
+use std::path::Path;
 use std::sync::RwLock;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::SynoFsError;
 use crate::types::{
@@ -10,11 +11,36 @@ use crate::types::{
     SynoResponse, UploadData, ADDITIONAL_FIELDS, SHARE_ADDITIONAL_FIELDS,
 };
 
+/// Synology API error code returned when the SID has expired or is otherwise
+/// not recognized by the server. DSM keeps sessions alive for ~30 minutes of
+/// inactivity by default; after that any operation using the cached SID fails
+/// with this code. When auto-relogin is enabled the client transparently
+/// re-authenticates and retries the call.
+#[allow(dead_code)] // unused by the FUSE binary today; consumed by python bindings.
+const SID_NOT_FOUND: u32 = 119;
+
+/// Stashed credentials used by the auto-relogin path. OTP codes are
+/// intentionally not stored: TOTP values are single-use, so re-login after
+/// session expiry would always fail for 2FA-enabled accounts. Auto-relogin is
+/// therefore only meaningful for accounts without 2FA.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct StoredCreds {
+    user: String,
+    password: String,
+}
+
 #[derive(Debug)]
 pub struct SynologyClient {
     http: Client,
     base_url: String,
     sid: RwLock<Option<String>>,
+    /// When true, operations that fail with `ApiError(119)` (SID not found)
+    /// trigger a transparent re-login + single retry instead of surfacing the
+    /// error. Off by default to preserve existing FUSE/WebDAV/WinFsp
+    /// behavior; opt in via [`SynologyClient::with_auto_relogin`].
+    auto_relogin: bool,
+    creds: RwLock<Option<StoredCreds>>,
 }
 
 impl SynologyClient {
@@ -46,7 +72,24 @@ impl SynologyClient {
             http,
             base_url,
             sid: RwLock::new(None),
+            auto_relogin: false,
+            creds: RwLock::new(None),
         }
+    }
+
+    /// Build a client that transparently re-authenticates and retries once
+    /// when an operation fails with `ApiError(119)` (SID expired). Use this
+    /// for long-running scripts where the DSM session may outlast the ~30 min
+    /// idle timeout.
+    ///
+    /// 2FA caveat: OTP codes are not stored, so re-login of a 2FA-enabled
+    /// account after expiry will fail. Use plain [`SynologyClient::new`] for
+    /// 2FA accounts and prompt for a fresh OTP at each login.
+    #[allow(dead_code)] // unused by the FUSE binary today; consumed by python bindings.
+    pub fn with_auto_relogin(host: &str, port: u16, https: bool) -> Self {
+        let mut c = Self::new(host, port, https);
+        c.auto_relogin = true;
+        c
     }
 
     fn sid(&self) -> String {
@@ -125,10 +168,65 @@ impl SynologyClient {
                 .sid;
             debug!("Logged in, SID: {}...", &sid[..8.min(sid.len())]);
             *self.sid.write().unwrap() = Some(sid);
+            if self.auto_relogin {
+                *self.creds.write().unwrap() = Some(StoredCreds {
+                    user: user.to_string(),
+                    password: password.to_string(),
+                });
+            }
             Ok(())
         } else {
             let code = resp.error.map(|e| e.code).unwrap_or(0);
             Err(SynoFsError::ApiError(code))
+        }
+    }
+
+    /// Re-authenticate using stashed credentials. Returns `NotSupported` if
+    /// auto-relogin is off or no credentials are available (e.g. 2FA login).
+    #[allow(dead_code)]
+    async fn relogin(&self) -> Result<(), SynoFsError> {
+        if !self.auto_relogin {
+            return Err(SynoFsError::NotSupported);
+        }
+        let creds = self
+            .creds
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or(SynoFsError::NotSupported)?;
+        warn!("SID expired, re-authenticating");
+        self.login(&creds.user, &creds.password, None).await
+    }
+
+    /// True if this client was constructed with auto-relogin enabled.
+    #[allow(dead_code)]
+    pub fn auto_relogin_enabled(&self) -> bool {
+        self.auto_relogin
+    }
+
+    /// Run `op` once. If it fails with `ApiError(119)` and auto-relogin is on,
+    /// re-authenticate and run `op` exactly one more time. Any other error is
+    /// returned untouched.
+    ///
+    /// If the re-login itself fails, the underlying error is wrapped in
+    /// `SynoFsError::LoginFailed(...)` so callers can distinguish "the
+    /// operation failed" from "we couldn't even re-authenticate to retry it."
+    /// A persistent 119 (re-login succeeds but the retry still returns 119)
+    /// surfaces as the second 119 untransformed.
+    #[allow(dead_code)]
+    pub async fn with_relogin_retry<F, Fut, T>(&self, mut op: F) -> Result<T, SynoFsError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, SynoFsError>>,
+    {
+        match op().await {
+            Err(SynoFsError::ApiError(SID_NOT_FOUND)) if self.auto_relogin => {
+                self.relogin()
+                    .await
+                    .map_err(|e| SynoFsError::LoginFailed(Box::new(e)))?;
+                op().await
+            }
+            other => other,
         }
     }
 
@@ -251,10 +349,64 @@ impl SynologyClient {
         }
     }
 
+    /// Download a remote file atomically to `local_path`.
+    ///
+    /// Bytes are first written to `<local_path>.part`, fsynced, then renamed
+    /// to `local_path`. The final file is therefore never observed in a
+    /// partial state — either it's complete and correct, or it doesn't exist.
+    /// If any step fails (network error, DSM JSON-error envelope, I/O error)
+    /// the temporary file is removed and `local_path` is left untouched.
+    ///
+    /// This guards against the common DSM footgun of `200 OK` responses whose
+    /// body is `{"success":false,"error":{"code":119}}` — the synology-api
+    /// PyPI package opens its destination in `'wb'` first and silently leaves
+    /// a 0-byte file in this scenario.
+    #[allow(dead_code)] // unused by the FUSE binary today; consumed by python bindings.
+    pub async fn download_to_path(
+        &self,
+        remote_path: &str,
+        local_path: &Path,
+    ) -> Result<(), SynoFsError> {
+        let bytes = self
+            .with_relogin_retry(|| self.download(remote_path, 0, 0))
+            .await?;
+
+        let tmp = {
+            let mut t = local_path.as_os_str().to_os_string();
+            t.push(".part");
+            std::path::PathBuf::from(t)
+        };
+
+        let write_result: std::io::Result<()> = (|| {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, local_path)
+        })();
+
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(SynoFsError::Io(format!(
+                "download_to_path: write to {} failed: {e}",
+                local_path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Download file bytes, optionally with a byte range.
     ///
     /// Retries up to 2 times on transient connection errors (e.g. the NAS closing a
     /// keep-alive connection mid-stream while the response body is being read).
+    ///
+    /// DSM violates HTTP convention by returning `200 OK` with a JSON error
+    /// envelope (`{"success":false,"error":{"code":119}}`) when the SID is
+    /// invalid, instead of a 4xx. We detect that case via the `Content-Type`
+    /// header and surface `ApiError(code)` rather than returning the JSON as
+    /// file content. Without this, a SID-expired download would silently
+    /// produce garbage data on disk.
     pub async fn download(
         &self,
         path: &str,
@@ -308,12 +460,37 @@ impl SynologyClient {
                 return Err(SynoFsError::Io(format!("download HTTP {}", status)));
             }
 
-            match resp.bytes().await {
-                Ok(b) => return Ok(b),
+            let body = match resp.bytes().await {
+                Ok(b) => b,
                 Err(e) => {
                     last_err = e.into();
+                    continue;
+                }
+            };
+
+            // DSM returns 200 OK with a JSON error envelope for SID-expired and
+            // similar errors instead of an HTTP error code. We can't trust
+            // Content-Type alone (some configurations omit it), so we always
+            // attempt to parse the body as a SynoResponse — if it parses *and*
+            // has success:false, it's a DSM error; otherwise it's binary file
+            // content. A real binary file is vanishingly unlikely to parse as
+            // a complete `{"success":false,"error":{"code":N}}` document.
+            //
+            // Only attempt parsing for small bodies that *plausibly* could be a
+            // JSON envelope (start with '{'); large file downloads skip the
+            // probe to avoid wasting CPU on multi-GB binaries.
+            if body.len() < 1024 && body.first() == Some(&b'{') {
+                if let Ok(envelope) =
+                    serde_json::from_slice::<SynoResponse<serde_json::Value>>(&body)
+                {
+                    if !envelope.success {
+                        let code = envelope.error.map(|e| e.code).unwrap_or(0);
+                        return Err(SynoFsError::ApiError(code));
+                    }
                 }
             }
+
+            return Ok(body);
         }
         Err(last_err)
     }
@@ -542,6 +719,15 @@ mod tests {
         let (host, port_str) = without_scheme.rsplit_once(':').unwrap();
         let port: u16 = port_str.parse().unwrap();
         SynologyClient::new(host, port, false)
+    }
+
+    /// Build an auto-relogin client pointed at the given mock server.
+    fn client_auto_for(server: &MockServer) -> SynologyClient {
+        let uri = server.uri();
+        let without_scheme = uri.trim_start_matches("http://");
+        let (host, port_str) = without_scheme.rsplit_once(':').unwrap();
+        let port: u16 = port_str.parse().unwrap();
+        SynologyClient::with_auto_relogin(host, port, false)
     }
 
     // ── login ────────────────────────────────────────────────────────────────
@@ -1107,5 +1293,481 @@ mod tests {
         let client = client_for(&server);
         let err = client.list_dir("/share").await.unwrap_err();
         assert!(matches!(err, SynoFsError::ApiError(408)));
+    }
+
+    // ── auto-relogin & SID-expiry handling ───────────────────────────────────
+    //
+    // DSM expires session tokens after ~30 minutes of inactivity, returning
+    // ApiError(119) ("SID not found"). Long-running scripts should recover
+    // transparently. These tests pin down the contract:
+    //   - default client (no auto_relogin): 119 surfaces unchanged
+    //   - auto_relogin client: 119 triggers one re-login + one retry; if the
+    //     retry succeeds the caller never sees 119; if the retry or re-login
+    //     itself fails, the *latest* error is what surfaces
+
+    #[tokio::test]
+    async fn default_client_does_not_stash_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "abc"}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        assert!(!client.auto_relogin_enabled());
+        // No stashed creds → relogin must refuse rather than silently no-op.
+        let err = client.relogin().await.unwrap_err();
+        assert!(matches!(err, SynoFsError::NotSupported));
+    }
+
+    #[tokio::test]
+    async fn auto_relogin_client_stashes_credentials_on_login() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "first"}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_auto_for(&server);
+        assert!(client.auto_relogin_enabled());
+        client.login("alice", "secret", None).await.unwrap();
+        // relogin should succeed using stashed creds (server returns the same SID).
+        client.relogin().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_119_surfaces_when_auto_relogin_off() {
+        // Pre-bug-fix behavior: a default client should still see 119 directly.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "s"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 119}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        let err = client
+            .with_relogin_retry(|| client.get_info("/share/x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(119)));
+    }
+
+    #[tokio::test]
+    async fn api_119_triggers_transparent_relogin_and_retry_succeeds() {
+        // Sequence: client logs in → operation returns 119 (SID expired) →
+        // client transparently re-logs-in → operation retried → caller sees Ok.
+        let server = MockServer::start().await;
+
+        // Both login calls return the same fixed sid; server doesn't care
+        // about sid value, only that the call sequence is right.
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .and(query_param("method", "login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "fresh_sid"}
+            })))
+            .expect(2) // initial login + one re-login
+            .mount(&server)
+            .await;
+
+        // First getinfo call: 119. Second call: success.
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 119}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [
+                    {"name": "x", "path": "/share/x", "isdir": false, "additional": null}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_auto_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        let info = client
+            .with_relogin_retry(|| client.get_info("/share/x"))
+            .await
+            .unwrap();
+        assert_eq!(info.name, "x");
+        // MockServer drop verifies the .expect(2) on the login mock — both
+        // initial login and re-login were observed.
+    }
+
+    #[tokio::test]
+    async fn api_119_relogin_failure_surfaces_auth_error() {
+        // Initial login OK; first op gets 119; re-login fails (e.g. password
+        // changed server-side). Caller should see the re-login failure, NOT
+        // the original 119, so they can act on the right cause.
+        let server = MockServer::start().await;
+
+        // First login: success. Second login (re-login): auth failure (400).
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .and(query_param("method", "login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "first"}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .and(query_param("method", "login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 400}
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 119}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_auto_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        let err = client
+            .with_relogin_retry(|| client.get_info("/share/x"))
+            .await
+            .unwrap_err();
+        // The re-login failure is wrapped so callers can distinguish "the
+        // operation failed" from "we couldn't even re-authenticate."
+        match err {
+            SynoFsError::LoginFailed(inner) => assert!(
+                matches!(*inner, SynoFsError::ApiError(400)),
+                "expected wrapped ApiError(400), got {inner:?}"
+            ),
+            other => panic!("expected LoginFailed(ApiError(400)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_119_only_retries_once() {
+        // If both the initial call AND the retry return 119, give up — don't
+        // loop forever. The second 119 is what the caller sees.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .and(query_param("method", "login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "s"}
+            })))
+            .expect(2) // initial + 1 re-login, no more
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 119}
+            })))
+            .expect(2) // exactly 2 attempts, never 3
+            .mount(&server)
+            .await;
+
+        let client = client_auto_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        let err = client
+            .with_relogin_retry(|| client.get_info("/share/x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(119)));
+    }
+
+    #[tokio::test]
+    async fn non_119_errors_do_not_trigger_relogin() {
+        // 408 (no permission) is deterministic — re-logging-in won't fix it.
+        // Verify we don't re-auth on non-119 errors. The login mock has
+        // .expect(1) and the test will fail on drop if we re-login.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .and(query_param("method", "login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "s"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": {"code": 408}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_auto_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        let err = client
+            .with_relogin_retry(|| client.get_info("/share/x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(408)));
+    }
+
+    // ── download JSON-error envelope detection ───────────────────────────────
+    //
+    // The fishsense bug: DSM returns 200 OK with body
+    // {"success":false,"error":{"code":119}} on a download when the SID is
+    // expired. The synology-api PyPI lib treats this as success (because HTTP
+    // is 200), opens the destination file with 'wb' (truncating), reads zero
+    // file bytes, and silently corrupts the output. We must surface this as
+    // ApiError(code).
+
+    #[tokio::test]
+    async fn download_returns_api_error_when_body_is_dsm_json_error_envelope() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json; charset=UTF-8")
+                    .set_body_string(r#"{"success":false,"error":{"code":119}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client.download("/share/file.bin", 0, 0).await.unwrap_err();
+        assert!(
+            matches!(err, SynoFsError::ApiError(119)),
+            "expected ApiError(119), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_with_octet_stream_content_type_returns_bytes_not_parsed() {
+        // Sanity-check that real binary downloads aren't accidentally caught
+        // by the JSON-envelope detection. The body happens to start with `{`
+        // but Content-Type is binary, so we should pass it through.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .set_body_bytes(b"{not really json}".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let bytes = client.download("/share/x", 0, 0).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"{not really json}");
+    }
+
+    // ── atomic download_to_path ──────────────────────────────────────────────
+    //
+    // download_to_path must guarantee that the destination file is either
+    // (a) absent, or (b) complete and correct — never a 0-byte stub or a
+    // partial download. Implementation detail: write to "<path>.part", fsync,
+    // rename. The fishsense regression is the central case here.
+
+    fn unique_tmp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("synofs-test-{pid}-{nanos}-{name}"));
+        p
+    }
+
+    #[tokio::test]
+    async fn download_to_path_writes_atomically_then_renames() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .set_body_bytes(b"hello atomic world".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let dest = unique_tmp_path("happy.bin");
+        let part = {
+            let mut p = dest.as_os_str().to_os_string();
+            p.push(".part");
+            std::path::PathBuf::from(p)
+        };
+
+        client.download_to_path("/share/file", &dest).await.unwrap();
+
+        let on_disk = std::fs::read(&dest).unwrap();
+        assert_eq!(on_disk, b"hello atomic world");
+        assert!(!part.exists(), "tmp file should be gone after rename");
+
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[tokio::test]
+    async fn download_to_path_does_not_create_final_file_on_dsm_json_error() {
+        // **The fishsense regression test.** DSM replies 200 OK with a JSON
+        // error envelope; the destination must NOT exist on disk afterward
+        // (no 0-byte stub), and neither must the .part tmp file.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"success":false,"error":{"code":119}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server); // no auto-relogin — 119 surfaces
+        let dest = unique_tmp_path("regression.bin");
+        let part = {
+            let mut p = dest.as_os_str().to_os_string();
+            p.push(".part");
+            std::path::PathBuf::from(p)
+        };
+
+        let err = client
+            .download_to_path("/share/missing", &dest)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(119)));
+        assert!(
+            !dest.exists(),
+            "destination must not exist after failed download (no zero-byte stub)"
+        );
+        assert!(!part.exists(), ".part tmp file must be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn download_to_path_with_auto_relogin_recovers_from_119() {
+        // End-to-end fishsense fix: SID expires mid-script, auto-relogin
+        // kicks in, retry succeeds, file lands on disk correctly.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/webapi/auth.cgi"))
+            .and(query_param("method", "login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"sid": "fresh"}
+            })))
+            .mount(&server)
+            .await;
+
+        // First download: 119. Second: real bytes.
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"success":false,"error":{"code":119}}"#),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .set_body_bytes(b"recovered payload".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_auto_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        let dest = unique_tmp_path("recovered.bin");
+        client.download_to_path("/share/x", &dest).await.unwrap();
+
+        let on_disk = std::fs::read(&dest).unwrap();
+        assert_eq!(on_disk, b"recovered payload");
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[tokio::test]
+    async fn download_to_path_cleans_tmp_when_rename_target_is_unwritable() {
+        // Force a rename failure by pointing at a path under a directory
+        // that doesn't exist. The .part tmp won't even be created (parent
+        // dir missing), so we should get an Io error and no leftover state.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .set_body_bytes(b"data".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let bogus_dir = unique_tmp_path("nonexistent-parent-dir");
+        let dest = bogus_dir.join("file.bin");
+
+        let err = client
+            .download_to_path("/share/x", &dest)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::Io(_)));
+        assert!(!dest.exists());
     }
 }

@@ -30,7 +30,7 @@
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication
         Theme="hyperlinkLicense"
-        LicenseUrl="https://github.com/UCSD-E4E/synology-filestation-fuse/blob/main/LICENSE" />
+        LicenseUrl="https://github.com/UCSD-E4E/synology-filestation/blob/main/LICENSE" />
     </BootstrapperApplication>
 
     <Chain>

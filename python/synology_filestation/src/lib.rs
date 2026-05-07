@@ -1,0 +1,773 @@
+//! PyO3 bindings for the Synology FileStation HTTP client.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use pyo3::create_exception;
+use pyo3::exceptions::PyException;
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyDict};
+use synology_filestation_core::error::SynoFsError;
+use synology_filestation_core::types::SynoFileInfo;
+use synology_filestation_core::SynologyClient;
+use tokio::runtime::Runtime;
+
+// ─── Exception hierarchy ─────────────────────────────────────────────────────
+//
+// Each typed exception carries `.code` (the DSM numeric code, or None) and
+// `.message` (the human-readable string) as instance attributes — see
+// `synofs_to_pyerr` for how those are populated.
+
+create_exception!(
+    synology_filestation,
+    FileStationError,
+    PyException,
+    "Base class for all Synology FileStation errors raised by this package."
+);
+
+create_exception!(
+    synology_filestation,
+    AuthError,
+    FileStationError,
+    "Authentication failed (wrong credentials, invalid OTP, etc.)."
+);
+
+create_exception!(
+    synology_filestation,
+    SidNotFound,
+    AuthError,
+    "DSM session ID expired or unknown (DSM error 119). When auto-relogin is \
+     enabled this is only raised if re-login itself fails."
+);
+
+create_exception!(
+    synology_filestation,
+    NoSuchFile,
+    FileStationError,
+    "File or folder does not exist (DSM codes 403, 414, 415)."
+);
+
+create_exception!(
+    synology_filestation,
+    PermissionDenied,
+    FileStationError,
+    "Permission denied (DSM codes 408, 1805)."
+);
+
+create_exception!(
+    synology_filestation,
+    AlreadyExists,
+    FileStationError,
+    "Path already exists (DSM codes 418, 1101)."
+);
+
+create_exception!(
+    synology_filestation,
+    NoSpace,
+    FileStationError,
+    "Quota or disk-space exhausted (DSM codes 419, 1804)."
+);
+
+create_exception!(
+    synology_filestation,
+    NotEmpty,
+    FileStationError,
+    "Directory not empty (DSM code 416)."
+);
+
+create_exception!(
+    synology_filestation,
+    InvalidArg,
+    FileStationError,
+    "Invalid parameter (DSM code 400)."
+);
+
+create_exception!(
+    synology_filestation,
+    NotSupported,
+    FileStationError,
+    "Operation is not supported by this DSM version or by this binding."
+);
+
+create_exception!(
+    synology_filestation,
+    TransportError,
+    FileStationError,
+    "Network or parse error talking to DSM (no DSM error code available)."
+);
+
+create_exception!(
+    synology_filestation,
+    DSMError,
+    FileStationError,
+    "Unmapped DSM error. The numeric code is available on `.code`."
+);
+
+/// Map a `SynoFsError` to the right typed Python exception, attaching `.code`
+/// and `.message` so callers can inspect them. Mapping mirrors the errno
+/// mapping in `synology_filestation_core::error` so the same DSM code lands
+/// in the same place across both backends.
+fn synofs_to_pyerr(py: Python<'_>, err: SynoFsError) -> PyErr {
+    let message = err.to_string();
+
+    // Per-variant routing first; the ApiError branch maps DSM codes onto the
+    // same typed exceptions so callers see consistent classes regardless of
+    // whether the error came from a raw HTTP layer or a per-entry envelope.
+    let (cls, code): (Bound<'_, PyAny>, Option<u32>) = match &err {
+        SynoFsError::NotFound => (py.get_type::<NoSuchFile>().into_any(), None),
+        SynoFsError::PermissionDenied => (py.get_type::<PermissionDenied>().into_any(), None),
+        SynoFsError::AlreadyExists => (py.get_type::<AlreadyExists>().into_any(), None),
+        SynoFsError::NotEmpty => (py.get_type::<NotEmpty>().into_any(), None),
+        SynoFsError::InvalidArg => (py.get_type::<InvalidArg>().into_any(), None),
+        SynoFsError::NoSpace => (py.get_type::<NoSpace>().into_any(), None),
+        SynoFsError::NotSupported => (py.get_type::<NotSupported>().into_any(), None),
+        SynoFsError::Io(_) => (py.get_type::<TransportError>().into_any(), None),
+        SynoFsError::LoginFailed(inner) => {
+            // Auth failures always present as AuthError, but we preserve the
+            // underlying DSM code so callers can inspect what specifically
+            // went wrong (account locked, OTP required, etc.).
+            let inner_code = match inner.as_ref() {
+                SynoFsError::ApiError(c) => Some(*c),
+                _ => None,
+            };
+            (py.get_type::<AuthError>().into_any(), inner_code)
+        }
+        SynoFsError::ApiError(c) => {
+            let cls = match *c {
+                119 => py.get_type::<SidNotFound>().into_any(),
+                400 => py.get_type::<InvalidArg>().into_any(),
+                403 | 414 | 415 => py.get_type::<NoSuchFile>().into_any(),
+                408 | 1805 => py.get_type::<PermissionDenied>().into_any(),
+                416 => py.get_type::<NotEmpty>().into_any(),
+                418 | 1101 => py.get_type::<AlreadyExists>().into_any(),
+                419 | 1804 => py.get_type::<NoSpace>().into_any(),
+                _ => py.get_type::<DSMError>().into_any(),
+            };
+            (cls, Some(*c))
+        }
+    };
+
+    // Construct the exception instance with the message as args[0], then set
+    // `.code` and `.message` for caller convenience. If anything in here
+    // fails, fall back to the underlying error from PyO3 so we never panic.
+    let instance = match cls.call1((message.clone(),)) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let _ = instance.setattr("message", message);
+    let _ = match code {
+        Some(c) => instance.setattr("code", c),
+        None => instance.setattr("code", py.None()),
+    };
+    PyErr::from_value(instance)
+}
+
+/// Split a full remote path like ``/share/sub/file.txt`` into
+/// ``(/share/sub, file.txt)``. Empty filename or trailing-slash inputs are
+/// treated as `InvalidArg` — DSM rejects uploads with no filename, and we'd
+/// rather fail fast than have it look like a valid request that 400s
+/// server-side. Trailing slashes are checked *before* the split so a path
+/// like ``/share/`` is rejected (caller meant a directory, not a file)
+/// instead of being misinterpreted as filename "share" under root.
+fn split_remote_path(remote_path: &str) -> PyResult<(String, String)> {
+    if remote_path.ends_with('/') || remote_path.is_empty() {
+        return Err(PyErr::new::<InvalidArg, _>(
+            "remote_path must end in a filename, not '/'",
+        ));
+    }
+    let (parent, name) = remote_path
+        .rsplit_once('/')
+        .ok_or_else(|| PyErr::new::<InvalidArg, _>("remote_path must contain a '/' separator"))?;
+    if name.is_empty() {
+        return Err(PyErr::new::<InvalidArg, _>(
+            "remote_path must end in a filename, not '/'",
+        ));
+    }
+    let parent = if parent.is_empty() { "/" } else { parent };
+    Ok((parent.to_string(), name.to_string()))
+}
+
+// ─── File-info helper ────────────────────────────────────────────────────────
+
+/// Convert a `SynoFileInfo` to a Python dict with a stable, documented shape.
+/// Keys are always present even when the underlying `additional` block is
+/// missing, so downstream code can do `info["size"] is None` instead of a
+/// missing-key check.
+fn fileinfo_to_pydict<'py>(py: Python<'py>, info: &SynoFileInfo) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("name", &info.name)?;
+    dict.set_item("path", &info.path)?;
+    dict.set_item("isdir", info.isdir)?;
+
+    let (size, mtime, atime, ctime, perm) = match &info.additional {
+        Some(a) => (
+            a.size,
+            a.time.as_ref().map(|t| t.mtime),
+            a.time.as_ref().map(|t| t.atime),
+            a.time.as_ref().map(|t| t.ctime),
+            a.perm.as_ref().map(|p| p.posix),
+        ),
+        None => (None, None, None, None, None),
+    };
+    dict.set_item("size", size)?;
+    dict.set_item("mtime", mtime)?;
+    dict.set_item("atime", atime)?;
+    dict.set_item("ctime", ctime)?;
+    dict.set_item("perm", perm)?;
+    Ok(dict)
+}
+
+// ─── Client (sync) ───────────────────────────────────────────────────────────
+
+#[pyclass]
+struct Client {
+    inner: Arc<SynologyClient>,
+    runtime: Arc<Runtime>,
+}
+
+impl Client {
+    /// Run a future on the per-Client Tokio runtime and convert the error.
+    /// All public methods funnel through this so the Tokio runtime is the
+    /// single sync↔async seam.
+    fn run<F, T>(&self, py: Python<'_>, fut: F) -> PyResult<T>
+    where
+        F: std::future::Future<Output = Result<T, SynoFsError>> + Send,
+        T: Send,
+    {
+        // We must release the GIL while blocking on async work — otherwise
+        // every Python thread waiting on a network call would serialize and
+        // deadlock-prone code in user-land would pay through the nose.
+        py.allow_threads(|| self.runtime.block_on(fut))
+            .map_err(|e| synofs_to_pyerr(py, e))
+    }
+}
+
+#[pymethods]
+impl Client {
+    #[staticmethod]
+    #[pyo3(signature = (host, port, username, password, *, https=true, otp=None, auto_relogin=true))]
+    #[allow(clippy::too_many_arguments)] // mirrors the Python kwargs surface
+    fn login(
+        py: Python<'_>,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        https: bool,
+        otp: Option<&str>,
+        auto_relogin: bool,
+    ) -> PyResult<Self> {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyErr::new::<TransportError, _>(format!("failed to start runtime: {e}"))
+                })?,
+        );
+        let client = if auto_relogin {
+            SynologyClient::with_auto_relogin(host, port, https)
+        } else {
+            SynologyClient::new(host, port, https)
+        };
+
+        // Login failures are always AuthError regardless of the underlying
+        // DSM code: a 400 means "wrong password", a 408 means "OTP required",
+        // etc., but for the caller they're all "auth didn't work." Wrap in
+        // LoginFailed so synofs_to_pyerr routes to the AuthError class.
+        py.allow_threads(|| runtime.block_on(client.login(username, password, otp)))
+            .map_err(|e| synofs_to_pyerr(py, SynoFsError::LoginFailed(Box::new(e))))?;
+
+        Ok(Self {
+            inner: Arc::new(client),
+            runtime,
+        })
+    }
+
+    fn logout(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        self.run(py, async move { inner.logout().await })
+    }
+
+    fn exists(&self, py: Python<'_>, path: &str) -> PyResult<bool> {
+        let inner = self.inner.clone();
+        let path = path.to_string();
+        let result = py.allow_threads(|| {
+            self.runtime
+                .block_on(async { inner.with_relogin_retry(|| inner.get_info(&path)).await })
+        });
+        match result {
+            Ok(_) => Ok(true),
+            Err(SynoFsError::NotFound) => Ok(false),
+            // 408 from getinfo on a missing path is the standard "no entry"
+            // shape (per-entry code in files[0]); also treat as not-existing.
+            Err(SynoFsError::ApiError(414 | 415 | 403 | 408)) => Ok(false),
+            Err(e) => Err(synofs_to_pyerr(py, e)),
+        }
+    }
+
+    fn getinfo<'py>(&self, py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
+        let inner = self.inner.clone();
+        let path_owned = path.to_string();
+        let info = py
+            .allow_threads(|| {
+                self.runtime.block_on(async {
+                    inner
+                        .with_relogin_retry(|| inner.get_info(&path_owned))
+                        .await
+                })
+            })
+            // DSM uses code 408 in per-entry context to mean "no permission
+            // OR no such file" — the two are indistinguishable from the API
+            // surface. For getinfo specifically, a missing-or-inaccessible
+            // path should look like NoSuchFile to Python callers, mirroring
+            // os.stat's FileNotFoundError on a path you can't reach.
+            .map_err(|e| match e {
+                SynoFsError::ApiError(408) => synofs_to_pyerr(py, SynoFsError::NotFound),
+                other => synofs_to_pyerr(py, other),
+            })?;
+        fileinfo_to_pydict(py, &info)
+    }
+
+    #[pyo3(signature = (path, *, offset=0, length=0))]
+    fn download<'py>(
+        &self,
+        py: Python<'py>,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let inner = self.inner.clone();
+        let path_owned = path.to_string();
+        let bytes = py
+            .allow_threads(|| {
+                self.runtime.block_on(async {
+                    inner
+                        .with_relogin_retry(|| inner.download(&path_owned, offset, length))
+                        .await
+                })
+            })
+            .map_err(|e| synofs_to_pyerr(py, e))?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn list_dir<'py>(&self, py: Python<'py>, path: &str) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let inner = self.inner.clone();
+        let path_owned = path.to_string();
+        let entries = py
+            .allow_threads(|| {
+                self.runtime.block_on(async {
+                    inner
+                        .with_relogin_retry(|| inner.list_dir(&path_owned))
+                        .await
+                })
+            })
+            .map_err(|e| synofs_to_pyerr(py, e))?;
+        entries.iter().map(|f| fileinfo_to_pydict(py, f)).collect()
+    }
+
+    fn list_shares<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let inner = self.inner.clone();
+        let shares = py
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(async { inner.with_relogin_retry(|| inner.list_shares()).await })
+            })
+            .map_err(|e| synofs_to_pyerr(py, e))?;
+        shares.iter().map(|s| fileinfo_to_pydict(py, s)).collect()
+    }
+
+    /// Upload raw bytes to ``remote_path``. Splits the path into a parent
+    /// directory + filename internally so callers don't have to. Mirrors
+    /// fsspec's ``pipe_file`` shape.
+    #[pyo3(signature = (remote_path, data, *, overwrite=true))]
+    fn upload_bytes(
+        &self,
+        py: Python<'_>,
+        remote_path: &str,
+        data: &[u8],
+        overwrite: bool,
+    ) -> PyResult<()> {
+        let (folder, filename) = split_remote_path(remote_path)?;
+        let buf = data.to_vec();
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                inner
+                    .with_relogin_retry(|| inner.upload(&folder, &filename, buf.clone(), overwrite))
+                    .await
+            })
+        })
+        .map_err(|e| synofs_to_pyerr(py, e))
+    }
+
+    fn download_to(&self, py: Python<'_>, remote_path: &str, local_path: &str) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let remote = remote_path.to_string();
+        let local: PathBuf = local_path.into();
+        py.allow_threads(|| {
+            self.runtime
+                .block_on(async { inner.download_to_path(&remote, &local).await })
+        })
+        .map_err(|e| synofs_to_pyerr(py, e))
+    }
+
+    #[pyo3(signature = (local_path, remote_dir, *, overwrite=true, _create_parents=true))]
+    fn upload(
+        &self,
+        py: Python<'_>,
+        local_path: &str,
+        remote_dir: &str,
+        overwrite: bool,
+        _create_parents: bool,
+    ) -> PyResult<()> {
+        // Read file bytes on the calling thread; this is the only sync I/O
+        // Python expects to be cheap (small files) or already fits in RAM
+        // for large ones — the existing core API takes a Vec<u8>.
+        let data = std::fs::read(local_path)
+            .map_err(|e| PyErr::new::<TransportError, _>(format!("read {local_path}: {e}")))?;
+
+        // Filename is the last path component.
+        let filename = std::path::Path::new(local_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| PyErr::new::<InvalidArg, _>("local_path has no filename"))?
+            .to_string();
+
+        let inner = self.inner.clone();
+        let remote_dir = remote_dir.to_string();
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                inner
+                    .with_relogin_retry(|| {
+                        inner.upload(&remote_dir, &filename, data.clone(), overwrite)
+                    })
+                    .await
+            })
+        })
+        .map_err(|e| synofs_to_pyerr(py, e))
+    }
+
+    #[pyo3(signature = (parent_dir, name, *, _force_parent=true))]
+    fn create_folder(
+        &self,
+        py: Python<'_>,
+        parent_dir: &str,
+        name: &str,
+        _force_parent: bool,
+    ) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let parent = parent_dir.to_string();
+        let name = name.to_string();
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                inner
+                    .with_relogin_retry(|| inner.create_folder(&parent, &name))
+                    .await
+            })
+        })
+        .map_err(|e| synofs_to_pyerr(py, e))?;
+        Ok(())
+    }
+
+    fn delete(&self, py: Python<'_>, remote_path: &str) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let path = remote_path.to_string();
+        py.allow_threads(|| {
+            self.runtime
+                .block_on(async { inner.with_relogin_retry(|| inner.delete(&path)).await })
+        })
+        .map_err(|e| synofs_to_pyerr(py, e))
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[allow(unused_variables)]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: PyObject,
+        exc_value: PyObject,
+        traceback: PyObject,
+    ) -> PyResult<bool> {
+        // Best-effort logout: a failure during logout shouldn't shadow an
+        // exception in the `with` body, so swallow logout errors entirely.
+        let inner = self.inner.clone();
+        let _ = py.allow_threads(|| self.runtime.block_on(async move { inner.logout().await }));
+        Ok(false) // do not suppress exceptions raised inside the `with` block
+    }
+}
+
+// ─── AsyncClient (pyo3-async-runtimes) ───────────────────────────────────────
+//
+// Mirrors `Client` but every method returns an awaitable. Internally the
+// futures run on the pyo3-async-runtimes Tokio runtime; we don't spin our own
+// per-instance runtime here because await points are explicit and there's no
+// sync→async bridge to manage.
+
+use pyo3_async_runtimes::tokio::future_into_py;
+
+/// Convert `SynoFsError` to PyErr while holding the GIL. Used inside async
+/// blocks where we don't have a Python token in scope but need to construct
+/// a typed Python exception before returning.
+fn synofs_to_pyerr_gil(e: SynoFsError) -> PyErr {
+    Python::with_gil(|py| synofs_to_pyerr(py, e))
+}
+
+/// Same as `synofs_to_pyerr_gil` but applies the getinfo-specific 408 →
+/// NoSuchFile remap. Centralized so sync and async getinfo agree.
+fn getinfo_err_gil(e: SynoFsError) -> PyErr {
+    Python::with_gil(|py| match e {
+        SynoFsError::ApiError(408) => synofs_to_pyerr(py, SynoFsError::NotFound),
+        other => synofs_to_pyerr(py, other),
+    })
+}
+
+#[pyclass]
+struct AsyncClient {
+    inner: Arc<SynologyClient>,
+}
+
+#[pymethods]
+impl AsyncClient {
+    #[staticmethod]
+    #[pyo3(signature = (host, port, username, password, *, https=true, otp=None, auto_relogin=true))]
+    #[allow(clippy::too_many_arguments)] // mirrors the Python kwargs surface
+    fn login<'py>(
+        py: Python<'py>,
+        host: String,
+        port: u16,
+        username: String,
+        password: String,
+        https: bool,
+        otp: Option<String>,
+        auto_relogin: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            let client = if auto_relogin {
+                SynologyClient::with_auto_relogin(&host, port, https)
+            } else {
+                SynologyClient::new(&host, port, https)
+            };
+            client
+                .login(&username, &password, otp.as_deref())
+                .await
+                .map_err(|e| synofs_to_pyerr_gil(SynoFsError::LoginFailed(Box::new(e))))?;
+            Ok(AsyncClient {
+                inner: Arc::new(client),
+            })
+        })
+    }
+
+    fn logout<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.logout().await.map_err(synofs_to_pyerr_gil)
+        })
+    }
+
+    fn exists<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let result = inner.with_relogin_retry(|| inner.get_info(&path)).await;
+            match result {
+                Ok(_) => Ok(true),
+                Err(SynoFsError::NotFound) => Ok(false),
+                Err(SynoFsError::ApiError(414 | 415 | 403 | 408)) => Ok(false),
+                Err(e) => Err(synofs_to_pyerr_gil(e)),
+            }
+        })
+    }
+
+    fn getinfo<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let info = inner
+                .with_relogin_retry(|| inner.get_info(&path))
+                .await
+                .map_err(getinfo_err_gil)?;
+            Python::with_gil(|py| -> PyResult<Py<PyDict>> {
+                fileinfo_to_pydict(py, &info).map(|d| d.unbind())
+            })
+        })
+    }
+
+    #[pyo3(signature = (path, *, offset=0, length=0))]
+    fn download<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        offset: u64,
+        length: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let bytes = inner
+                .with_relogin_retry(|| inner.download(&path, offset, length))
+                .await
+                .map_err(synofs_to_pyerr_gil)?;
+            Python::with_gil(|py| -> PyResult<Py<PyBytes>> {
+                Ok(PyBytes::new(py, &bytes).unbind())
+            })
+        })
+    }
+
+    fn list_dir<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let entries = inner
+                .with_relogin_retry(|| inner.list_dir(&path))
+                .await
+                .map_err(synofs_to_pyerr_gil)?;
+            Python::with_gil(|py| -> PyResult<Py<pyo3::types::PyList>> {
+                let dicts: Vec<Bound<'_, PyDict>> = entries
+                    .iter()
+                    .map(|f| fileinfo_to_pydict(py, f))
+                    .collect::<PyResult<_>>()?;
+                Ok(pyo3::types::PyList::new(py, dicts)?.unbind())
+            })
+        })
+    }
+
+    fn list_shares<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let shares = inner
+                .with_relogin_retry(|| inner.list_shares())
+                .await
+                .map_err(synofs_to_pyerr_gil)?;
+            Python::with_gil(|py| -> PyResult<Py<pyo3::types::PyList>> {
+                let dicts: Vec<Bound<'_, PyDict>> = shares
+                    .iter()
+                    .map(|s| fileinfo_to_pydict(py, s))
+                    .collect::<PyResult<_>>()?;
+                Ok(pyo3::types::PyList::new(py, dicts)?.unbind())
+            })
+        })
+    }
+
+    #[pyo3(signature = (remote_path, data, *, overwrite=true))]
+    fn upload_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        remote_path: String,
+        data: Vec<u8>,
+        overwrite: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (folder, filename) = split_remote_path(&remote_path)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .with_relogin_retry(|| inner.upload(&folder, &filename, data.clone(), overwrite))
+                .await
+                .map_err(synofs_to_pyerr_gil)
+        })
+    }
+
+    fn download_to<'py>(
+        &self,
+        py: Python<'py>,
+        remote_path: String,
+        local_path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let local: PathBuf = local_path.into();
+            inner
+                .download_to_path(&remote_path, &local)
+                .await
+                .map_err(synofs_to_pyerr_gil)
+        })
+    }
+
+    #[pyo3(signature = (local_path, remote_dir, *, overwrite=true, _create_parents=true))]
+    fn upload<'py>(
+        &self,
+        py: Python<'py>,
+        local_path: String,
+        remote_dir: String,
+        overwrite: bool,
+        _create_parents: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let data = std::fs::read(&local_path).map_err(|e| {
+                Python::with_gil(|py| {
+                    PyErr::new::<TransportError, _>(format!("read {local_path}: {e}")).clone_ref(py)
+                })
+            })?;
+            let filename = std::path::Path::new(&local_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    Python::with_gil(|_py| {
+                        PyErr::new::<InvalidArg, _>("local_path has no filename")
+                    })
+                })?
+                .to_string();
+            inner
+                .with_relogin_retry(|| {
+                    inner.upload(&remote_dir, &filename, data.clone(), overwrite)
+                })
+                .await
+                .map_err(synofs_to_pyerr_gil)
+        })
+    }
+
+    #[pyo3(signature = (parent_dir, name, *, _force_parent=true))]
+    fn create_folder<'py>(
+        &self,
+        py: Python<'py>,
+        parent_dir: String,
+        name: String,
+        _force_parent: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .with_relogin_retry(|| inner.create_folder(&parent_dir, &name))
+                .await
+                .map_err(synofs_to_pyerr_gil)?;
+            Ok(())
+        })
+    }
+
+    fn delete<'py>(&self, py: Python<'py>, remote_path: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .with_relogin_retry(|| inner.delete(&remote_path))
+                .await
+                .map_err(synofs_to_pyerr_gil)
+        })
+    }
+}
+
+// ─── Module registration ─────────────────────────────────────────────────────
+
+#[pymodule]
+fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let _ = tracing_log::LogTracer::init();
+    let _ = pyo3_log::try_init();
+
+    m.add_class::<Client>()?;
+    m.add_class::<AsyncClient>()?;
+
+    m.add("FileStationError", py.get_type::<FileStationError>())?;
+    m.add("AuthError", py.get_type::<AuthError>())?;
+    m.add("SidNotFound", py.get_type::<SidNotFound>())?;
+    m.add("NoSuchFile", py.get_type::<NoSuchFile>())?;
+    m.add("PermissionDenied", py.get_type::<PermissionDenied>())?;
+    m.add("AlreadyExists", py.get_type::<AlreadyExists>())?;
+    m.add("NoSpace", py.get_type::<NoSpace>())?;
+    m.add("NotEmpty", py.get_type::<NotEmpty>())?;
+    m.add("InvalidArg", py.get_type::<InvalidArg>())?;
+    m.add("NotSupported", py.get_type::<NotSupported>())?;
+    m.add("TransportError", py.get_type::<TransportError>())?;
+    m.add("DSMError", py.get_type::<DSMError>())?;
+
+    Ok(())
+}
