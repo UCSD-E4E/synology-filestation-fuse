@@ -1,11 +1,14 @@
-# synology-filestation-fuse
+# synology-filestation
 
-A filesystem driver that mounts a [Synology FileStation](https://www.synology.com/en-global/dsm/feature/file_station) share as a local directory. Written in Rust, with an optional cross-platform GUI.
+Tools for working with Synology [FileStation](https://www.synology.com/en-global/dsm/feature/file_station) from outside DSM. The repo ships two related products from a single shared HTTP-client core:
 
+**Filesystem driver** — mount a FileStation share as a local directory:
 - **Linux** — FUSE via the `fuser` crate
 - **macOS** — local WebDAV proxy; no kernel extension required
 - **Windows** — user-mode filesystem via [WinFsp](https://winfsp.dev/)
 - **GUI (all platforms)** — Avalonia desktop app for point-and-click mounting
+
+**Python package** (`pip install synology-filestation`) — typed exceptions, atomic downloads, transparent SID-expiry recovery; a drop-in replacement for the `synology-api` PyPI package's FileStation surface. Includes an [fsspec](https://filesystem-spec.readthedocs.io/) backend registered as protocol `synofs` so it composes with pandas / dask / polars / pyarrow. See [python/synology_filestation/README.md](python/synology_filestation/README.md).
 
 ## Features
 
