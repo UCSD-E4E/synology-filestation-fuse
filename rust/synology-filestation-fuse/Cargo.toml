@@ -26,7 +26,7 @@ bytes       = "1"
 rpassword   = "7"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = "0.16"
+fuser = "0.17"
 moka  = { version = "0.12", features = ["sync"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
