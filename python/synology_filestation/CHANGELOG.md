@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.18](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.1.17...synology_filestation-v0.1.18) (2026-05-07)
+
+
+### Bug Fixes
+
+* **python:** bump requires-python to &gt;=3.10 ([54b35c4](https://github.com/UCSD-E4E/synology-filestation/commit/54b35c4454f806df325f3b0dfcae50972061badf))
+* **python:** bump requires-python to &gt;=3.10 to unblock pytest security update ([f5ddba0](https://github.com/UCSD-E4E/synology-filestation/commit/f5ddba0207b14178642b2dc839f0afce7653186a))
+
 ## [0.1.17](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.1.16...synology_filestation-v0.1.17) (2026-05-07)
 
 
