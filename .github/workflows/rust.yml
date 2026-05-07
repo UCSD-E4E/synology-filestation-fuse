@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - name: Install Dependencies
       run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
     - name: Rust formatting (cargo fmt)
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - name: Install Dependencies
       run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
     # We restrict Rust CI to the FUSE crate + its `core` library dependency.
@@ -71,7 +71,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     # We restrict Rust CI to the FUSE crate + its `core` library dependency.
     # The Python crate (`python/synology_filestation`) has its own workflow
     # (`python.yml` / `maturin.yml`) and pulling it in here would require
@@ -108,7 +108,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - name: Set up MSVC environment
       uses: ilammy/msvc-dev-cmd@v1
     - name: Install WinFsp
