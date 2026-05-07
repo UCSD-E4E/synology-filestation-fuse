@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.19](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.1.18...synology-filestation-core-v0.1.19) (2026-05-07)
+
+
+### Miscellaneous Chores
+
+* **synology-filestation-core:** Synchronize synology-filestation versions
+
 ## [0.1.18](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.1.17...synology-filestation-core-v0.1.18) (2026-05-07)
 
 
