@@ -1,0 +1,8 @@
+# Changelog
+
+## [0.1.17](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.1.16...synology-filestation-fuse-v0.1.17) (2026-05-07)
+
+
+### Features
+
+* Python bindings + fsspec backend (synofs) ([ae100f3](https://github.com/UCSD-E4E/synology-filestation/commit/ae100f372b37f54d3e41aa780db2bfc3f48b0140))
