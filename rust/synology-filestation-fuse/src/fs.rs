@@ -779,9 +779,10 @@ impl Filesystem for SynologyFS {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        let fh = fh.0;
         debug!("flush: fh={}", fh);
         // Kick off the upload in the background; release() will wait for completion.
-        self.queue_upload(fh.0);
+        self.queue_upload(fh);
         reply.ok();
     }
 

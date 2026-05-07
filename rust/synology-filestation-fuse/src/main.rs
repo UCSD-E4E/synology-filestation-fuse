@@ -216,17 +216,12 @@ fn main() -> anyhow::Result<()> {
 
         let fs = SynologyFS::new(client.clone(), cache, read_cache, handle, uid, gid);
 
-        let mount_options = vec![
-            MountOption::RW,
-            MountOption::FSName("synology-fuse".to_string()),
-            MountOption::AutoUnmount,
-        ];
-
         // `allow_other` (kernel-level access for other users) moved off MountOption
         // in fuser 0.17 — it's now expressed via Config::acl: SessionACL::All.
         // As a non-root user this requires `user_allow_other` in /etc/fuse.conf;
         // running as root always permits it.
-        let acl = if uid == 0 || fuse_conf_allows_other() {
+        let allow_other = uid == 0 || fuse_conf_allows_other();
+        let acl = if allow_other {
             SessionACL::All
         } else {
             tracing::warn!(
@@ -236,6 +231,18 @@ fn main() -> anyhow::Result<()> {
             );
             SessionACL::Owner
         };
+
+        let mut mount_options = vec![
+            MountOption::RW,
+            MountOption::FSName("synology-fuse".to_string()),
+        ];
+        // AutoUnmount requires AllowOther or AllowRoot per libfuse / fuser docs.
+        // Without that, mount2() will fail. Skip AutoUnmount when allow_other
+        // is unavailable so the mount still succeeds (the user just has to
+        // unmount manually with `fusermount -u <mountpoint>`).
+        if allow_other {
+            mount_options.push(MountOption::AutoUnmount);
+        }
 
         let mut config = Config::default();
         config.mount_options = mount_options;
