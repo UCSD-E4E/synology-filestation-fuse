@@ -33,7 +33,7 @@ jobs:
       python_release_created: ${{ steps.release.outputs['python/synology_filestation--release_created'] }}
       python_tag_name:        ${{ steps.release.outputs['python/synology_filestation--tag_name'] }}
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
