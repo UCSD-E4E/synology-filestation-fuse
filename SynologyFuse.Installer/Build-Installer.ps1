@@ -10,7 +10,7 @@
         dotnet tool install --global wix
 
     Run from the repo root before calling this script:
-        cargo build -r
+        cargo build -r -p synology-filestation-fuse
         dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
 
 .PARAMETER Version
@@ -45,7 +45,7 @@ if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
 
 $CliExe = Join-Path $RustBin "synology-filestation-fuse.exe"
 if (-not (Test-Path $CliExe)) {
-    throw "Rust CLI not found at '$CliExe'. Build it first: cargo build -r"
+    throw "Rust CLI not found at '$CliExe'. Build it first: cargo build -r -p synology-filestation-fuse"
 }
 
 if (-not (Test-Path $GuiPublish)) {

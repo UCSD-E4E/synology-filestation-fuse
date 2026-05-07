@@ -20,7 +20,7 @@
 #     # Rust toolchain and .NET 10 SDK must also be installed
 #
 #   Run from the repo root (or any directory), having already built:
-#     cargo build --release
+#     cargo build --release -p synology-filestation-fuse
 #     dotnet publish SynologyFuse.Gui -c Release -r linux-x64 -p:SelfContained=true
 #
 #   Or pass --build to have this script run those steps automatically.
@@ -121,7 +121,7 @@ fi
 
 if [[ ! -f "${RUST_RELEASE_DIR}/${CLI_BINARY}" ]]; then
     echo "Error: CLI binary not found at '${RUST_RELEASE_DIR}/${CLI_BINARY}'." >&2
-    echo "  Run 'cargo build --release' first, or pass --build." >&2
+    echo "  Run 'cargo build --release -p synology-filestation-fuse' first, or pass --build." >&2
     exit 1
 fi
 

@@ -12,7 +12,7 @@
     • WinFsp  https://winfsp.dev/  (checked at install time)
 
   Build prerequisites (run from repo root):
-    cargo build -r
+    cargo build -r -p synology-filestation-fuse
     dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
 
   Build the MSI (from repo root):

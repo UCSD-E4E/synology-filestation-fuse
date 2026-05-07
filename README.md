@@ -142,10 +142,12 @@ After saving the file, remount and all users will be able to access the share.
 ### CLI (all platforms)
 
 ```bash
-cargo build --release
+cargo build --release -p synology-filestation-fuse
 ```
 
 The binary will be at `target/release/synology-filestation-fuse`.
+
+The repo is a Cargo workspace; `-p synology-filestation-fuse` keeps the build scoped to the FUSE binary and its `synology-filestation-core` library dependency. Building the whole workspace also pulls in [`python/synology_filestation/`](python/synology_filestation/), which requires Python development headers — see [the Python package's README](python/synology_filestation/README.md) for that.
 
 ### GUI (all platforms)
 
@@ -184,7 +186,7 @@ sudo apt-get install dpkg-dev
 # Produces: SynologyFuse.DebInstaller/synologyfuse-0.1.2_amd64.deb
 ```
 
-Pass `--build` to compile the Rust CLI and publish the .NET GUI automatically. Omit it if you have already run `cargo build --release` and `dotnet publish` yourself. Use `--arch arm64` to target 64-bit ARM instead of x86-64 (default: `amd64`).
+Pass `--build` to compile the Rust CLI and publish the .NET GUI automatically. Omit it if you have already run `cargo build --release -p synology-filestation-fuse` and `dotnet publish` yourself. Use `--arch arm64` to target 64-bit ARM instead of x86-64 (default: `amd64`).
 
 The package installs:
 
@@ -212,7 +214,7 @@ xcode-select --install   # provides pkgbuild, productbuild, iconutil
 # Produces: SynologyFuse.MacInstaller/SynologyFuse-0.1.2.pkg
 ```
 
-Pass `--build` to compile the Rust CLI and publish the .NET GUI automatically. Omit it if you have already run `cargo build --release` and `dotnet publish` yourself. Use `--arch x86_64` to target Intel Macs instead of Apple Silicon (default: `arm64`).
+Pass `--build` to compile the Rust CLI and publish the .NET GUI automatically. Omit it if you have already run `cargo build --release -p synology-filestation-fuse` and `dotnet publish` yourself. Use `--arch x86_64` to target Intel Macs instead of Apple Silicon (default: `arm64`).
 
 #### Windows
 
@@ -235,7 +237,7 @@ wix extension add WixToolset.Util.wixext
 
 ```powershell
 # From repo root — build Rust CLI and .NET GUI first
-cargo build -r
+cargo build -r -p synology-filestation-fuse
 dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
 
 msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj
@@ -328,22 +330,33 @@ diskutil unmount /Volumes/nas
 
 ## Architecture
 
+The repo is a Cargo workspace with three Rust crates plus the .NET desktop GUI and platform installers:
+
 ```
-synology-fuse/
-├── src/
-│   ├── main.rs          CLI argument parsing, Tokio runtime, platform dispatch
-│   ├── client.rs        Async Synology FileStation HTTP API client
-│   ├── types.rs         Serde types for API JSON responses
-│   ├── error.rs         Synology API error code → POSIX errno / NTSTATUS translation
-│   ├── fs.rs            fuser::Filesystem trait (Linux FUSE backend)
-│   ├── cache.rs         Inode ↔ path metadata cache + block-level read cache (Linux)
-│   ├── webdav.rs        dav_server::DavFileSystem trait (macOS WebDAV backend)
-│   └── winfs.rs         winfsp::FileSystemContext trait (Windows WinFsp backend)
-├── SynologyFuse.Gui/         Cross-platform desktop GUI (Avalonia / .NET 10)
-├── SynologyFuse.DebInstaller/ Linux .deb package (dpkg-deb)
-├── SynologyFuse.MacInstaller/ macOS .pkg installer (pkgbuild / productbuild)
-├── SynologyFuse.Installer/   Windows MSI + bundle installer (WiX 6)
-└── SynologyFuse.Tests/       xUnit tests for the GUI project
+synology-filestation/
+├── rust/
+│   ├── synology-filestation-core/   Pure async HTTP client (no platform deps)
+│   │   └── src/
+│   │       ├── client.rs            FileStation API; auto-relogin; atomic download_to_path
+│   │       ├── types.rs             Serde types for API JSON responses
+│   │       └── error.rs             SynoFsError + Linux errno mapping
+│   └── synology-filestation-fuse/   CLI + FUSE / WebDAV / WinFsp backends
+│       └── src/
+│           ├── main.rs              CLI argument parsing, Tokio runtime, platform dispatch
+│           ├── fs.rs                fuser::Filesystem trait (Linux FUSE backend)
+│           ├── cache.rs             Inode ↔ path cache + block-level read cache (Linux)
+│           ├── webdav.rs            dav_server::DavFileSystem trait (macOS WebDAV backend)
+│           └── winfs.rs             winfsp::FileSystemContext trait (Windows WinFsp backend)
+├── python/
+│   └── synology_filestation/        PyO3 + maturin Python bindings (synofs fsspec)
+│       ├── src/lib.rs               PyO3 _native module: Client, AsyncClient, exceptions
+│       ├── synology_filestation/    Importable Python package (re-exports + fsspec.py)
+│       └── tests/                   pytest + pytest-httpserver
+├── SynologyFuse.Gui/                Cross-platform desktop GUI (Avalonia / .NET 10)
+├── SynologyFuse.DebInstaller/       Linux .deb package (dpkg-deb)
+├── SynologyFuse.MacInstaller/       macOS .pkg installer (pkgbuild / productbuild)
+├── SynologyFuse.Installer/          Windows MSI + bundle installer (WiX 6)
+└── SynologyFuse.Tests/              xUnit tests for the GUI project
 ```
 
 ### GUI
