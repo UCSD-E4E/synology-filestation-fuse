@@ -1,5 +1,5 @@
 {
-  "rust/synology-filestation-core": "0.1.16",
-  "rust/synology-filestation-fuse": "0.1.16",
-  "python/synology_filestation": "0.1.16"
+  "rust/synology-filestation-core": "0.1.17",
+  "rust/synology-filestation-fuse": "0.1.17",
+  "python/synology_filestation": "0.1.17"
 }
