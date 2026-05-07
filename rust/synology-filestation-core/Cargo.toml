@@ -1,6 +1,6 @@
 [package]
 name = "synology-filestation-core"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust async HTTP client for the Synology FileStation API."
