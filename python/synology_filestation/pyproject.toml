@@ -26,7 +26,7 @@ asyncio_mode = "auto"
 
 [project.optional-dependencies]
 fsspec = [
-    "fsspec>=2023.10",
+    "fsspec>=2026.4.0",
 ]
 
 [project.entry-points."fsspec.specs"]
@@ -40,5 +40,5 @@ dev = [
     "maturin>=1.7,<2.0",
     # fsspec is opt-in for end users (`pip install synology-filestation[fsspec]`)
     # but always installed in dev so the fsspec backend is exercised in CI.
-    "fsspec>=2023.10",
+    "fsspec>=2026.4.0",
 ]
