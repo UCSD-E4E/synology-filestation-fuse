@@ -12,9 +12,9 @@ use libc::{EIO, ENOENT, ENOSYS};
 use tracing::{debug, error, info, warn};
 
 use crate::cache::{InodeCache, ReadCache};
-use crate::client::SynologyClient;
-use crate::error::SynoFsError;
-use crate::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
+use synology_filestation_core::client::SynologyClient;
+use synology_filestation_core::error::SynoFsError;
+use synology_filestation_core::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
 
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO: u64 = 1;
@@ -835,7 +835,7 @@ impl Filesystem for SynologyFS {
         // flush.  The write buffer is marked new_file=true so flush uses
         // overwrite=false, skipping the delete-before-upload round trips.
         let ino = self.cache.get_or_alloc_ino(&new_path);
-        let synthetic_info = crate::types::SynoFileInfo {
+        let synthetic_info = synology_filestation_core::types::SynoFileInfo {
             name: name_str.to_string(),
             path: new_path.clone(),
             isdir: false,

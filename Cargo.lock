@@ -1695,6 +1695,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "synology-filestation-core"
+version = "0.1.16"
+dependencies = [
+ "bytes",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "synology-filestation-fuse"
 version = "0.1.16"
 dependencies = [
@@ -1712,6 +1726,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "synology-filestation-core",
  "tokio",
  "tracing",
  "tracing-subscriber",

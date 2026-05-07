@@ -9,9 +9,9 @@ use winfsp::filesystem::{
 };
 use winfsp::FspError;
 
-use crate::client::SynologyClient;
-use crate::error::SynoFsError;
-use crate::types::SynoFileInfo;
+use synology_filestation_core::client::SynologyClient;
+use synology_filestation_core::error::SynoFsError;
+use synology_filestation_core::types::SynoFileInfo;
 
 // ── Windows constants ─────────────────────────────────────────────────────────
 

@@ -1,9 +1,9 @@
-use crate::types::{InodeEntry, SynoFileInfo};
 use bytes::Bytes;
 use moka::sync::Cache;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use synology_filestation_core::types::{InodeEntry, SynoFileInfo};
 
 #[cfg(test)]
 fn make_file_info(path: &str) -> SynoFileInfo {
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn get_size_for_ino_returns_size() {
-        use crate::types::SynoAdditional;
+        use synology_filestation_core::types::SynoAdditional;
         let cache = InodeCache::new(30);
         let mut info = make_file_info("/share/video.mp4");
         info.additional = Some(SynoAdditional {

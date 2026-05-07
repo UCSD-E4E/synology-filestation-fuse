@@ -7,9 +7,9 @@ use dav_server::fs::*;
 use futures_util::stream;
 use tracing::debug;
 
-use crate::client::SynologyClient;
-use crate::error::SynoFsError;
-use crate::types::SynoFileInfo;
+use synology_filestation_core::client::SynologyClient;
+use synology_filestation_core::error::SynoFsError;
+use synology_filestation_core::types::SynoFileInfo;
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 

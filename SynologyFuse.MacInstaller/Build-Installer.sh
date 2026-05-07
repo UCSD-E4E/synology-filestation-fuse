@@ -57,9 +57,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Read version from Cargo.toml if not specified
+# Read version from Cargo.toml if not specified. The repo is a Cargo
+# workspace as of 0.1.16 — the [workspace] root has no version, so we read
+# it from the FUSE crate's manifest instead.
 if [[ -z "${VERSION}" ]]; then
-    VERSION=$(grep '^version' "${REPO_ROOT}/Cargo.toml" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+    VERSION=$(grep '^version' "${REPO_ROOT}/rust/synology-filestation-fuse/Cargo.toml" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
 fi
 
 DOTNET_RID="osx-${ARCH}"
@@ -94,7 +96,7 @@ done
 
 if [[ "${DO_BUILD}" == true ]]; then
     echo "Building Rust CLI (release)..."
-    cargo build --release --manifest-path "${REPO_ROOT}/Cargo.toml"
+    cargo build --release -p synology-filestation-fuse --manifest-path "${REPO_ROOT}/Cargo.toml"
 
     echo "Publishing .NET GUI (${DOTNET_RID})..."
     dotnet publish "${REPO_ROOT}/${GUI_PROJECT}" \

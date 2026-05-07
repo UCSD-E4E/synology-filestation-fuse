@@ -6,18 +6,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a cross-platform filesystem driver that mounts a Synology FileStation NAS share as a local directory. The core driver is written in **Rust**; an optional desktop GUI uses **.NET 10 / Avalonia**. Platform backends: Linux (FUSE via `fuser`), macOS (WebDAV via `dav-server`), Windows (WinFsp via `winfsp` crate).
 
+## Repository layout
+
+The repo is a **Cargo workspace** with two crates plus the existing .NET projects:
+
+```
+rust/synology-filestation-core/    # Pure HTTP client (no FS code, no platform deps)
+rust/synology-filestation-fuse/    # CLI + FUSE/WebDAV/WinFsp backends
+SynologyFuse.Gui/                  # Avalonia desktop GUI
+SynologyFuse.{Mac,Deb}Installer/   # macOS .pkg / Debian .deb builders
+SynologyFuse.Installer/            # Windows MSI/bundle builder (WiX 4)
+```
+
 ## Build Commands
 
 ### Rust CLI
 
 ```bash
-cargo build --release
-cargo test
-cargo fmt --check
-cargo clippy
+cargo build --release -p synology-filestation-fuse
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-On Windows, build from a **Developer Command Prompt for VS** — Git for Windows ships a `link.exe` that shadows MSVC's linker. See `.cargo/config.toml` for context and the fix if linker issues arise.
+On Windows, build from a **Developer Command Prompt for VS** — Git for Windows ships a `link.exe` that shadows MSVC's linker. See `rust/synology-filestation-fuse/.cargo/config.toml` for context and the fix if linker issues arise.
 
 ### .NET GUI
 
@@ -94,26 +106,32 @@ dotnet tool install --global wix --version 6.0.2
 ```
 CLI (main.rs) or GUI (MountService.cs → subprocess)
     → Tokio runtime
-    → SynologyClient (src/client.rs) — async HTTP to FileStation API
+    → SynologyClient (rust/synology-filestation-core/src/client.rs) — async HTTP
     → Platform backend (dispatched in main.rs):
-        Linux:   src/fs.rs      (fuser FUSE callbacks, sync→async bridge)
-        macOS:   src/webdav.rs  (local HTTP server, mounted via Finder)
-        Windows: src/winfs.rs   (WinFsp callbacks, sync→async bridge)
+        Linux:   rust/synology-filestation-fuse/src/fs.rs       (fuser FUSE callbacks)
+        macOS:   rust/synology-filestation-fuse/src/webdav.rs   (local HTTP, mounted via Finder)
+        Windows: rust/synology-filestation-fuse/src/winfs.rs    (WinFsp callbacks)
     → OS filesystem layer → user applications
 ```
 
-### Rust Components (`src/`)
+### Rust core (`rust/synology-filestation-core/src/`)
 
 | File | Role |
 |------|------|
-| `main.rs` | CLI parsing (clap), interactive prompts, platform dispatch |
+| `lib.rs`    | Module declarations + re-exports of the public surface |
 | `client.rs` | Async HTTP client — all FileStation API calls, session/SID management, 2FA |
-| `types.rs` | Serde structs for API responses (`SynoFileInfo`, `SynoResponse<T>`, etc.) |
-| `error.rs` | Maps Synology API error codes → POSIX errno / Windows NTSTATUS |
-| `fs.rs` | Linux FUSE backend; uses `runtime.block_on()` for each FUSE callback |
-| `cache.rs` | Linux only — `InodeCache` (TTL metadata), `ReadCache` (LRU block cache, 256 KiB blocks, prefetch) |
+| `types.rs`  | Serde structs for API responses (`SynoFileInfo`, `SynoResponse<T>`, etc.) |
+| `error.rs`  | `SynoFsError` enum + Linux errno mapping (used by FUSE backend) |
+
+### FUSE binary (`rust/synology-filestation-fuse/src/`)
+
+| File | Role |
+|------|------|
+| `main.rs`   | CLI parsing (clap), interactive prompts, platform dispatch |
+| `fs.rs`     | Linux FUSE backend; uses `runtime.block_on()` for each FUSE callback |
+| `cache.rs`  | Linux only — `InodeCache` (TTL metadata), `ReadCache` (LRU block cache, 256 KiB blocks, prefetch) |
 | `webdav.rs` | macOS WebDAV backend; directory moves are download→upload→delete |
-| `winfs.rs` | Windows WinFsp backend; in-memory write buffers flushed atomically on close |
+| `winfs.rs`  | Windows WinFsp backend; in-memory write buffers flushed atomically on close |
 
 ### .NET GUI (`SynologyFuse.Gui/`)
 

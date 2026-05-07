@@ -1,6 +1,4 @@
-mod client;
-mod error;
-mod types;
+use synology_filestation_core::{client, error};
 
 #[cfg(target_os = "linux")]
 mod cache;
