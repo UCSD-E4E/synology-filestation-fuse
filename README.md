@@ -186,7 +186,7 @@ sudo apt-get install dpkg-dev
 # Produces: SynologyFuse.DebInstaller/synologyfuse-0.1.2_amd64.deb
 ```
 
-Pass `--build` to compile the Rust CLI and publish the .NET GUI automatically. Omit it if you have already run `cargo build --release` and `dotnet publish` yourself. Use `--arch arm64` to target 64-bit ARM instead of x86-64 (default: `amd64`).
+Pass `--build` to compile the Rust CLI and publish the .NET GUI automatically. Omit it if you have already run `cargo build --release -p synology-filestation-fuse` and `dotnet publish` yourself. Use `--arch arm64` to target 64-bit ARM instead of x86-64 (default: `amd64`).
 
 The package installs:
 
@@ -214,7 +214,7 @@ xcode-select --install   # provides pkgbuild, productbuild, iconutil
 # Produces: SynologyFuse.MacInstaller/SynologyFuse-0.1.2.pkg
 ```
 
-Pass `--build` to compile the Rust CLI and publish the .NET GUI automatically. Omit it if you have already run `cargo build --release` and `dotnet publish` yourself. Use `--arch x86_64` to target Intel Macs instead of Apple Silicon (default: `arm64`).
+Pass `--build` to compile the Rust CLI and publish the .NET GUI automatically. Omit it if you have already run `cargo build --release -p synology-filestation-fuse` and `dotnet publish` yourself. Use `--arch x86_64` to target Intel Macs instead of Apple Silicon (default: `arm64`).
 
 #### Windows
 
@@ -237,7 +237,7 @@ wix extension add WixToolset.Util.wixext
 
 ```powershell
 # From repo root — build Rust CLI and .NET GUI first
-cargo build -r
+cargo build -r -p synology-filestation-fuse
 dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
 
 msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj

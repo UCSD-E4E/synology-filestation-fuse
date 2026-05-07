@@ -11,7 +11,7 @@
         wix extension add -g WixToolset.Bal.wixext/6.0.2
 
     Run from the repo root before calling this script:
-        cargo build -r
+        cargo build -r -p synology-filestation-fuse
         dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
         msbuild SynologyFuse.Installer\SynologyFuse.Installer.wixproj
 
