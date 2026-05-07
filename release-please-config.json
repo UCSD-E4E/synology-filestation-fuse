@@ -1,8 +1,27 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "plugins": [
+    {
+      "type": "linked-versions",
+      "groupName": "synology-filestation",
+      "components": [
+        "synology-filestation-core",
+        "synology-filestation-fuse",
+        "synology_filestation"
+      ],
+      "merge": false
+    }
+  ],
   "packages": {
-    ".": {
+    "rust/synology-filestation-core": {
       "release-type": "rust",
+      "package-name": "synology-filestation-core",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true
+    },
+    "rust/synology-filestation-fuse": {
+      "release-type": "rust",
+      "package-name": "synology-filestation-fuse",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
       "extra-files": [
@@ -11,6 +30,12 @@
           "path": "SynologyFuse.Gui/SynologyFuse.Gui.csproj"
         }
       ]
+    },
+    "python/synology_filestation": {
+      "release-type": "rust",
+      "package-name": "synology_filestation",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true
     }
   }
 }

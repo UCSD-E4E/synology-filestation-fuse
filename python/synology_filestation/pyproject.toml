@@ -1,0 +1,44 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "synology_filestation._native"
+python-source = "."
+features = ["pyo3/extension-module"]
+
+[project]
+name = "synology-filestation"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: System :: Filesystems",
+]
+description = "Python bindings for the Synology FileStation HTTP client. Drop-in replacement for the synology-api PyPI package's FileStation surface, with typed exceptions, atomic downloads, and transparent session-expiry recovery."
+readme = "README.md"
+dynamic = ["version"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[project.optional-dependencies]
+fsspec = [
+    "fsspec>=2023.10",
+]
+
+[project.entry-points."fsspec.specs"]
+synofs = "synology_filestation.fsspec:SynologyFileSystem"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-httpserver>=1.0",
+    "maturin>=1.7,<2.0",
+    # fsspec is opt-in for end users (`pip install synology-filestation[fsspec]`)
+    # but always installed in dev so the fsspec backend is exercised in CI.
+    "fsspec>=2023.10",
+]

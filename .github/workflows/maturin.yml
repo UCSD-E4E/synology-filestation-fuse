@@ -1,0 +1,24 @@
+name: Maturin
+
+# Smoke-test the Linux wheel build on every push so we catch packaging
+# breakage before a tag fires the actual release upload. The wheel itself is
+# discarded — `release-please.yml` re-builds it for tagged releases.
+
+on: [push]
+
+jobs:
+  build-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --strip --manifest-path python/synology_filestation/Cargo.toml --out target/wheels --find-interpreter
+          target: x86_64-unknown-linux-gnu
+          manylinux: "2_34"
+          sccache: true

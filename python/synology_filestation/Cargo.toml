@@ -1,0 +1,31 @@
+[package]
+name = "synology_filestation"
+version = "0.1.16"
+edition = "2021"
+license = "MIT"
+description = "Python bindings for the Synology FileStation HTTP client."
+repository = "https://github.com/UCSD-E4E/synology-filestation"
+
+[lib]
+name = "synology_filestation"
+crate-type = ["cdylib"]
+
+[dependencies]
+synology-filestation-core = { path = "../../rust/synology-filestation-core", version = "0.1.16" }
+
+# pyo3 0.23 supports abi3-py39, which gives us a single Linux wheel that works
+# on Python 3.9 through whatever's current. Bumping to 0.24+ later is a
+# straight find/replace; pyo3-async-runtimes versions track pyo3 versions.
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+
+# pyo3-log routes Rust `log` records into Python's `logging`. tracing-log
+# adapts our existing `tracing` events to the `log` crate so the bridge is
+# end-to-end.
+pyo3-log = "0.12"
+tracing-log = "0.2"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
