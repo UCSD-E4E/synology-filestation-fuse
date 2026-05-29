@@ -68,6 +68,76 @@ The installer includes [WinFsp](https://winfsp.dev/) and automatically installs 
 
 To build the installer yourself, see [Building the installer](#building-the-installer) below.
 
+## Nix installation
+
+The repository ships a flake exposing both binaries as packages:
+
+| Output | Contents |
+|---|---|
+| `synology-filestation-fuse` (also `default`) | The Rust CLI |
+| `synologyfuse-gui` | The .NET 10 / Avalonia desktop GUI |
+
+The GUI launches the CLI as a subprocess, so the `synologyfuse-gui` package wraps its launcher with the CLI already on `PATH` — installing or running the GUI alone is enough to mount. Install `synology-filestation-fuse` as well if you also want the CLI available directly in your shell.
+
+### Try it without installing
+
+```bash
+nix run github:UCSD-E4E/synology-filestation          # CLI
+nix run github:UCSD-E4E/synology-filestation#gui       # GUI (bundles the CLI)
+```
+
+### Imperative (user profile)
+
+```bash
+# GUI (self-contained), plus the CLI for direct shell use:
+nix profile install \
+  github:UCSD-E4E/synology-filestation#synologyfuse-gui \
+  github:UCSD-E4E/synology-filestation#synology-filestation-fuse
+```
+
+### Declarative (NixOS flake)
+
+Add the flake as an input and pull the packages into `environment.systemPackages`:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    synology-filestation.url = "github:UCSD-E4E/synology-filestation";
+    # Reuse your system's nixpkgs instead of evaluating a second copy:
+    synology-filestation.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { self, nixpkgs, synology-filestation, ... }: {
+    nixosConfigurations.YOUR_HOST = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        ({ pkgs, ... }: {
+          environment.systemPackages = [
+            synology-filestation.packages.${pkgs.system}.synology-filestation-fuse
+            synology-filestation.packages.${pkgs.system}.synologyfuse-gui   # optional
+          ];
+
+          # Required for non-root FUSE mounting (see below).
+          programs.fuse.userAllowOther = true;
+        })
+      ];
+    };
+  };
+}
+```
+
+Then `sudo nixos-rebuild switch --flake .#YOUR_HOST`. For [Home Manager](https://nix-community.github.io/home-manager/), use the same packages in `home.packages` instead.
+
+On NixOS the CLI mounts via a setuid `fusermount3`; if you hit `fusermount3: permission denied`, the `programs.fuse.userAllowOther = true` option above provides it (this is the NixOS equivalent of the [`/etc/fuse.conf` step](#linux-fuse-configuration-allow_other) below).
+
+### Develop against the flake
+
+`nix develop` drops you into a shell with the Rust toolchain (clippy/rustfmt), `pkg-config` + `fuse3`, the Python binding toolchain (`uv`, `maturin`, `python3`), and the .NET 10 SDK — everything needed to build every component in this repo. `nix flake check` runs the CLI build, clippy, rustfmt, and the GUI build + test suite.
+
+Supported systems: `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, `aarch64-darwin`.
+
 ## Requirements
 
 ### System

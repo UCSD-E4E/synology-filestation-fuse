@@ -1,0 +1,28 @@
+name: Nix
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  flake-check:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+    # Caches /nix/store across runs (keyed on the flake lockfile) so the heavy
+    # Rust + .NET builds only run from scratch when inputs change.
+    - name: Cache Nix store
+      uses: nix-community/cache-nix-action@v6
+      with:
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/deps.json') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-
+    # Runs the CLI build, clippy (-D warnings), rustfmt, and the GUI build +
+    # test suite — i.e. every `checks.x86_64-linux.*` output in the flake.
+    - name: nix flake check
+      run: nix flake check -L

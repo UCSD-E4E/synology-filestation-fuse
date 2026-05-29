@@ -1,3 +1,8 @@
+### Nix ###
+# Build symlinks produced by `nix build`
+/result
+/result-*
+
 # Created by https://www.toptal.com/developers/gitignore/api/linux,windows,macos,visualstudiocode,rust,rust-analyzer,csharp,rider,visualstudio,dotnetcore
 # Edit at https://www.toptal.com/developers/gitignore?templates=linux,windows,macos,visualstudiocode,rust,rust-analyzer,csharp,rider,visualstudio,dotnetcore
 

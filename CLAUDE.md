@@ -191,4 +191,5 @@ CI workflows:
 | `.github/workflows/rust.yml`           | every push / PR        | clippy, build, test for the rust crates + .deb/.pkg/.msi smoke builds |
 | `.github/workflows/python.yml`         | every push             | pytest matrix (Python 3.10–3.13) for the bindings |
 | `.github/workflows/maturin.yml`        | every push             | manylinux wheel smoke build |
+| `.github/workflows/nix.yml`            | push to main / PR      | `nix flake check` — CLI + GUI builds, clippy, rustfmt, GUI tests |
 | `.github/workflows/release-please.yml` | tag (or workflow_dispatch) | release-please PRs and per-package artifact uploads |
