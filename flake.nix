@@ -106,6 +106,27 @@
             }
           );
 
+          # ── Native FFI library (C ABI consumed by the GUI) ────────────────
+          # Built as a cdylib; crane installs it to $out/lib. The GUI loads it
+          # at runtime via SYNOFS_NATIVE_DIR (see the wrapper below).
+          ffiArgs = commonArgs // {
+            pname = "synology-filestation-ffi";
+            cargoExtraArgs = "--package synology-filestation-ffi";
+          };
+          synology-filestation-ffi = craneLib.buildPackage (
+            ffiArgs
+            // {
+              inherit cargoArtifacts;
+              doCheck = false;
+              meta = {
+                description = "C ABI bindings for the Synology FileStation client and mount driver";
+                homepage = "https://github.com/UCSD-E4E/synology-filestation";
+                license = lib.licenses.mit;
+                platforms = lib.platforms.linux ++ lib.platforms.darwin;
+              };
+            }
+          );
+
           # ── .NET 10 GUI (Avalonia) ────────────────────────────────────────
           dotnet = pkgs.dotnetCorePackages.sdk_10_0;
 
@@ -149,12 +170,13 @@
             selfContainedBuild = true;
             runtimeDeps = guiRuntimeDeps;
 
-            # The GUI shells out to the CLI, which MountService.FindBinary()
-            # resolves via PATH (the CLI is a separate derivation, so it is not
-            # beside the GUI binary). Put it on the launcher's PATH so the GUI is
-            # self-sufficient — `nix run .#gui` can mount without the user also
-            # installing synology-filestation-fuse separately.
+            # The GUI calls the Rust core directly through the native FFI
+            # library (no subprocess). The resolver in NativeMethods.cs honours
+            # SYNOFS_NATIVE_DIR, so point it at the cdylib's output dir to make
+            # `nix run .#gui` self-sufficient. The CLI is also placed on PATH for
+            # users who want the standalone terminal tool.
             makeWrapperArgs = [
+              "--set SYNOFS_NATIVE_DIR ${synology-filestation-ffi}/lib"
               "--prefix PATH : ${lib.makeBinPath [ synology-filestation-fuse ]}"
             ];
 
@@ -169,7 +191,7 @@
         in
         {
           packages = {
-            inherit synology-filestation-fuse synologyfuse-gui;
+            inherit synology-filestation-fuse synology-filestation-ffi synologyfuse-gui;
             default = synology-filestation-fuse;
           };
 
@@ -184,13 +206,15 @@
           };
 
           checks = {
-            inherit synology-filestation-fuse synologyfuse-gui;
+            inherit synology-filestation-fuse synology-filestation-ffi synologyfuse-gui;
 
             clippy = craneLib.cargoClippy (
               commonArgs
               // {
                 inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--all-targets -- -D warnings";
+                # Lint the FFI crate alongside the CLI + core.
+                cargoClippyExtraArgs =
+                  "--package synology-filestation-fuse --package synology-filestation-ffi --all-targets -- -D warnings";
               }
             );
 

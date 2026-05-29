@@ -83,7 +83,7 @@
         <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
           <TextBlock Grid.Column="0" Text="Host" VerticalAlignment="Center" />
           <TextBox   Grid.Column="1" Text="{Binding Host}"
-                     Watermark="192.168.1.100 or nas.local"
+                     PlaceholderText="192.168.1.100 or nas.local"
                      IsEnabled="{Binding IsDisconnected}" />
         </Grid>
 
@@ -91,7 +91,7 @@
         <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
           <TextBlock Grid.Column="0" Text="Username" VerticalAlignment="Center" />
           <TextBox   Grid.Column="1" Text="{Binding Username}"
-                     Watermark="admin"
+                     PlaceholderText="admin"
                      IsEnabled="{Binding IsDisconnected}" />
         </Grid>
 
@@ -131,7 +131,7 @@
         <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
           <TextBlock Grid.Column="0" Text="Mountpoint" VerticalAlignment="Center" />
           <TextBox   Grid.Column="1" Text="{Binding Mountpoint}"
-                     Watermark="/mnt/nas  •  /Volumes/nas  •  Z:\"
+                     PlaceholderText="/mnt/nas  •  /Volumes/nas  •  Z:\"
                      IsEnabled="{Binding IsDisconnected}" />
         </Grid>
 
@@ -167,7 +167,7 @@
           </StackPanel>
         </Expander>
 
-        <!-- 2FA banner: appears when the CLI is blocked waiting for the OTP on stdin -->
+        <!-- 2FA banner: appears when login reports that an OTP code is required -->
         <Border IsVisible="{Binding ShowOtpPrompt}"
                 Background="#FFF3CD"
                 CornerRadius="4"
@@ -177,12 +177,12 @@
             <TextBlock Text="Two-factor authentication code required."
                        FontWeight="SemiBold"
                        Foreground="#856404" />
-            <TextBlock Text="Enter your TOTP code below. The mount process is waiting."
+            <TextBlock Text="Enter your TOTP code below to finish connecting."
                        TextWrapping="Wrap"
                        Foreground="#856404" />
             <Grid ColumnDefinitions="*,Auto">
               <TextBox Grid.Column="0" Text="{Binding PendingOtp, UpdateSourceTrigger=PropertyChanged}"
-                       Watermark="6-digit TOTP code"
+                       PlaceholderText="6-digit TOTP code"
                        Margin="0,0,8,0">
                 <TextBox.KeyBindings>
                   <KeyBinding Gesture="Enter" Command="{Binding SubmitOtpCommand}" />
@@ -197,17 +197,40 @@
         </Border>
 
         <!-- Buttons -->
-        <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,20,0,4"
-                    HorizontalAlignment="Right">
-          <Button Content="Connect"
+        <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto" Margin="0,20,0,4">
+          <!-- Connecting spinner -->
+          <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8"
+                      VerticalAlignment="Center"
+                      IsVisible="{Binding IsConnecting}">
+            <ProgressBar IsIndeterminate="True" Width="120" Height="4"
+                         VerticalAlignment="Center" />
+            <TextBlock Text="Working…" VerticalAlignment="Center" FontSize="12"
+                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+          </StackPanel>
+
+          <Button Grid.Column="1"
+                  Content="Browse…"
+                  Click="OnBrowse"
+                  IsEnabled="{Binding IsIdle}"
+                  HorizontalAlignment="Left"
+                  Width="100" />
+          <Button Grid.Column="2"
+                  Content="Test Connection"
+                  Command="{Binding TestConnectionCommand}"
+                  Margin="0,0,10,0"
+                  Width="130" />
+          <Button Grid.Column="3"
+                  Content="Connect"
                   Command="{Binding ConnectCommand}"
                   Classes="accent"
                   IsDefault="True"
+                  Margin="0,0,10,0"
                   Width="110" />
-          <Button Content="Disconnect"
+          <Button Grid.Column="4"
+                  Content="Disconnect"
                   Command="{Binding DisconnectCommand}"
                   Width="110" />
-        </StackPanel>
+        </Grid>
 
       </StackPanel>
     </ScrollViewer>

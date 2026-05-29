@@ -1,54 +1,12 @@
-use synology_filestation_core::{client, error};
-
-#[cfg(target_os = "linux")]
-mod cache;
-#[cfg(target_os = "linux")]
-mod fs;
-
-#[cfg(target_os = "macos")]
-mod webdav;
-
-#[cfg(target_os = "windows")]
-mod winfs;
-
-/// Add WinFsp's bin directory to PATH so the Windows loader can find
-/// winfsp-x64.dll when the delay-load triggers on the first WinFsp call.
-/// WinFsp installs to a non-standard location and does not add itself to PATH.
-#[cfg(target_os = "windows")]
-fn ensure_winfsp_in_path() {
-    let candidates = [
-        r"C:\Program Files (x86)\WinFsp\bin",
-        r"C:\Program Files\WinFsp\bin",
-    ];
-    for dir in &candidates {
-        if std::path::Path::new(dir).join("winfsp-x64.dll").exists() {
-            let current = std::env::var_os("PATH").unwrap_or_default();
-            let current_str = current.to_string_lossy();
-            if !current_str.to_lowercase().contains(&dir.to_lowercase()) {
-                std::env::set_var("PATH", format!("{};{}", dir, current_str));
-            }
-            return;
-        }
-    }
-}
-
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(target_os = "windows")]
-use anyhow::Context;
 use clap::Parser;
 use tracing::info;
 
-use client::SynologyClient;
-
-#[cfg(target_os = "linux")]
-use cache::{InodeCache, ReadCache, READ_BLOCK_SIZE};
-#[cfg(target_os = "linux")]
-use fs::SynologyFS;
-#[cfg(target_os = "linux")]
-use fuser::{Config, MountOption, SessionACL};
+use synology_filestation_core::client::SynologyClient;
+use synology_filestation_fuse::{is_otp_required, spawn_mount, MountOptions};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -97,31 +55,12 @@ struct Args {
     log_level: String,
 }
 
-fn is_otp_required(e: &error::SynoFsError) -> bool {
-    matches!(e, error::SynoFsError::ApiError(403 | 404))
-}
-
 fn prompt(label: &str) -> anyhow::Result<String> {
     eprint!("{}: ", label);
     io::stderr().flush()?;
     let mut value = String::new();
     io::stdin().read_line(&mut value)?;
     Ok(value.trim().to_string())
-}
-
-/// Returns `true` when `/etc/fuse.conf` contains an uncommented
-/// `user_allow_other` line, meaning a non-root user is permitted to pass the
-/// `allow_other` option to `fusermount`/`fusermount3`.
-#[cfg(target_os = "linux")]
-fn fuse_conf_allows_other() -> bool {
-    let contents = match std::fs::read_to_string("/etc/fuse.conf") {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    contents.lines().any(|line| {
-        let trimmed = line.trim();
-        !trimmed.starts_with('#') && trimmed == "user_allow_other"
-    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -134,41 +73,6 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-
-    // On Windows, WinFsp creates the mountpoint directory itself (FILE_CREATE
-    // disposition) and deletes it on unmount.  The parent must exist but the
-    // directory itself must NOT exist when mounting.
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(parent) = args.mountpoint.parent() {
-            if !parent.as_os_str().is_empty() && !parent.is_dir() {
-                anyhow::bail!(
-                    "On Windows the mountpoint's parent directory must exist, got: {}",
-                    args.mountpoint.display()
-                );
-            }
-        }
-        if args.mountpoint.exists() {
-            std::fs::remove_dir(&args.mountpoint).with_context(|| {
-                format!(
-                    "Mountpoint {} already exists and could not be removed \
-                     (is it still mounted?)",
-                    args.mountpoint.display()
-                )
-            })?;
-        }
-    }
-
-    // On macOS we mount via Finder which always places volumes under /Volumes/.
-    // Require that the user provides a path there so they get a predictable name.
-    #[cfg(target_os = "macos")]
-    if !args.mountpoint.starts_with("/Volumes/") {
-        anyhow::bail!(
-            "On macOS the mountpoint must be under /Volumes/ (e.g. /Volumes/nas), \
-             got: {}",
-            args.mountpoint.display()
-        );
-    }
 
     info!(
         "Connecting to Synology NAS at {}://{}:{}",
@@ -198,252 +102,20 @@ fn main() -> anyhow::Result<()> {
 
     info!("Logged in successfully");
 
-    #[cfg(target_os = "linux")]
-    {
-        let cache = Arc::new(InodeCache::new(args.cache_ttl));
-        let max_blocks = (args.read_cache_mb * 1024 * 1024) / READ_BLOCK_SIZE;
-        let read_cache = Arc::new(ReadCache::new(READ_BLOCK_SIZE, max_blocks.max(1)));
-        let handle = rt.handle().clone();
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
+    let opts = MountOptions {
+        cache_ttl: args.cache_ttl,
+        read_cache_mb: args.read_cache_mb,
+    };
+    let handle = spawn_mount(client.clone(), rt.handle().clone(), args.mountpoint, opts)?;
 
-        info!(
-            "Read cache: {} MiB ({} blocks × {} MiB)",
-            args.read_cache_mb,
-            max_blocks,
-            READ_BLOCK_SIZE / (1024 * 1024)
-        );
+    // Block until Ctrl-C, then unmount and log out — preserving the previous
+    // foreground CLI behaviour now that the mount itself runs in the background.
+    rt.block_on(tokio::signal::ctrl_c())?;
+    info!("Signal received, unmounting…");
+    handle.stop();
 
-        let fs = SynologyFS::new(client.clone(), cache, read_cache, handle, uid, gid);
-
-        // `allow_other` (kernel-level access for other users) moved off MountOption
-        // in fuser 0.17 — it's now expressed via Config::acl: SessionACL::All.
-        // As a non-root user this requires `user_allow_other` in /etc/fuse.conf;
-        // running as root always permits it.
-        let allow_other = uid == 0 || fuse_conf_allows_other();
-        let acl = if allow_other {
-            SessionACL::All
-        } else {
-            tracing::warn!(
-                "allow_other is not enabled: only the mounting user can access the \
-                 filesystem. To allow other users, add or uncomment \
-                 `user_allow_other` in /etc/fuse.conf."
-            );
-            SessionACL::Owner
-        };
-
-        let mut mount_options = vec![
-            MountOption::RW,
-            MountOption::FSName("synology-fuse".to_string()),
-        ];
-        // AutoUnmount requires AllowOther or AllowRoot per libfuse / fuser docs.
-        // Without that, mount2() will fail. Skip AutoUnmount when allow_other
-        // is unavailable so the mount still succeeds (the user just has to
-        // unmount manually with `fusermount -u <mountpoint>`).
-        if allow_other {
-            mount_options.push(MountOption::AutoUnmount);
-        }
-
-        let mut config = Config::default();
-        config.mount_options = mount_options;
-        config.acl = acl;
-
-        info!("Mounting shares on {}", args.mountpoint.display());
-        fuser::mount2(fs, &args.mountpoint, &config)?;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        info!(
-            "Mounting shares on {} via WebDAV",
-            args.mountpoint.display()
-        );
-        rt.block_on(serve_and_mount(client.clone(), &args.mountpoint))?;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
-
-        info!(
-            "Mounting shares on {} via WinFsp",
-            args.mountpoint.display()
-        );
-
-        ensure_winfsp_in_path();
-        let _fsp = winfsp::winfsp_init().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to initialise WinFsp ({:?}). \
-                 Ensure WinFsp is installed from https://winfsp.dev/rel/ \
-                 and the WinFsp.Launcher service is running.",
-                e
-            )
-        })?;
-
-        let mut volume_params = VolumeParams::new();
-        volume_params.filesystem_name("SynoFS");
-        volume_params.sector_size(512);
-        volume_params.sectors_per_allocation_unit(1);
-        volume_params.max_component_length(255);
-        volume_params.file_info_timeout(1000);
-        volume_params.case_sensitive_search(false);
-        volume_params.unicode_on_disk(true);
-        volume_params.persistent_acls(false);
-        // Unique serial per mount so the Windows MountManager never reuses a
-        // stale Volume GUID from a previous (now-dead) WinFsp mount, which
-        // would cause STATUS_OBJECT_NAME_COLLISION on the next mount attempt.
-        let serial = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0xdeadbeef);
-        volume_params.volume_serial_number(serial);
-
-        let fs_params = FileSystemParams::default_params(volume_params);
-        let fs_ctx = winfs::SynologyWinFs::new(client.clone(), rt.handle().clone());
-        let mut host = FileSystemHost::new_with_options(fs_params, fs_ctx)
-            .map_err(|e| anyhow::anyhow!("Failed to create WinFsp filesystem ({:?})", e))?;
-        host.mount(&args.mountpoint).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to mount on {} ({:?}): ensure the drive letter is not already in use",
-                args.mountpoint.display(),
-                e
-            )
-        })?;
-        host.start()
-            .map_err(|e| anyhow::anyhow!("Failed to start WinFsp dispatcher ({:?})", e))?;
-
-        info!("Mounted at {}", args.mountpoint.display());
-        rt.block_on(tokio::signal::ctrl_c())?;
-
-        info!("Signal received, unmounting {}…", args.mountpoint.display());
-        host.stop();
-        host.unmount();
-    }
-
-    info!("Unmounted, logging out");
+    info!("Logging out");
     rt.block_on(client.logout())?;
 
-    Ok(())
-}
-
-/// Start a local WebDAV server, then ask macOS Finder to mount it via
-/// AppleScript `mount volume`.  This works for regular users on any modern
-/// macOS version without root or kernel extensions.
-///
-/// The WebDAV server advertises the last path component of `mountpoint` as its
-/// `DAV:displayname`, which macOS Finder uses as the volume name.  The volume
-/// therefore appears at exactly the `/Volumes/<name>` path the user requested.
-#[cfg(target_os = "macos")]
-async fn serve_and_mount(
-    client: Arc<SynologyClient>,
-    mountpoint: &std::path::Path,
-) -> anyhow::Result<()> {
-    use std::convert::Infallible;
-
-    use dav_server::{fakels::FakeLs, DavHandler};
-    use hyper::server::conn::http1;
-    use hyper_util::rt::TokioIo;
-    use webdav::SynologyDavFs;
-
-    // Extract the desired volume name from the last component of the path
-    // (e.g. "/Volumes/nas" → "nas") and use it as a URL path prefix so that
-    // macOS names the mounted volume correctly.
-    let volume_name = mountpoint
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let path_prefix = format!("/{}", volume_name);
-
-    let handler = Arc::new(
-        DavHandler::builder()
-            .filesystem(Box::new(SynologyDavFs::new(client, path_prefix.clone())))
-            .locksystem(FakeLs::new())
-            .build_handler(),
-    );
-
-    // Bind to a kernel-assigned port on localhost.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    // Include the volume name as a path component so macOS uses it as the
-    // volume name when mounting (e.g. http://127.0.0.1:PORT/nas/ → /Volumes/nas).
-    let url = format!("http://127.0.0.1:{}{}/", port, path_prefix);
-
-    info!("WebDAV server listening on {}", url);
-
-    // Start the accept loop BEFORE calling osascript so that Finder's probe
-    // requests are answered immediately.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let handler_srv = handler.clone();
-    let server_task = tokio::spawn(async move {
-        let mut shutdown_rx = shutdown_rx;
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    let (stream, _addr) = match result {
-                        Ok(r) => r,
-                        Err(e) => { tracing::debug!("accept error: {}", e); break; }
-                    };
-                    let io = TokioIo::new(stream);
-                    let h = handler_srv.clone();
-                    tokio::spawn(async move {
-                        let svc = hyper::service::service_fn(move |req| {
-                            let h = h.clone();
-                            async move { Ok::<_, Infallible>(h.handle(req).await) }
-                        });
-                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                            tracing::debug!("WebDAV connection closed: {}", e);
-                        }
-                    });
-                }
-                _ = &mut shutdown_rx => {
-                    info!("WebDAV server shutting down");
-                    break;
-                }
-            }
-        }
-    });
-
-    // Remove a stale mount-point directory left over from a previous run.
-    // If the directory is actually still mounted this will fail (EBUSY/EPERM),
-    // which is fine — we leave it alone and let osascript fail with a clear message.
-    if mountpoint.is_dir() && !mountpoint.is_symlink() {
-        let _ = std::fs::remove_dir(mountpoint);
-    }
-
-    // Ask Finder to mount the volume via AppleScript.
-    let script = format!("mount volume \"{}\"", url);
-    let out = tokio::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .await?;
-
-    if !out.status.success() {
-        let _ = shutdown_tx.send(());
-        server_task.await.ok();
-        anyhow::bail!(
-            "osascript mount failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-
-    info!("Mounted at {}", mountpoint.display());
-
-    // Ctrl-C → unmount and stop serving.
-    let mp = mountpoint.to_path_buf();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("Signal received, unmounting {}…", mp.display());
-        let _ = tokio::process::Command::new("diskutil")
-            .args(["unmount", &mp.to_string_lossy()])
-            .status()
-            .await;
-        // macOS does not always remove the /Volumes/<name> directory after
-        // unmounting a WebDAV volume.  Remove it ourselves if it is now empty.
-        let _ = std::fs::remove_dir(&mp);
-        let _ = shutdown_tx.send(());
-    });
-
-    server_task.await.ok();
     Ok(())
 }

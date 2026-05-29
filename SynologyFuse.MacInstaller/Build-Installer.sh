@@ -139,10 +139,19 @@ echo "Assembling ${APP_NAME}.app..."
 # Copy all GUI publish output into MacOS/
 cp -R "${GUI_PUBLISH_DIR}/"* "${APP_CONTENTS}/MacOS/"
 
-# Place CLI binary beside the GUI executable so MountService.FindBinary()
-# finds it at the "deployed layout" path without needing PATH.
+# Place CLI binary beside the GUI executable (standalone terminal use).
 cp "${RUST_RELEASE_DIR}/${CLI_BINARY}" "${APP_CONTENTS}/MacOS/"
 chmod +x "${APP_CONTENTS}/MacOS/${CLI_BINARY}"
+
+# The GUI calls the Rust core directly through this native library; the
+# resolver in NativeMethods.cs finds it beside the GUI executable.
+FFI_LIB="libsynology_filestation_ffi.dylib"
+if [[ ! -f "${RUST_RELEASE_DIR}/${FFI_LIB}" ]]; then
+    echo "Error: FFI library not found at '${RUST_RELEASE_DIR}/${FFI_LIB}'." >&2
+    echo "Build it first: cargo build --release -p synology-filestation-ffi" >&2
+    exit 1
+fi
+cp "${RUST_RELEASE_DIR}/${FFI_LIB}" "${APP_CONTENTS}/MacOS/"
 chmod +x "${APP_CONTENTS}/MacOS/${GUI_BINARY}"
 
 # Convert PNG icon to .icns (skipped gracefully if iconutil or PNG unavailable)

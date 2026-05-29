@@ -41,13 +41,13 @@ jobs:
     # Python development headers on macOS/Windows runners just to compile
     # an extension we don't ship via this pipeline.
     - name: Clippy
-      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core --all-targets --all-features -- -D warnings
+      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build -p synology-filestation-fuse -p synology-filestation-core --verbose
+      run: cargo build -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
     - name: Run Rust tests
-      run: cargo test -p synology-filestation-fuse -p synology-filestation-core --verbose
+      run: cargo test -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
     - name: Build release (required for installer)
-      run: cargo build --release -p synology-filestation-fuse --verbose
+      run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
       uses: actions/setup-dotnet@v5
       with:
@@ -78,13 +78,13 @@ jobs:
     # Python development headers on macOS/Windows runners just to compile
     # an extension we don't ship via this pipeline.
     - name: Clippy
-      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core --all-targets --all-features -- -D warnings
+      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build -p synology-filestation-fuse -p synology-filestation-core --verbose
+      run: cargo build -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
     - name: Run Rust tests
-      run: cargo test -p synology-filestation-fuse -p synology-filestation-core --verbose
+      run: cargo test -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
     - name: Build release (required for installer)
-      run: cargo build --release -p synology-filestation-fuse --verbose
+      run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
       uses: actions/setup-dotnet@v5
       with:
@@ -119,13 +119,13 @@ jobs:
     # Python development headers on macOS/Windows runners just to compile
     # an extension we don't ship via this pipeline.
     - name: Clippy
-      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core --all-targets --all-features -- -D warnings
+      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build -p synology-filestation-fuse -p synology-filestation-core --verbose
+      run: cargo build -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
     - name: Run Rust tests
-      run: cargo test -p synology-filestation-fuse -p synology-filestation-core --verbose
+      run: cargo test -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
     - name: Build release (required for installer)
-      run: cargo build --release -p synology-filestation-fuse --verbose
+      run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
       uses: actions/setup-dotnet@v5
       with:

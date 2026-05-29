@@ -6,6 +6,10 @@ license = "MIT"
 description = "Cross-platform filesystem driver mounting Synology FileStation as a local directory."
 repository = "https://github.com/UCSD-E4E/synology-filestation"
 
+[lib]
+name = "synology_filestation_fuse"
+path = "src/lib.rs"
+
 [[bin]]
 name = "synology-filestation-fuse"
 path = "src/main.rs"
