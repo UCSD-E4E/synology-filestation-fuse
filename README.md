@@ -77,21 +77,22 @@ The repository ships a flake exposing both binaries as packages:
 | `synology-filestation-fuse` (also `default`) | The Rust CLI |
 | `synologyfuse-gui` | The .NET 10 / Avalonia desktop GUI |
 
-> **Install both if you use the GUI.** The GUI launches the CLI as a subprocess and resolves it via `PATH`, so `synologyfuse-gui` on its own cannot mount anything.
+The GUI launches the CLI as a subprocess, so the `synologyfuse-gui` package wraps its launcher with the CLI already on `PATH` — installing or running the GUI alone is enough to mount. Install `synology-filestation-fuse` as well if you also want the CLI available directly in your shell.
 
 ### Try it without installing
 
 ```bash
 nix run github:UCSD-E4E/synology-filestation          # CLI
-nix run github:UCSD-E4E/synology-filestation#gui       # GUI
+nix run github:UCSD-E4E/synology-filestation#gui       # GUI (bundles the CLI)
 ```
 
 ### Imperative (user profile)
 
 ```bash
+# GUI (self-contained), plus the CLI for direct shell use:
 nix profile install \
-  github:UCSD-E4E/synology-filestation#synology-filestation-fuse \
-  github:UCSD-E4E/synology-filestation#synologyfuse-gui
+  github:UCSD-E4E/synology-filestation#synologyfuse-gui \
+  github:UCSD-E4E/synology-filestation#synology-filestation-fuse
 ```
 
 ### Declarative (NixOS flake)

@@ -149,6 +149,15 @@
             selfContainedBuild = true;
             runtimeDeps = guiRuntimeDeps;
 
+            # The GUI shells out to the CLI, which MountService.FindBinary()
+            # resolves via PATH (the CLI is a separate derivation, so it is not
+            # beside the GUI binary). Put it on the launcher's PATH so the GUI is
+            # self-sufficient — `nix run .#gui` can mount without the user also
+            # installing synology-filestation-fuse separately.
+            makeWrapperArgs = [
+              "--prefix PATH : ${lib.makeBinPath [ synology-filestation-fuse ]}"
+            ];
+
             meta = {
               description = "Desktop GUI for the Synology FileStation filesystem driver";
               homepage = "https://github.com/UCSD-E4E/synology-filestation";
