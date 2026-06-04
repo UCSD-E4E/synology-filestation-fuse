@@ -522,7 +522,10 @@ pub unsafe extern "C" fn syno_download_to(
                 file.write_all(&bytes)
                     .map_err(|e| SynoFsError::Io(format!("write {}: {e}", part.display())))?;
                 offset += bytes.len() as u64;
-                report(progress, user_data, offset, total.max(offset));
+                // Report `total` as-is: 0 means "unknown" (the documented
+                // contract). Using total.max(offset) would make an unknown-size
+                // transfer report done == total every chunk, i.e. always 100%.
+                report(progress, user_data, offset, total);
                 // Stop at EOF: a short final chunk, or — when the size is known
                 // and is an exact multiple of the chunk — having read it all
                 // (avoids a spurious past-EOF range request).

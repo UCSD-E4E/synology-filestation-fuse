@@ -217,7 +217,11 @@ public sealed class SynoClient : IDisposable
     private static SynoFileInfo ParseObject(IntPtr json)
     {
         var s = TakeString(json);
-        return JsonSerializer.Deserialize<SynoFileInfo>(s, JsonOpts) ?? new SynoFileInfo();
+        // A successful native call always emits a real object; a null here means
+        // the FFI broke its contract, so fail fast rather than hand back an empty
+        // record that looks like a real (but blank) entry.
+        return JsonSerializer.Deserialize<SynoFileInfo>(s, JsonOpts)
+            ?? throw new SynoException(SynoStatus.Io, 0, "native returned malformed file-info JSON");
     }
 
     /// <summary>Copy a native string to managed and free the native buffer.</summary>

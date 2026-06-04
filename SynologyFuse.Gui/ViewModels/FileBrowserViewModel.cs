@@ -22,6 +22,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
 {
     private readonly MountConfig _config;
     private SynoClient? _client;
+    private bool _disposed;
 
     /// <summary>Path stack for breadcrumb navigation; "" denotes the shares root.</summary>
     private readonly Stack<string> _history = new();
@@ -81,8 +82,17 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         Status = "Connecting…";
         try
         {
-            _client = await Task.Run(() => SynoClient.Connect(
+            var client = await Task.Run(() => SynoClient.Connect(
                 _config.Host, _config.Port, _config.UseHttps, _config.Username, _config.Password, otp));
+            // If the window was closed (Dispose ran) while the login was in
+            // flight, the handle would otherwise leak — dispose it and bail.
+            // The await resumed on the UI thread, so this can't race Dispose().
+            if (_disposed)
+            {
+                client.Dispose();
+                return;
+            }
+            _client = client;
             ShowOtpPrompt = false;
             OnPropertyChanged(nameof(IsConnected));
             await LoadAsync("");
@@ -247,5 +257,10 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         return $"{v:0.#} {units[u]}";
     }
 
-    public void Dispose() => _client?.Dispose();
+    public void Dispose()
+    {
+        _disposed = true;
+        _client?.Dispose();
+        _client = null;
+    }
 }
