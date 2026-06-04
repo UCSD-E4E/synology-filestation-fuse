@@ -451,7 +451,7 @@ pub fn spawn_mount(
     let worker = std::thread::Builder::new()
         .name("synofs-winfsp".to_string())
         .spawn(move || {
-            use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
+            use winfsp::host::{FileSystemHost, FileSystemParams, FineGuard, VolumeParams};
 
             let init = match winfsp::winfsp_init() {
                 Ok(i) => i,
@@ -485,14 +485,20 @@ pub fn spawn_mount(
 
             let fs_params = FileSystemParams::default_params(volume_params);
             let fs_ctx = winfs::SynologyWinFs::new(worker_client, rt.clone());
-            let mut host = match FileSystemHost::new_with_options(fs_params, fs_ctx) {
-                Ok(h) => h,
-                Err(e) => {
-                    let _ =
-                        ready_tx.send(Err(format!("Failed to create WinFsp filesystem ({e:?})")));
-                    return;
-                }
-            };
+            // winfsp 0.13 made FileSystemHost generic over an operation-guard
+            // strategy and split start() across the FineGuard/CoarseGuard impls,
+            // so the guard must be named to disambiguate. FineGuard (the default)
+            // dispatches callbacks concurrently — matching 0.12's behaviour — and
+            // both SynologyWinFs and its FileContext are Sync, as it requires.
+            let mut host: FileSystemHost<winfs::SynologyWinFs, FineGuard> =
+                match FileSystemHost::new_with_options(fs_params, fs_ctx) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = ready_tx
+                            .send(Err(format!("Failed to create WinFsp filesystem ({e:?})")));
+                        return;
+                    }
+                };
             if let Err(e) = host.mount(&worker_mp) {
                 let _ = ready_tx.send(Err(format!(
                     "Failed to mount on {} ({e:?}): ensure the drive letter is not already in use",
