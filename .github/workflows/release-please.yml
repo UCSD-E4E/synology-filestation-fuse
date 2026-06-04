@@ -48,8 +48,8 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
-      - name: Build release CLI
-        run: cargo build --release -p synology-filestation-fuse
+      - name: Build release CLI + FFI library
+        run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v5
         with:
@@ -72,8 +72,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Build release CLI
-        run: cargo build --release -p synology-filestation-fuse
+      - name: Build release CLI + FFI library
+        run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v5
         with:
@@ -100,8 +100,8 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
       - name: Install WinFsp
         run: choco install winfsp
-      - name: Build release CLI
-        run: cargo build --release -p synology-filestation-fuse
+      - name: Build release CLI + FFI library
+        run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v5
         with:
