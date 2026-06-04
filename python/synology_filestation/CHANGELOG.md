@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.20](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.1.19...synology_filestation-v0.1.20) (2026-06-04)
+
+
+### Features
+
+* GUI calls the Rust core directly via a native FFI binding ([603e47d](https://github.com/UCSD-E4E/synology-filestation/commit/603e47de958a787974c387d1e98e28688344b30b))
+
+
+### Bug Fixes
+
+* address code-review findings (correctness, cleanup, altitude) ([7631694](https://github.com/UCSD-E4E/synology-filestation/commit/763169458a7e11041726c29a5941b04bbaa84bce))
+
 ## [0.1.19](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.1.18...synology_filestation-v0.1.19) (2026-05-07)
 
 
