@@ -124,6 +124,9 @@ public sealed class SynoClient : IDisposable
     /// Returns once the mount is established (or throws on failure).</summary>
     public void Mount(string mountpoint, ulong cacheTtl, ulong readCacheMb)
     {
+        // Tear down any prior mount first so a second Mount() can't orphan the
+        // previous native SynoMount (and its background worker / runtime).
+        Unmount();
         var err = default(NativeError);
         int rc = syno_mount(_client, mountpoint, cacheTtl, readCacheMb, out var mount, ref err);
         Check(rc, ref err);
@@ -152,8 +155,11 @@ public sealed class SynoClient : IDisposable
         NativeMethods.EnsureResolver();
         if (onLine is null)
         {
-            _logKeepAlive = null;
+            // Tell native to stop calling FIRST, then drop the managed delegate —
+            // otherwise a log line dispatched on a Tokio thread in the gap could
+            // invoke a GC-collected delegate.
             syno_set_log_callback(IntPtr.Zero, IntPtr.Zero);
+            _logKeepAlive = null;
             return;
         }
         _logKeepAlive = (level, line, _) =>
@@ -171,6 +177,13 @@ public sealed class SynoClient : IDisposable
             }
         };
         syno_set_log_callback(Marshal.GetFunctionPointerForDelegate(_logKeepAlive), IntPtr.Zero);
+    }
+
+    /// <summary>Set native log verbosity ("error"/"warn"/"info"/"debug"/"trace").</summary>
+    public static void SetLogLevel(string level)
+    {
+        NativeMethods.EnsureResolver();
+        syno_set_log_level(level);
     }
 
     // ── Dispose ────────────────────────────────────────────────────────────────

@@ -276,34 +276,27 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
             ProgressMax = total > 0 ? total : Math.Max(done, 1);
             ProgressValue = done;
             ProgressText = total > 0
-                ? $"{Bytes(done)} / {Bytes(total)}"
-                : Bytes(done);
+                ? $"{BrowserConverters.HumanSize(done)} / {BrowserConverters.HumanSize(total)}"
+                : BrowserConverters.HumanSize(done);
         });
-
-    private static string Bytes(long n)
-    {
-        string[] units = ["B", "KiB", "MiB", "GiB", "TiB"];
-        double v = n;
-        int u = 0;
-        while (v >= 1024 && u < units.Length - 1) { v /= 1024; u++; }
-        return $"{v:0.#} {units[u]}";
-    }
 
     public void Dispose()
     {
         _disposed = true;
-        // Block until any in-flight native op (which holds the gate on a worker
-        // thread) finishes, so we never free the handle mid-P/Invoke. The gate
-        // is released off the UI thread, so this Wait can't deadlock.
-        _gate.Wait();
-        try
+        var client = _client;
+        _client = null; // new GatedAsync calls now see null and bail
+        if (client is null) return;
+
+        // Free the handle off the UI thread: wait for any in-flight native op
+        // (which holds the gate on a worker thread) to finish, THEN dispose.
+        // Doing this on a background task keeps the window from freezing when
+        // it's closed mid-transfer, while the gate still prevents a
+        // dispose-during-P/Invoke use-after-free.
+        Task.Run(() =>
         {
-            _client?.Dispose();
-            _client = null;
-        }
-        finally
-        {
-            _gate.Release();
-        }
+            _gate.Wait();
+            try { client.Dispose(); }
+            finally { _gate.Release(); }
+        });
     }
 }

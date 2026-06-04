@@ -21,49 +21,87 @@ pub enum SynoFsError {
     LoginFailed(Box<SynoFsError>),
 }
 
+/// Platform-agnostic classification of a Synology error. This is the **single
+/// source of truth** every binding derives from: the FUSE errno map (below),
+/// the FFI status codes (`synology-filestation-ffi`), and the PyO3 exception
+/// hierarchy (`python/synology_filestation`) all map *from* `ErrorCategory`, so
+/// a DSM code lands in the same place across all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCategory {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    NotEmpty,
+    InvalidArg,
+    NoSpace,
+    NotSupported,
+    /// DSM session id expired or unknown (code 119).
+    SidExpired,
+    /// System too busy / try again (code 402).
+    Busy,
+    /// Network/transport/parse failure with no DSM code.
+    Transport,
+    /// A DSM code with no more specific mapping.
+    Other,
+}
+
+/// Canonical map from a raw DSM/FileStation API error code to a category.
+pub fn dsm_code_to_category(code: u32) -> ErrorCategory {
+    match code {
+        400 => ErrorCategory::InvalidArg,              // Invalid parameter
+        402 => ErrorCategory::Busy,                    // System too busy
+        403 | 414 | 415 => ErrorCategory::NotFound,    // Invalid path / no such file or folder
+        408 | 1805 => ErrorCategory::PermissionDenied, // No permission (list / upload)
+        416 => ErrorCategory::NotEmpty,                // Directory not empty
+        418 | 1101 => ErrorCategory::AlreadyExists,    // Already exists (entry / folder)
+        419 | 1804 => ErrorCategory::NoSpace,          // Not enough quota
+        119 => ErrorCategory::SidExpired, // Session id expired / insufficient privilege
+        // 401 (unknown), 404 (indexing disabled), 1100 (create failed),
+        // 1800 (upload failed), and anything unrecognised fall through.
+        _ => ErrorCategory::Other,
+    }
+}
+
 impl SynoFsError {
+    /// The platform-agnostic [`ErrorCategory`] of this error.
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::NotFound => ErrorCategory::NotFound,
+            Self::PermissionDenied => ErrorCategory::PermissionDenied,
+            Self::AlreadyExists => ErrorCategory::AlreadyExists,
+            Self::NotEmpty => ErrorCategory::NotEmpty,
+            Self::InvalidArg => ErrorCategory::InvalidArg,
+            Self::NoSpace => ErrorCategory::NoSpace,
+            Self::NotSupported => ErrorCategory::NotSupported,
+            Self::Io(_) => ErrorCategory::Transport,
+            Self::ApiError(code) => dsm_code_to_category(*code),
+            Self::LoginFailed(inner) => inner.category(),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub fn to_errno(&self) -> i32 {
-        match self {
-            Self::NotFound => ENOENT,
-            Self::PermissionDenied => EACCES,
-            Self::AlreadyExists => EEXIST,
-            Self::NotEmpty => ENOTEMPTY,
-            Self::InvalidArg => EINVAL,
-            Self::NoSpace => ENOSPC,
-            Self::NotSupported => ENOSYS,
-            Self::Io(_) => EIO,
-            Self::ApiError(code) => syno_code_to_errno(*code),
-            Self::LoginFailed(_) => EACCES,
+        // A failed (re)login is always a permission/auth problem to the kernel,
+        // regardless of the inner DSM code.
+        if matches!(self, Self::LoginFailed(_)) {
+            return EACCES;
         }
+        category_to_errno(self.category())
     }
 }
 
 #[cfg(target_os = "linux")]
-fn syno_code_to_errno(code: u32) -> i32 {
-    match code {
-        // Common FileStation errors
-        400 => EINVAL,    // Invalid parameter
-        401 => EIO,       // Unknown error
-        402 => EAGAIN,    // System too busy
-        403 => ENOENT,    // Invalid path
-        404 => EIO,       // File indexing disabled
-        408 => EACCES,    // No permission
-        414 => ENOENT,    // No such file
-        415 => ENOENT,    // No such folder
-        416 => ENOTEMPTY, // Directory not empty
-        418 => EEXIST,    // Already exists
-        419 => ENOSPC,    // Not enough quota
-        // CreateFolder-specific errors
-        1100 => EIO,    // Failed to create folder
-        1101 => EEXIST, // Folder already exists
-        // Generic session/privilege errors
-        119 => EACCES, // Insufficient privilege / session does not have write access
-        // Upload-specific errors
-        1800 => EIO,    // Upload failed
-        1804 => ENOSPC, // Not enough quota
-        1805 => EACCES, // No permission to upload
-        _ => EIO,
+fn category_to_errno(category: ErrorCategory) -> i32 {
+    match category {
+        ErrorCategory::NotFound => ENOENT,
+        ErrorCategory::PermissionDenied | ErrorCategory::SidExpired => EACCES,
+        ErrorCategory::AlreadyExists => EEXIST,
+        ErrorCategory::NotEmpty => ENOTEMPTY,
+        ErrorCategory::InvalidArg => EINVAL,
+        ErrorCategory::NoSpace => ENOSPC,
+        ErrorCategory::NotSupported => ENOSYS,
+        ErrorCategory::Busy => EAGAIN,
+        ErrorCategory::Transport | ErrorCategory::Other => EIO,
     }
 }
 
@@ -121,6 +159,29 @@ mod display_tests {
         assert_eq!(
             SynoFsError::ApiError(408).to_string(),
             "Synology API error 408"
+        );
+    }
+
+    #[test]
+    fn dsm_codes_map_to_expected_categories() {
+        // The single source of truth shared by errno / FFI / PyO3. 119 in
+        // particular must be SidExpired so all three bindings agree.
+        assert_eq!(dsm_code_to_category(119), ErrorCategory::SidExpired);
+        assert_eq!(dsm_code_to_category(400), ErrorCategory::InvalidArg);
+        assert_eq!(dsm_code_to_category(402), ErrorCategory::Busy);
+        assert_eq!(dsm_code_to_category(403), ErrorCategory::NotFound);
+        assert_eq!(dsm_code_to_category(408), ErrorCategory::PermissionDenied);
+        assert_eq!(dsm_code_to_category(416), ErrorCategory::NotEmpty);
+        assert_eq!(dsm_code_to_category(418), ErrorCategory::AlreadyExists);
+        assert_eq!(dsm_code_to_category(419), ErrorCategory::NoSpace);
+        assert_eq!(dsm_code_to_category(9999), ErrorCategory::Other);
+        assert_eq!(
+            SynoFsError::ApiError(119).category(),
+            ErrorCategory::SidExpired
+        );
+        assert_eq!(
+            SynoFsError::NotSupported.category(),
+            ErrorCategory::NotSupported
         );
     }
 

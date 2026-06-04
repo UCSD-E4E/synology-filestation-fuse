@@ -17,6 +17,7 @@ namespace SynologyFuse.Gui.Services;
 public sealed class MountService : IDisposable
 {
     private SynoClient? _client;
+    private bool _disposed;
 
     /// <summary>Raised for each log line emitted by the native library.
     /// May fire on a background thread — marshal to the UI thread in handlers.</summary>
@@ -41,35 +42,49 @@ public sealed class MountService : IDisposable
             throw new InvalidOperationException("Already mounted.");
 
         var mountpoint = ExpandPath(config.Mountpoint);
+        SynoClient.SetLogLevel(config.LogLevel);
 
-        _client = await Task.Run(() =>
+        var client = await Task.Run(() =>
         {
-            var client = SynoClient.Connect(
+            var c = SynoClient.Connect(
                 config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp);
             try
             {
-                client.Mount(mountpoint, config.CacheTtl, config.ReadCacheMb);
+                c.Mount(mountpoint, config.CacheTtl, config.ReadCacheMb);
             }
             catch
             {
-                client.Dispose();
+                c.Dispose();
                 throw;
             }
-            return client;
+            return c;
         });
+
+        // If Dispose() ran (app shutdown) while connect+mount was in flight,
+        // tear the freshly-built client down instead of leaking it. The await
+        // resumed on the UI thread, so this can't race Dispose().
+        if (_disposed)
+        {
+            client.Dispose();
+            return;
+        }
+        _client = client;
     }
 
     /// <summary>
     /// Validate credentials by logging in and straight back out — no mount.
     /// Same exception contract as <see cref="ConnectAndMountAsync"/>.
     /// </summary>
-    public Task TestConnectionAsync(MountConfig config, string? otp = null) =>
-        Task.Run(() =>
+    public Task TestConnectionAsync(MountConfig config, string? otp = null)
+    {
+        SynoClient.SetLogLevel(config.LogLevel);
+        return Task.Run(() =>
         {
             using var client = SynoClient.Connect(
                 config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp);
             // Dispose logs out immediately; reaching here means success.
         });
+    }
 
     /// <summary>Unmount and log out, if connected.</summary>
     public void Stop()
@@ -80,6 +95,7 @@ public sealed class MountService : IDisposable
 
     public void Dispose()
     {
+        _disposed = true;
         Stop();
         SynoClient.SetLogCallback(null);
     }

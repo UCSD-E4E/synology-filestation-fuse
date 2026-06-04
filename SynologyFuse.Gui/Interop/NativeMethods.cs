@@ -35,6 +35,7 @@ internal static partial class NativeMethods
         OtpRequired = 11,
         NullArg = 12,
         Panic = 13,
+        SidNotFound = 14,
     }
 
     /// <summary>Blittable mirror of the Rust <c>SynoError</c> struct.</summary>
@@ -118,6 +119,9 @@ internal static partial class NativeMethods
 
     [LibraryImport(Lib)]
     internal static partial void syno_set_log_callback(IntPtr cb, IntPtr userData);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial void syno_set_log_level(string level);
 
     // ── Native library resolution ──────────────────────────────────────────────
 

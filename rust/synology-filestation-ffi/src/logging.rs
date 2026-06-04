@@ -11,6 +11,9 @@ use std::io::{self, Write};
 use std::os::raw::c_char;
 use std::sync::{Mutex, Once, OnceLock};
 
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::{fmt, prelude::*, reload, Registry};
+
 /// C callback signature: `(level, line, user_data)`. `level` mirrors the
 /// `tracing::Level` ordering (1=ERROR … 5=TRACE); `line` is a NUL-terminated
 /// UTF-8 string valid only for the duration of the call.
@@ -30,9 +33,31 @@ unsafe impl Send for Sink {}
 
 static SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 static INIT: Once = Once::new();
+/// Handle to the reloadable level filter, so `set_level` can change verbosity
+/// after the subscriber is installed.
+static RELOAD: OnceLock<reload::Handle<LevelFilter, Registry>> = OnceLock::new();
 
 fn sink() -> &'static Mutex<Option<Sink>> {
     SINK.get_or_init(|| Mutex::new(None))
+}
+
+fn parse_level(level: &str) -> LevelFilter {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "error" => LevelFilter::ERROR,
+        "warn" => LevelFilter::WARN,
+        "info" => LevelFilter::INFO,
+        "debug" => LevelFilter::DEBUG,
+        "trace" => LevelFilter::TRACE,
+        _ => LevelFilter::INFO,
+    }
+}
+
+/// Change the active log verbosity. No-op until the subscriber is installed
+/// (the GUI registers a callback at startup, before any connect).
+pub fn set_level(level: &str) {
+    if let Some(handle) = RELOAD.get() {
+        let _ = handle.reload(parse_level(level));
+    }
 }
 
 /// Register (or, with `cb == None`, clear) the log callback, installing the
@@ -49,13 +74,14 @@ pub unsafe fn set_callback(cb: Option<LogCb>, user_data: *mut c_void) {
         });
     }
     INIT.call_once(|| {
-        // INFO-and-above by default; the GUI doesn't need DEBUG/TRACE spam in
-        // its log pane. (We avoid the `env-filter` feature to keep the cdylib
-        // lean — a static max level is all the GUI needs.)
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .with_writer(|| CallbackWriter)
+        // INFO by default, reloadable via `set_level` so the GUI's log-level
+        // control actually takes effect. Build the reload handle first so it is
+        // available even if `try_init` later loses the global-default race.
+        let (filter, handle) = reload::Layer::new(LevelFilter::INFO);
+        let _ = RELOAD.set(handle);
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().with_ansi(false).with_writer(|| CallbackWriter))
             .try_init();
     });
 }
@@ -84,18 +110,21 @@ impl Write for CallbackWriter {
 }
 
 fn level_of(line: &str) -> i32 {
-    // The fmt layer prints e.g. "...  INFO synology...: message".
-    if line.contains("ERROR") {
-        1
-    } else if line.contains(" WARN") {
-        2
-    } else if line.contains(" INFO") {
-        3
-    } else if line.contains("DEBUG") {
-        4
-    } else {
-        5
+    // The fmt layer prints "<timestamp> <LEVEL> <target>: <message>". The level
+    // is the first whitespace-delimited token that exactly equals a level name;
+    // returning on the first exact match means message text containing the word
+    // "ERROR"/"DEBUG" (which comes after the level) can't misclassify the line.
+    for tok in line.split_whitespace() {
+        match tok {
+            "ERROR" => return 1,
+            "WARN" => return 2,
+            "INFO" => return 3,
+            "DEBUG" => return 4,
+            "TRACE" => return 5,
+            _ => {}
+        }
     }
+    3 // default to INFO if no level token is found
 }
 
 fn dispatch(line: &str) {

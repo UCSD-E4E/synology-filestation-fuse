@@ -52,6 +52,8 @@ pub enum SynoStatus {
     NullArg = 12,
     /// A panic was caught at the FFI boundary.
     Panic = 13,
+    /// DSM session id expired or unknown (DSM code 119).
+    SidNotFound = 14,
 }
 
 /// Out-param filled on error. `message` is a heap UTF-8 C string owned by the
@@ -64,40 +66,42 @@ pub struct SynoError {
     pub message: *mut c_char,
 }
 
-/// Map a core error to (typed status, raw DSM code). Mirrors the PyO3
-/// `synofs_to_pyerr` routing so the GUI sees the same classes the Python
-/// bindings expose.
+/// Map a core error to (typed status, raw DSM code). Both this and the PyO3
+/// exception mapping derive from the core's shared [`ErrorCategory`], so the
+/// GUI and the Python bindings classify every DSM code identically.
 fn classify(err: &SynoFsError) -> (SynoStatus, u32) {
+    use synology_filestation_core::error::ErrorCategory as C;
     use SynoStatus as S;
-    match err {
-        SynoFsError::NotFound => (S::NotFound, 0),
-        SynoFsError::PermissionDenied => (S::PermissionDenied, 0),
-        SynoFsError::AlreadyExists => (S::AlreadyExists, 0),
-        SynoFsError::NotEmpty => (S::NotEmpty, 0),
-        SynoFsError::InvalidArg => (S::InvalidArg, 0),
-        SynoFsError::NoSpace => (S::NoSpace, 0),
-        SynoFsError::NotSupported => (S::NotSupported, 0),
-        SynoFsError::Io(_) => (S::Io, 0),
-        SynoFsError::LoginFailed(inner) => {
-            let code = match inner.as_ref() {
-                SynoFsError::ApiError(c) => *c,
-                _ => 0,
-            };
-            (S::LoginFailed, code)
-        }
-        SynoFsError::ApiError(c) => {
-            let s = match *c {
-                400 => S::InvalidArg,
-                403 | 414 | 415 => S::NotFound,
-                408 | 1805 => S::PermissionDenied,
-                416 => S::NotEmpty,
-                418 | 1101 => S::AlreadyExists,
-                419 | 1804 => S::NoSpace,
-                _ => S::Api,
-            };
-            (s, *c)
-        }
+
+    // A failed (re)login always presents as LoginFailed, but we preserve the
+    // underlying DSM code on `dsm_code` so callers can inspect what failed.
+    if let SynoFsError::LoginFailed(inner) = err {
+        let code = match inner.as_ref() {
+            SynoFsError::ApiError(c) => *c,
+            _ => 0,
+        };
+        return (S::LoginFailed, code);
     }
+
+    let dsm = match err {
+        SynoFsError::ApiError(c) => *c,
+        _ => 0,
+    };
+    let status = match err.category() {
+        C::NotFound => S::NotFound,
+        C::PermissionDenied => S::PermissionDenied,
+        C::AlreadyExists => S::AlreadyExists,
+        C::NotEmpty => S::NotEmpty,
+        C::InvalidArg => S::InvalidArg,
+        C::NoSpace => S::NoSpace,
+        C::NotSupported => S::NotSupported,
+        C::SidExpired => S::SidNotFound,
+        C::Transport => S::Io,
+        // No dedicated FFI status for "busy"; surface as a generic API error
+        // (the raw DSM code is still on `dsm_code`).
+        C::Busy | C::Other => S::Api,
+    };
+    (status, dsm)
 }
 
 /// Write a status + message into `*err` (if non-null) and return the status as
@@ -261,12 +265,21 @@ pub unsafe extern "C" fn syno_connect(
             return set_err(err, SynoStatus::NullArg, 0, "out pointer must not be null");
         }
 
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        let client = if auto_relogin {
+            SynologyClient::with_auto_relogin(host, port, https)
+        } else {
+            SynologyClient::new(host, port, https)
+        };
+
+        // Attempt login on a cheap current-thread runtime that spawns no worker
+        // threads. Only on success do we build the persistent multi-thread
+        // runtime the client/mount will use — so a wrong password or an
+        // OTP-required first call doesn't churn OS threads per attempt.
+        let probe_rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
-            Ok(rt) => Arc::new(rt),
+            Ok(rt) => rt,
             Err(e) => {
                 return set_err(
                     err,
@@ -277,14 +290,24 @@ pub unsafe extern "C" fn syno_connect(
             }
         };
 
-        let client = if auto_relogin {
-            SynologyClient::with_auto_relogin(host, port, https)
-        } else {
-            SynologyClient::new(host, port, https)
-        };
-
-        match runtime.block_on(client.login(username, password, otp)) {
+        match probe_rt.block_on(client.login(username, password, otp)) {
             Ok(()) => {
+                drop(probe_rt);
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => Arc::new(rt),
+                    Err(e) => {
+                        return set_err(
+                            err,
+                            SynoStatus::Io,
+                            0,
+                            &format!("failed to start runtime: {e}"),
+                        )
+                    }
+                };
                 let handle = Box::new(SynoClient {
                     inner: Arc::new(client),
                     runtime,
@@ -493,8 +516,14 @@ pub unsafe extern "C" fn syno_download_to(
         let inner = c.inner.clone();
 
         // Stream into a `.part` sidecar, renamed on success for atomicity.
-        // Computed out here so failure paths can clean it up (see below).
-        let part = local.with_extension("part");
+        // Append (rather than replace the extension) so `a.txt` and `a.csv`
+        // get distinct sidecars and we never collide with an unrelated
+        // `<stem>.part`. Computed out here so failure paths can clean it up.
+        let part = {
+            let mut p = local.clone().into_os_string();
+            p.push(".syno-part");
+            PathBuf::from(p)
+        };
 
         let result: Result<(), SynoFsError> = c.runtime.block_on(async {
             use std::io::Write as _;
@@ -786,6 +815,18 @@ pub unsafe extern "C" fn syno_set_log_callback(cb: Option<logging::LogCb>, user_
     }));
 }
 
+/// Set the log verbosity: one of "error", "warn", "info", "debug", "trace"
+/// (anything else falls back to "info"). No-op until a callback is registered.
+///
+/// # Safety
+/// `level` must be a valid NUL-terminated UTF-8 string, or null (treated as "info").
+#[no_mangle]
+pub unsafe extern "C" fn syno_set_log_level(level: *const c_char) {
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        logging::set_level(opt_str(level).unwrap_or("info"));
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,6 +999,54 @@ mod tests {
             assert_eq!(rc, SynoStatus::LoginFailed as i32);
             assert_eq!(err.dsm_code, 400, "DSM code preserved on `.dsm_code`");
             syno_string_free(err.message);
+        }
+    }
+
+    #[test]
+    fn dsm_119_classifies_as_sid_not_found() {
+        let (_rt, server) = server_with(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/webapi/auth.cgi"))
+                .respond_with(login_ok())
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/webapi/entry.cgi"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": false, "error": {"code": 119}
+                })))
+                .mount(&server)
+                .await;
+            server
+        });
+
+        unsafe {
+            let (host, port) = host_port(&server);
+            let mut client: *mut SynoClient = ptr::null_mut();
+            let mut err = empty_err();
+            // auto_relogin = false so the 119 surfaces instead of triggering a retry.
+            let rc = syno_connect(
+                host.as_ptr(),
+                port,
+                false,
+                cstr("alice").as_ptr(),
+                cstr("secret").as_ptr(),
+                ptr::null(),
+                false,
+                &mut client,
+                &mut err,
+            );
+            assert_eq!(rc, SynoStatus::Ok as i32, "connect: {}", err_message(&err));
+
+            let mut out_json: *mut c_char = ptr::null_mut();
+            let rc = syno_list_dir(client, cstr("/home").as_ptr(), &mut out_json, &mut err);
+            assert_eq!(rc, SynoStatus::SidNotFound as i32);
+            assert_eq!(err.dsm_code, 119);
+
+            syno_string_free(err.message);
+            syno_logout(client);
+            syno_client_free(client);
         }
     }
 
