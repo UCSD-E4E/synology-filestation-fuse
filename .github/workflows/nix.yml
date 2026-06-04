@@ -18,7 +18,7 @@ jobs:
     # Caches /nix/store across runs (keyed on the flake lockfile) so the heavy
     # Rust + .NET builds only run from scratch when inputs change.
     - name: Cache Nix store
-      uses: nix-community/cache-nix-action@v6
+      uses: nix-community/cache-nix-action@v7
       with:
         primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/deps.json') }}
         restore-prefixes-first-match: nix-${{ runner.os }}-
