@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -23,6 +24,12 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     private readonly MountConfig _config;
     private SynoClient? _client;
     private bool _disposed;
+
+    // Serializes every native call against Dispose() so the handle is never
+    // freed while a P/Invoke is in flight. The gate is taken and released on
+    // the worker thread inside Task.Run (never the UI thread), so Dispose() can
+    // block on it without risking a deadlock.
+    private readonly SemaphoreSlim _gate = new(1, 1);
 
     /// <summary>Path stack for breadcrumb navigation; "" denotes the shares root.</summary>
     private readonly Stack<string> _history = new();
@@ -132,9 +139,8 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         Status = path.Length == 0 ? "Loading shares…" : $"Loading {path}…";
         try
         {
-            var client = _client;
-            var entries = await Task.Run(() =>
-                path.Length == 0 ? client.ListShares() : client.ListDir(path));
+            var entries = await GatedAsync(c => path.Length == 0 ? c.ListShares() : c.ListDir(path));
+            if (entries is null) return; // client was disposed mid-call
 
             Items.Clear();
             foreach (var e in entries) Items.Add(e);
@@ -214,7 +220,6 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     private async Task RunWithProgressAsync(string status, Action<SynoClient> op)
     {
         if (_client is null) return;
-        var client = _client;
         IsBusy = true;
         ShowProgress = true;
         ProgressValue = 0;
@@ -223,7 +228,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         Status = status;
         try
         {
-            await Task.Run(() => op(client));
+            await GatedAsync(op);
             Status = "Done";
         }
         catch (Exception ex)
@@ -236,6 +241,33 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
             IsBusy = false;
         }
     }
+
+    /// <summary>Run a native call that returns a value under the gate, on a
+    /// worker thread. Returns null if the client was disposed.</summary>
+    private Task<T?> GatedAsync<T>(Func<SynoClient, T> op) where T : class =>
+        Task.Run<T?>(() =>
+        {
+            _gate.Wait();
+            try
+            {
+                var c = _client;
+                return c is null ? null : op(c);
+            }
+            finally { _gate.Release(); }
+        });
+
+    /// <summary>Run a native call with no return value under the gate.</summary>
+    private Task GatedAsync(Action<SynoClient> op) =>
+        Task.Run(() =>
+        {
+            _gate.Wait();
+            try
+            {
+                var c = _client;
+                if (c is not null) op(c);
+            }
+            finally { _gate.Release(); }
+        });
 
     // Marshals native-thread progress callbacks onto the UI thread.
     private void ReportProgress(long done, long total) =>
@@ -260,7 +292,18 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         _disposed = true;
-        _client?.Dispose();
-        _client = null;
+        // Block until any in-flight native op (which holds the gate on a worker
+        // thread) finishes, so we never free the handle mid-P/Invoke. The gate
+        // is released off the UI thread, so this Wait can't deadlock.
+        _gate.Wait();
+        try
+        {
+            _client?.Dispose();
+            _client = null;
+        }
+        finally
+        {
+            _gate.Release();
+        }
     }
 }

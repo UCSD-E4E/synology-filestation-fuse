@@ -57,23 +57,27 @@ pub fn is_otp_required(e: &SynoFsError) -> bool {
     matches!(e, SynoFsError::ApiError(403 | 404))
 }
 
-/// A live mount. Dropping or calling [`MountHandle::stop`] unmounts the
-/// filesystem and joins the background worker. The handle keeps the Tokio
-/// runtime handle and client alive for the lifetime of the mount.
+/// A live mount. Dropping the handle — or calling [`MountHandle::stop`], which
+/// is just an explicit drop — unmounts the filesystem and joins the background
+/// worker (the real work lives in `impl Drop for PlatformMount`, per platform).
+/// The handle keeps the Tokio runtime handle and client alive for the lifetime
+/// of the mount.
 pub struct MountHandle {
     // The client is held so the session's strong reference outlives the caller
     // dropping theirs; the FUSE/WebDAV/WinFsp callbacks all clone from it.
     #[allow(dead_code)]
     client: Arc<SynologyClient>,
+    #[allow(dead_code)]
     inner: PlatformMount,
 }
 
 impl MountHandle {
     /// Unmount the filesystem and wait for the background worker to finish.
-    /// Errors during unmount are logged and swallowed — there is nothing the
-    /// caller can usefully do, and a best-effort unmount is the right contract.
+    /// Equivalent to dropping the handle; provided as an explicit, readable
+    /// call site. Errors during unmount are logged and swallowed — a
+    /// best-effort unmount is the right contract.
     pub fn stop(self) {
-        self.inner.stop();
+        // Cleanup happens in `PlatformMount`'s `Drop` as `self` goes out of scope.
     }
 }
 
@@ -85,8 +89,8 @@ struct PlatformMount {
 }
 
 #[cfg(target_os = "linux")]
-impl PlatformMount {
-    fn stop(mut self) {
+impl Drop for PlatformMount {
+    fn drop(&mut self) {
         if let Some(session) = self.session.take() {
             if let Err(e) = session.umount_and_join() {
                 tracing::warn!("error during unmount: {e}");
@@ -194,8 +198,8 @@ struct PlatformMount {
 }
 
 #[cfg(target_os = "macos")]
-impl PlatformMount {
-    fn stop(mut self) {
+impl Drop for PlatformMount {
+    fn drop(&mut self) {
         use tracing::info;
         info!("Unmounting {}…", self.mountpoint.display());
         let mp = self.mountpoint.clone();
@@ -390,8 +394,8 @@ struct PlatformMount {
 }
 
 #[cfg(target_os = "windows")]
-impl PlatformMount {
-    fn stop(mut self) {
+impl Drop for PlatformMount {
+    fn drop(&mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
