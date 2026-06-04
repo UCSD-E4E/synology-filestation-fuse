@@ -238,7 +238,7 @@ dotnet publish SynologyFuse.Gui -c Release -r osx-x64 -p:SelfContained=true
 dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
 ```
 
-Output goes to `SynologyFuse.Gui/bin/Release/net10.0/<rid>/publish/`. The GUI calls the Rust core through the native FFI library (`libsynology_filestation_ffi.{so,dylib}` / `synology_filestation_ffi.dll`); build it with `cargo build --release -p synology-filestation-ffi` and place it beside the GUI executable. The resolver searches: beside the GUI (deployed layout), then `target/{release,debug}/` relative to the repo root (development layout), then the `SYNOFS_NATIVE_DIR` environment variable. The platform installers bundle the library automatically.
+Output goes to `SynologyFuse.Gui/bin/Release/net10.0/<rid>/publish/`. The GUI calls the Rust core through the native FFI library (`libsynology_filestation_ffi.{so,dylib}` / `synology_filestation_ffi.dll`); build it with `cargo build --release -p synology-filestation-ffi` and place it beside the GUI executable. The resolver searches, in order: the `SYNOFS_NATIVE_DIR` environment variable (explicit override), then beside the GUI (deployed layout), then `target/{release,debug}/` relative to the repo root (development layout). The platform installers bundle the library automatically.
 
 ### Building the installer
 

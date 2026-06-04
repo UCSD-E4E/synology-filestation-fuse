@@ -158,8 +158,17 @@ public sealed class SynoClient : IDisposable
         }
         _logKeepAlive = (level, line, _) =>
         {
-            var text = line != IntPtr.Zero ? Marshal.PtrToStringUTF8(line) ?? "" : "";
-            onLine(level, text);
+            // This runs as an unmanaged callback — an exception escaping here
+            // would tear down the process. Swallow anything a subscriber throws.
+            try
+            {
+                var text = line != IntPtr.Zero ? Marshal.PtrToStringUTF8(line) ?? "" : "";
+                onLine(level, text);
+            }
+            catch
+            {
+                // Best-effort logging: never let a log line crash the app.
+            }
         };
         syno_set_log_callback(Marshal.GetFunctionPointerForDelegate(_logKeepAlive), IntPtr.Zero);
     }
@@ -184,7 +193,13 @@ public sealed class SynoClient : IDisposable
     private static (IntPtr fp, ProgressCb? keepAlive) MakeProgress(Action<long, long>? progress)
     {
         if (progress is null) return (IntPtr.Zero, null);
-        ProgressCb cb = (done, total, _) => progress((long)done, (long)total);
+        // Invoked as an unmanaged callback — guard so a throwing progress
+        // handler can't escape the native boundary and crash the process.
+        ProgressCb cb = (done, total, _) =>
+        {
+            try { progress((long)done, (long)total); }
+            catch { /* progress is advisory; never let it abort the transfer */ }
+        };
         return (Marshal.GetFunctionPointerForDelegate(cb), cb);
     }
 

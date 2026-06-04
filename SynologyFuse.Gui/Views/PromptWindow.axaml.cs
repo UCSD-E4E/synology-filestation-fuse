@@ -8,8 +8,6 @@ namespace SynologyFuse.Gui.Views;
 /// null if cancelled.</summary>
 public partial class PromptWindow : Window
 {
-    private string? _result;
-
     public PromptWindow() => InitializeComponent();
 
     public static async Task<string?> ShowAsync(Window owner, string title, string label)
@@ -19,11 +17,7 @@ public partial class PromptWindow : Window
         return await dlg.ShowDialog<string?>(owner);
     }
 
-    private void OnOk(object? sender, RoutedEventArgs e)
-    {
-        _result = Input.Text;
-        Close(_result);
-    }
+    private void OnOk(object? sender, RoutedEventArgs e) => Close(Input.Text);
 
     private void OnCancel(object? sender, RoutedEventArgs e) => Close(null);
 }

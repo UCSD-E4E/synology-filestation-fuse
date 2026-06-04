@@ -492,6 +492,10 @@ pub unsafe extern "C" fn syno_download_to(
         };
         let inner = c.inner.clone();
 
+        // Stream into a `.part` sidecar, renamed on success for atomicity.
+        // Computed out here so failure paths can clean it up (see below).
+        let part = local.with_extension("part");
+
         let result: Result<(), SynoFsError> = c.runtime.block_on(async {
             use std::io::Write as _;
 
@@ -504,7 +508,6 @@ pub unsafe extern "C" fn syno_download_to(
                 .unwrap_or(0);
             report(progress, user_data, 0, total);
 
-            let part = local.with_extension("part");
             let mut file = std::fs::File::create(&part)
                 .map_err(|e| SynoFsError::Io(format!("create {}: {e}", part.display())))?;
 
@@ -538,7 +541,12 @@ pub unsafe extern "C" fn syno_download_to(
 
         match result {
             Ok(()) => SynoStatus::Ok as i32,
-            Err(e) => set_core_err(err, &e),
+            Err(e) => {
+                // Best-effort: don't leave a stale partial file behind on
+                // failure (range error mid-transfer, rename failure, etc.).
+                let _ = std::fs::remove_file(&part);
+                set_core_err(err, &e)
+            }
         }
     })
 }
@@ -572,6 +580,11 @@ pub unsafe extern "C" fn syno_upload(
             None => return set_err(err, SynoStatus::NullArg, 0, "client must not be null"),
         };
 
+        // The core Upload API is single-shot (takes a full `Vec<u8>`), so the
+        // whole file is buffered in memory — the same documented "write
+        // buffering" limitation the CLI and PyO3 binding share. There is no
+        // streaming path to prefer here; a streaming upload would have to land
+        // in the core crate first.
         let data = match std::fs::read(&local) {
             Ok(d) => d,
             Err(e) => return set_err(err, SynoStatus::Io, 0, &format!("read {local}: {e}")),

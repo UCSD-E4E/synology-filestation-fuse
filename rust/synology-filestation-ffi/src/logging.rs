@@ -99,13 +99,19 @@ fn level_of(line: &str) -> i32 {
 }
 
 fn dispatch(line: &str) {
-    let guard = match sink().lock() {
-        Ok(g) => g,
-        Err(_) => return,
+    // Copy the callback + user_data out while holding the lock, then release it
+    // *before* calling into foreign code. Calling under the lock risks a
+    // deadlock if the callback re-enters logging or tries to swap/clear itself.
+    let target = {
+        let guard = match sink().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        guard.as_ref().map(|s| (s.cb, s.user_data))
     };
-    if let Some(s) = guard.as_ref() {
+    if let Some((cb, user_data)) = target {
         if let Ok(c) = CString::new(line) {
-            (s.cb)(level_of(line), c.as_ptr(), s.user_data as *mut c_void);
+            cb(level_of(line), c.as_ptr(), user_data as *mut c_void);
         }
     }
 }

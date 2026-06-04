@@ -114,6 +114,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [NotifyPropertyChangedFor(nameof(IsIdle))]
     [NotifyCanExecuteChangedFor(nameof(ConnectCommand))]
     [NotifyCanExecuteChangedFor(nameof(TestConnectionCommand))]
+    [NotifyCanExecuteChangedFor(nameof(DisconnectCommand))]
     private bool _isConnecting;
 
     public bool IsIdle => !IsConnecting;
@@ -248,18 +249,33 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         !string.IsNullOrWhiteSpace(Mountpoint);
 
     [RelayCommand(CanExecute = nameof(CanDisconnect))]
-    private void Disconnect()
+    private async Task Disconnect()
     {
         AppendLog("Disconnecting…");
         StatusText = "Disconnecting…";
         ShowOtpPrompt = false;
-        _mountService.Stop();
-        IsConnected = false;
-        StatusText = "Disconnected";
-        AppendLog("Unmounted.");
+        IsConnecting = true;
+        try
+        {
+            // Stop() disposes the native client and blocks while unmounting and
+            // joining the background worker — keep it off the UI thread.
+            await Task.Run(() => _mountService.Stop());
+            IsConnected = false;
+            StatusText = "Disconnected";
+            AppendLog("Unmounted.");
+        }
+        catch (Exception ex)
+        {
+            StatusText = "Error";
+            AppendLog($"Error during disconnect: {ex.Message}");
+        }
+        finally
+        {
+            IsConnecting = false;
+        }
     }
 
-    private bool CanDisconnect() => IsConnected;
+    private bool CanDisconnect() => IsConnected && !IsConnecting;
 
     /// <summary>Retry the gated connect/test with the user-entered OTP code.</summary>
     [RelayCommand(CanExecute = nameof(CanSubmitOtp))]
