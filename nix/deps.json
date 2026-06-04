@@ -106,23 +106,23 @@
   },
   {
     "pname": "Microsoft.CodeCoverage",
-    "version": "18.5.1",
-    "hash": "sha256-OnahMnRBbdlGSz+igNB0GaMS7PAppefPL1fWN1+cs0w="
+    "version": "18.6.0",
+    "hash": "sha256-rxJjgFmEmS9+zzocT279IfR7J0pOhDZE527bvkttKBg="
   },
   {
     "pname": "Microsoft.NET.Test.Sdk",
-    "version": "18.5.1",
-    "hash": "sha256-X69wQBKd5GvXfO7BaPWFcyrwfi/kZFVdH/axorIra5Y="
+    "version": "18.6.0",
+    "hash": "sha256-tzlCrp1WgmQdB05yJpib6PeGkH0juPUrw4wu/79H7yw="
   },
   {
     "pname": "Microsoft.TestPlatform.ObjectModel",
-    "version": "18.5.1",
-    "hash": "sha256-CUuOoANj4lXhQAE1/265X6S+afmNxhpsICEIDqNzSXk="
+    "version": "18.6.0",
+    "hash": "sha256-Q+GpQZxEw0g/tUsQBkTWtRtbwljCum3LimIuqTELWQo="
   },
   {
     "pname": "Microsoft.TestPlatform.TestHost",
-    "version": "18.5.1",
-    "hash": "sha256-jtb74D0mqq7hu/nlCtV7IU2dXhviLrmGPER0ttdH2Dg="
+    "version": "18.6.0",
+    "hash": "sha256-Ez1zC2QiamrlgXO/LlKuLGnD7wJFrWk8w5zYlSkwyJw="
   },
   {
     "pname": "Newtonsoft.Json",
