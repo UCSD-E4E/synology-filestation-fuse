@@ -11,6 +11,11 @@ on:
         required: false
         type: string
         default: ""
+      fuse_tag:
+        description: "Existing tag to (re)build and upload the .deb/.pkg/.msi to (e.g. synology-filestation-fuse-v0.1.20). Leave blank for the normal release-please flow."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -42,14 +47,23 @@ jobs:
 
   release-linux:
     needs: release-please
-    if: needs.release-please.outputs.fuse_release_created == 'true'
+    if: |
+      always() && (
+        needs.release-please.outputs.fuse_release_created == 'true' ||
+        (github.event_name == 'workflow_dispatch' && inputs.fuse_tag != '')
+      )
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Resolve release tag/version
+        run: |
+          TAG="${{ inputs.fuse_tag != '' && inputs.fuse_tag || needs.release-please.outputs.fuse_tag_name }}"
+          echo "FUSE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "FUSE_VERSION=${TAG##*-v}" >> "$GITHUB_ENV"
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
-      - name: Build release CLI
-        run: cargo build --release -p synology-filestation-fuse
+      - name: Build release CLI + FFI library
+        run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v5
         with:
@@ -59,21 +73,30 @@ jobs:
       - name: Build deb package
         run: |
           ./SynologyFuse.DebInstaller/Build-Package.sh \
-            --version "${{ needs.release-please.outputs.fuse_version }}" \
+            --version "$FUSE_VERSION" \
             --out-dir .
       - name: Upload deb to release
-        run: gh release upload "${{ needs.release-please.outputs.fuse_tag_name }}" synologyfuse-*.deb
+        run: gh release upload "$FUSE_TAG" synologyfuse-*.deb
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   release-macos:
     needs: release-please
-    if: needs.release-please.outputs.fuse_release_created == 'true'
+    if: |
+      always() && (
+        needs.release-please.outputs.fuse_release_created == 'true' ||
+        (github.event_name == 'workflow_dispatch' && inputs.fuse_tag != '')
+      )
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Build release CLI
-        run: cargo build --release -p synology-filestation-fuse
+      - name: Resolve release tag/version
+        run: |
+          TAG="${{ inputs.fuse_tag != '' && inputs.fuse_tag || needs.release-please.outputs.fuse_tag_name }}"
+          echo "FUSE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "FUSE_VERSION=${TAG##*-v}" >> "$GITHUB_ENV"
+      - name: Build release CLI + FFI library
+        run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v5
         with:
@@ -83,25 +106,34 @@ jobs:
       - name: Build macOS installer
         run: |
           ./SynologyFuse.MacInstaller/Build-Installer.sh \
-            --version "${{ needs.release-please.outputs.fuse_version }}" \
+            --version "$FUSE_VERSION" \
             --out-dir .
       - name: Upload pkg to release
-        run: gh release upload "${{ needs.release-please.outputs.fuse_tag_name }}" SynologyFuse-*.pkg
+        run: gh release upload "$FUSE_TAG" SynologyFuse-*.pkg
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   release-windows:
     needs: release-please
-    if: needs.release-please.outputs.fuse_release_created == 'true'
+    if: |
+      always() && (
+        needs.release-please.outputs.fuse_release_created == 'true' ||
+        (github.event_name == 'workflow_dispatch' && inputs.fuse_tag != '')
+      )
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Resolve release tag/version
+        run: |
+          $tag = "${{ inputs.fuse_tag != '' && inputs.fuse_tag || needs.release-please.outputs.fuse_tag_name }}"
+          "FUSE_TAG=$tag"                       | Out-File -FilePath $env:GITHUB_ENV -Append
+          "FUSE_VERSION=$($tag -replace '.*-v','')" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
       - name: Install WinFsp
         run: choco install winfsp
-      - name: Build release CLI
-        run: cargo build --release -p synology-filestation-fuse
+      - name: Build release CLI + FFI library
+        run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v5
         with:
@@ -112,15 +144,15 @@ jobs:
         run: |
           dotnet tool install --global wix --version 6.0.2
       - name: Build MSI
-        run: .\SynologyFuse.Installer\Build-Installer.ps1 -Version "${{ needs.release-please.outputs.fuse_version }}"
+        run: .\SynologyFuse.Installer\Build-Installer.ps1 -Version "$env:FUSE_VERSION"
       - name: Build bundle
         run: |
           .\SynologyFuse.Installer\Build-Bundle.ps1 `
-            -Version "${{ needs.release-please.outputs.fuse_version }}" `
+            -Version "$env:FUSE_VERSION" `
             -OutDir SynologyFuse.Installer
       - name: Upload installers to release
         run: |
-          gh release upload "${{ needs.release-please.outputs.fuse_tag_name }}" `
+          gh release upload "$env:FUSE_TAG" `
             (Get-Item SynologyFuse.Installer\SynologyFuse-*-Setup.exe).FullName
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
