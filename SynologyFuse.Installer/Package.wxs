@@ -61,6 +61,8 @@
       <ComponentGroupRef Id="GuiComponents" />
       <!-- Rust CLI binary -->
       <ComponentRef Id="CliComponent" />
+      <!-- Native FFI library used by the GUI -->
+      <ComponentRef Id="FfiComponent" />
       <!-- System PATH entry -->
       <ComponentRef Id="PathComponent" />
       <!-- Start Menu shortcut -->
@@ -104,6 +106,19 @@
     <Component Id="CliComponent" Directory="INSTALLFOLDER" Guid="*">
       <File Id="CliExe"
             Source="$(var.RustBin)\synology-filestation-fuse.exe"
+            KeyPath="yes" />
+    </Component>
+  </Fragment>
+
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       Native FFI library — the GUI calls the Rust core through this directly
+       (the resolver in NativeMethods.cs finds it beside the GUI executable).
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <Fragment>
+    <Component Id="FfiComponent" Directory="INSTALLFOLDER" Guid="*">
+      <File Id="FfiDll"
+            Source="$(var.RustBin)\synology_filestation_ffi.dll"
             KeyPath="yes" />
     </Component>
   </Fragment>

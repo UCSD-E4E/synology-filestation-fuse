@@ -6,7 +6,7 @@ Tools for working with Synology [FileStation](https://www.synology.com/en-global
 - **Linux** — FUSE via the `fuser` crate
 - **macOS** — local WebDAV proxy; no kernel extension required
 - **Windows** — user-mode filesystem via [WinFsp](https://winfsp.dev/)
-- **GUI (all platforms)** — Avalonia desktop app for point-and-click mounting
+- **GUI (all platforms)** — Avalonia desktop app for point-and-click mounting; calls the Rust core in-process (no subprocess), with a connecting spinner, a **Test Connection** check, and a pre-mount file browser
 
 **Python package** (`pip install synology-filestation`) — typed exceptions, atomic downloads, transparent SID-expiry recovery; a drop-in replacement for the `synology-api` PyPI package's FileStation surface. Includes an [fsspec](https://filesystem-spec.readthedocs.io/) backend registered as protocol `synofs` so it composes with pandas / dask / polars / pyarrow. See [python/synology_filestation/README.md](python/synology_filestation/README.md).
 
@@ -22,7 +22,7 @@ Tools for working with Synology [FileStation](https://www.synology.com/en-global
 - **Linux:** metadata cache with configurable TTL; block-level read cache (default 256 MiB) with background prefetch
 - **macOS:** no kernel extension; uses macOS's built-in WebDAV filesystem support
 - **Windows:** user-mode filesystem via WinFsp; mounts as a drive letter (e.g. `Z:`)
-- **GUI (all platforms):** Avalonia app that wraps the CLI with live log output, inline 2FA prompt, and settings persistence
+- **GUI (all platforms):** Avalonia app that calls the Rust core directly through a native library (no subprocess) — connecting spinner, **Test Connection**, typed error messages, inline 2FA prompt, live log output, a pre-mount file browser (browse / download / upload / delete / new folder with transfer progress), and settings persistence
 
 ## Linux installation
 
@@ -38,7 +38,7 @@ Install with `apt` (which also satisfies the `libfuse3-3` dependency automatical
 sudo apt install ./synologyfuse-<version>_amd64.deb
 ```
 
-This places the CLI at `/usr/bin/synology-filestation-fuse`, the GUI and its .NET runtime at `/opt/SynologyFuse/`, and a desktop launcher in your application menu.
+This places the CLI at `/usr/bin/synology-filestation-fuse`, the GUI and its .NET runtime (plus the native `libsynology_filestation_ffi.so` the GUI loads) at `/opt/SynologyFuse/`, and a desktop launcher in your application menu.
 
 To build the package yourself, see [Building the installer](#building-the-installer) below.
 
@@ -75,9 +75,10 @@ The repository ships a flake exposing both binaries as packages:
 | Output | Contents |
 |---|---|
 | `synology-filestation-fuse` (also `default`) | The Rust CLI |
+| `synology-filestation-ffi` | The native C ABI library (cdylib) the GUI loads |
 | `synologyfuse-gui` | The .NET 10 / Avalonia desktop GUI |
 
-The GUI launches the CLI as a subprocess, so the `synologyfuse-gui` package wraps its launcher with the CLI already on `PATH` — installing or running the GUI alone is enough to mount. Install `synology-filestation-fuse` as well if you also want the CLI available directly in your shell.
+The GUI calls the Rust core directly through the native library, so the `synologyfuse-gui` package wraps its launcher with `SYNOFS_NATIVE_DIR` pointing at the cdylib (and the CLI on `PATH` too) — installing or running the GUI alone is enough to mount. Install `synology-filestation-fuse` as well if you also want the CLI available directly in your shell.
 
 ### Try it without installing
 
@@ -237,7 +238,7 @@ dotnet publish SynologyFuse.Gui -c Release -r osx-x64 -p:SelfContained=true
 dotnet publish SynologyFuse.Gui -c Release -r win-x64 -p:SelfContained=true
 ```
 
-Output goes to `SynologyFuse.Gui/bin/Release/net10.0/<rid>/publish/`. The GUI locates the Rust CLI automatically: first beside itself (deployed layout), then in `target/release/` relative to the repo root (development layout), then on `PATH`.
+Output goes to `SynologyFuse.Gui/bin/Release/net10.0/<rid>/publish/`. The GUI calls the Rust core through the native FFI library (`libsynology_filestation_ffi.{so,dylib}` / `synology_filestation_ffi.dll`); build it with `cargo build --release -p synology-filestation-ffi` and place it beside the GUI executable. The resolver searches, in order: the `SYNOFS_NATIVE_DIR` environment variable (explicit override), then beside the GUI (deployed layout), then `target/{release,debug}/` relative to the repo root (development layout). The platform installers bundle the library automatically.
 
 ### Building the installer
 
@@ -263,7 +264,7 @@ The package installs:
 | Path | Contents |
 |---|---|
 | `/usr/bin/synology-filestation-fuse` | CLI binary |
-| `/opt/SynologyFuse/` | GUI executable and .NET runtime |
+| `/opt/SynologyFuse/` | GUI executable, .NET runtime, and `libsynology_filestation_ffi.so` |
 | `/usr/share/applications/synologyfuse.desktop` | Application menu entry |
 | `/usr/share/icons/hicolor/256x256/apps/synologyfuse.png` | Application icon |
 
@@ -400,7 +401,7 @@ diskutil unmount /Volumes/nas
 
 ## Architecture
 
-The repo is a Cargo workspace with three Rust crates plus the .NET desktop GUI and platform installers:
+The repo is a Cargo workspace with four Rust crates plus the .NET desktop GUI and platform installers:
 
 ```
 synology-filestation/
@@ -410,13 +411,18 @@ synology-filestation/
 │   │       ├── client.rs            FileStation API; auto-relogin; atomic download_to_path
 │   │       ├── types.rs             Serde types for API JSON responses
 │   │       └── error.rs             SynoFsError + Linux errno mapping
-│   └── synology-filestation-fuse/   CLI + FUSE / WebDAV / WinFsp backends
+│   ├── synology-filestation-fuse/   CLI + FUSE / WebDAV / WinFsp backends
+│   │   └── src/
+│   │       ├── main.rs              CLI: arg parsing, Tokio runtime, login, then spawn_mount
+│   │       ├── lib.rs               spawn_mount / MountHandle (non-blocking) — shared by CLI + FFI
+│   │       ├── fs.rs                fuser::Filesystem trait (Linux FUSE backend)
+│   │       ├── cache.rs             Inode ↔ path cache + block-level read cache (Linux)
+│   │       ├── webdav.rs            dav_server::DavFileSystem trait (macOS WebDAV backend)
+│   │       └── winfs.rs             winfsp::FileSystemContext trait (Windows WinFsp backend)
+│   └── synology-filestation-ffi/    C ABI cdylib consumed by the GUI (P/Invoke)
 │       └── src/
-│           ├── main.rs              CLI argument parsing, Tokio runtime, platform dispatch
-│           ├── fs.rs                fuser::Filesystem trait (Linux FUSE backend)
-│           ├── cache.rs             Inode ↔ path cache + block-level read cache (Linux)
-│           ├── webdav.rs            dav_server::DavFileSystem trait (macOS WebDAV backend)
-│           └── winfs.rs             winfsp::FileSystemContext trait (Windows WinFsp backend)
+│           ├── lib.rs               connect / browse / transfer / mount; typed SynoError; catch_unwind
+│           └── logging.rs           tracing → C log callback bridge
 ├── python/
 │   └── synology_filestation/        PyO3 + maturin Python bindings (synofs fsspec)
 │       ├── src/lib.rs               PyO3 _native module: Client, AsyncClient, exceptions
@@ -431,14 +437,17 @@ synology-filestation/
 
 ### GUI
 
-`SynologyFuse.Gui` is a cross-platform Avalonia application that wraps the CLI. It provides:
+`SynologyFuse.Gui` is a cross-platform Avalonia application that calls the Rust core **in-process** through the `synology-filestation-ffi` cdylib via P/Invoke — it does not spawn the CLI. It provides:
 
 - Form fields for host, username, password, OTP, mountpoint, and advanced options (cache TTL, read cache size, log level)
-- Connect / Disconnect buttons that launch and terminate the CLI subprocess
-- Live log output streamed from the CLI's stdout/stderr
-- Inline 2FA prompt: when the CLI pauses waiting for a TOTP code on stdin, the GUI shows an input banner so the user can submit the code without restarting
+- **Connect** (login + mount), **Test Connection** (login only), and **Disconnect** (unmount + logout), with a connecting spinner while a call is in flight
+- Typed error reporting — the native layer returns structured errors (with the DSM code), so messages are accurate instead of scraped from log text
+- Inline 2FA prompt: when login reports that an OTP is required, the GUI shows an input banner and retries the connect with the code (entered once, then reused for the mount)
+- A pre-mount **file browser** ([`FileBrowserWindow`](SynologyFuse.Gui/Views/FileBrowserWindow.axaml)) that lists shares/directories and supports download, upload, delete, and new-folder with a transfer progress bar — all without mounting
+- Live log output, bridged from the native library's `tracing` events via a log callback
 - Settings persistence — connection parameters are saved to the platform settings directory and reloaded on next launch
-- Platform-aware argument building: Linux-only flags (`--cache-ttl`, `--read-cache-mb`) are omitted on macOS and Windows
+
+The P/Invoke surface lives in `SynologyFuse.Gui/Interop/` (`NativeMethods.cs` declarations + native-library resolver, `SynoException.cs`); `Services/SynoClient.cs` is the managed wrapper and `Services/MountService.cs` orchestrates connect/mount/test.
 
 ### Virtual root
 

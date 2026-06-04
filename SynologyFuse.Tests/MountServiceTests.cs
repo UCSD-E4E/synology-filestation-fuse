@@ -1,6 +1,6 @@
 using System;
 using System.IO;
-using SynologyFuse.Gui.Models;
+using SynologyFuse.Gui.Interop;
 using SynologyFuse.Gui.Services;
 using Xunit;
 
@@ -8,60 +8,6 @@ namespace SynologyFuse.Tests;
 
 public class MountServiceTests
 {
-    // ── StripAnsi ─────────────────────────────────────────────────────────────
-
-    [Fact]
-    public void StripAnsi_PlainText_Unchanged()
-    {
-        Assert.Equal("hello world", MountService.StripAnsi("hello world"));
-    }
-
-    [Fact]
-    public void StripAnsi_RemovesSgrColorCode()
-    {
-        // ESC[32m = green, ESC[0m = reset
-        Assert.Equal("green text", MountService.StripAnsi("\x1b[32mgreen text\x1b[0m"));
-    }
-
-    [Fact]
-    public void StripAnsi_RemovesBoldAndDim()
-    {
-        Assert.Equal("bold", MountService.StripAnsi("\x1b[1mbold\x1b[22m"));
-    }
-
-    [Fact]
-    public void StripAnsi_RemovesMultipleSequences()
-    {
-        var input = "\x1b[1m\x1b[32mIMPORTANT\x1b[0m: message";
-        Assert.Equal("IMPORTANT: message", MountService.StripAnsi(input));
-    }
-
-    [Fact]
-    public void StripAnsi_EmptyString_ReturnsEmpty()
-    {
-        Assert.Equal("", MountService.StripAnsi(""));
-    }
-
-    // ── Quote ─────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public void Quote_NoSpaces_ReturnsOriginal()
-    {
-        Assert.Equal("nas.local", MountService.Quote("nas.local"));
-    }
-
-    [Fact]
-    public void Quote_ContainsSpace_WrapsInDoubleQuotes()
-    {
-        Assert.Equal("\"My NAS\"", MountService.Quote("My NAS"));
-    }
-
-    [Fact]
-    public void Quote_EmptyString_ReturnsEmpty()
-    {
-        Assert.Equal("", MountService.Quote(""));
-    }
-
     // ── ExpandEnvVars ─────────────────────────────────────────────────────────
 
     [Fact]
@@ -146,98 +92,7 @@ public class MountServiceTests
         Assert.Equal("/mnt/nas", MountService.ExpandPath("/mnt/nas"));
     }
 
-    // ── BuildArgs ─────────────────────────────────────────────────────────────
-
-    [Fact]
-    public void BuildArgs_IncludesHostUsernamePortLogLevel()
-    {
-        var config = new MountConfig
-        {
-            Host = "nas.local",
-            Username = "alice",
-            Port = 5001,
-            UseHttps = true,
-            Mountpoint = "/mnt/nas",
-            LogLevel = "info",
-        };
-
-        var args = MountService.BuildArgs(config);
-
-        Assert.Contains("--host nas.local", args);
-        Assert.Contains("--username alice", args);
-        Assert.Contains("--port 5001", args);
-        Assert.Contains("--log-level info", args);
-    }
-
-    [Fact]
-    public void BuildArgs_MountpointIsLastArg()
-    {
-        var config = new MountConfig
-        {
-            Host = "nas.local",
-            Username = "alice",
-            Port = 5001,
-            UseHttps = true,
-            Mountpoint = "/mnt/nas",
-            LogLevel = "info",
-        };
-
-        var args = MountService.BuildArgs(config);
-        Assert.EndsWith("/mnt/nas", args);
-    }
-
-    [Fact]
-    public void BuildArgs_HttpsDisabled_AddsHttpsFalse()
-    {
-        var config = new MountConfig
-        {
-            Host = "nas.local",
-            Username = "alice",
-            Port = 5000,
-            UseHttps = false,
-            Mountpoint = "/mnt/nas",
-            LogLevel = "warn",
-        };
-
-        var args = MountService.BuildArgs(config);
-        Assert.Contains("--https false", args);
-    }
-
-    [Fact]
-    public void BuildArgs_HttpsEnabled_DoesNotAddHttpsFlag()
-    {
-        var config = new MountConfig
-        {
-            Host = "nas.local",
-            Username = "alice",
-            Port = 5001,
-            UseHttps = true,
-            Mountpoint = "/mnt/nas",
-            LogLevel = "info",
-        };
-
-        var args = MountService.BuildArgs(config);
-        Assert.DoesNotContain("--https", args);
-    }
-
-    [Fact]
-    public void BuildArgs_HostWithSpaces_IsQuoted()
-    {
-        var config = new MountConfig
-        {
-            Host = "my nas",
-            Username = "alice",
-            Port = 5001,
-            UseHttps = true,
-            Mountpoint = "/mnt/nas",
-            LogLevel = "info",
-        };
-
-        var args = MountService.BuildArgs(config);
-        Assert.Contains("--host \"my nas\"", args);
-    }
-
-    // ── FindRepoRoot ──────────────────────────────────────────────────────────
+    // ── NativeMethods.FindRepoRoot (native-library resolver) ────────────────────
 
     [Fact]
     public void FindRepoRoot_FindsCargoTomlInParent()
@@ -248,33 +103,12 @@ public class MountServiceTests
         File.WriteAllText(Path.Combine(root, "Cargo.toml"), "[package]");
         try
         {
-            var found = MountService.FindRepoRoot(subDir);
+            var found = NativeMethods.FindRepoRoot(subDir);
             Assert.Equal(root, found);
         }
         finally
         {
             Directory.Delete(root, recursive: true);
-        }
-    }
-
-    [Fact]
-    public void FindRepoRoot_NoCargoToml_ReturnsNull()
-    {
-        var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(dir);
-        try
-        {
-            // Temp dir tree won't have Cargo.toml, so result should be null
-            // (unless a Cargo.toml happens to be somewhere above %TEMP% — very unlikely).
-            var found = MountService.FindRepoRoot(dir);
-            // We can't assert null absolutely (unlikely but possible), just that if
-            // found it points to a directory containing Cargo.toml.
-            if (found is not null)
-                Assert.True(File.Exists(Path.Combine(found, "Cargo.toml")));
-        }
-        finally
-        {
-            Directory.Delete(dir, recursive: true);
         }
     }
 
@@ -286,7 +120,7 @@ public class MountServiceTests
         File.WriteAllText(Path.Combine(dir, "Cargo.toml"), "[package]");
         try
         {
-            var found = MountService.FindRepoRoot(dir);
+            var found = NativeMethods.FindRepoRoot(dir);
             Assert.Equal(dir, found);
         }
         finally

@@ -4,17 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a cross-platform filesystem driver that mounts a Synology FileStation NAS share as a local directory. The core driver is written in **Rust**; an optional desktop GUI uses **.NET 10 / Avalonia**. Platform backends: Linux (FUSE via `fuser`), macOS (WebDAV via `dav-server`), Windows (WinFsp via `winfsp` crate). A **Python binding** (PyO3, see `python/synology_filestation/`) exposes the FileStation HTTP client surface as a `pip install`-able package — drop-in replacement for the `synology-api` PyPI package's FileStation operations, with typed exceptions, atomic downloads, and transparent SID-expiry recovery.
+This is a cross-platform filesystem driver that mounts a Synology FileStation NAS share as a local directory. The core driver is written in **Rust**; an optional desktop GUI uses **.NET 10 / Avalonia**. Platform backends: Linux (FUSE via `fuser`), macOS (WebDAV via `dav-server`), Windows (WinFsp via `winfsp` crate). A **Python binding** (PyO3, see `python/synology_filestation/`) exposes the FileStation HTTP client surface as a `pip install`-able package — drop-in replacement for the `synology-api` PyPI package's FileStation operations, with typed exceptions, atomic downloads, and transparent SID-expiry recovery. The GUI talks to the Rust core **in-process** through a C ABI (`rust/synology-filestation-ffi`, a cdylib) via P/Invoke — it does not spawn the CLI.
 
 ## Repository layout
 
-The repo is a **Cargo workspace** with three crates plus the existing .NET projects:
+The repo is a **Cargo workspace** with four crates plus the existing .NET projects:
 
 ```
 rust/synology-filestation-core/    # Pure HTTP client (no FS code, no platform deps)
-rust/synology-filestation-fuse/    # Existing CLI + FUSE/WebDAV/WinFsp backends
+rust/synology-filestation-fuse/    # CLI binary + a library exposing the FUSE/WebDAV/WinFsp mount backends
+rust/synology-filestation-ffi/     # C ABI cdylib — connect/browse/transfer/mount, consumed by the GUI
 python/synology_filestation/       # PyO3 bindings (cdylib) — Python wheel builds
-SynologyFuse.Gui/                  # Avalonia desktop GUI
+SynologyFuse.Gui/                  # Avalonia desktop GUI (P/Invokes the FFI cdylib)
 SynologyFuse.{Mac,Deb}Installer/   # macOS .pkg / Debian .deb builders
 SynologyFuse.Installer/            # Windows MSI/bundle builder (WiX 4)
 ```
@@ -25,6 +26,7 @@ SynologyFuse.Installer/            # Windows MSI/bundle builder (WiX 4)
 
 ```bash
 cargo build --release -p synology-filestation-fuse
+cargo build --release -p synology-filestation-ffi   # cdylib the GUI loads (libsynology_filestation_ffi.{so,dylib,dll})
 cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -115,15 +117,18 @@ dotnet tool install --global wix --version 6.0.2
 ### Data Flow
 
 ```
-CLI (main.rs) or GUI (MountService.cs → subprocess) or Python (Client/AsyncClient)
+CLI (main.rs) or GUI (MountService/SynoClient → FFI cdylib) or Python (Client/AsyncClient)
     → Tokio runtime
     → SynologyClient (rust/synology-filestation-core/src/client.rs) — async HTTP
-    → Platform backend (dispatched in main.rs) OR PyO3 binding:
+    → Platform backend (spawned by synology-filestation-fuse's lib.rs::spawn_mount) OR PyO3 binding:
         Linux:   rust/synology-filestation-fuse/src/fs.rs       (fuser FUSE callbacks)
         macOS:   rust/synology-filestation-fuse/src/webdav.rs   (local HTTP, mounted via Finder)
         Windows: rust/synology-filestation-fuse/src/winfs.rs    (WinFsp callbacks)
         Python:  python/synology_filestation/src/lib.rs         (PyO3 _native module)
     → OS filesystem / user Python code
+
+The GUI path goes: MountService.cs / SynoClient.cs → P/Invoke (Interop/NativeMethods.cs)
+    → rust/synology-filestation-ffi/src/lib.rs (C ABI) → SynologyClient + spawn_mount.
 ```
 
 ### Rust core (`rust/synology-filestation-core/src/`)
@@ -139,7 +144,8 @@ CLI (main.rs) or GUI (MountService.cs → subprocess) or Python (Client/AsyncCli
 
 | File | Role |
 |------|------|
-| `main.rs`   | CLI parsing (clap), interactive prompts, platform dispatch |
+| `main.rs`   | CLI binary: parsing (clap), interactive prompts, login, then calls `lib.rs::spawn_mount` and parks on Ctrl-C |
+| `lib.rs`    | Library surface: `spawn_mount`/`MountHandle` (non-blocking, background mount) + `is_otp_required`, shared by the CLI and the FFI crate |
 | `fs.rs`     | Linux FUSE backend; uses `runtime.block_on()` for each FUSE callback |
 | `cache.rs`  | Linux only — `InodeCache` (TTL metadata), `ReadCache` (LRU block cache, 256 KiB blocks, prefetch) |
 | `webdav.rs` | macOS WebDAV backend; directory moves are download→upload→delete |
@@ -155,9 +161,25 @@ CLI (main.rs) or GUI (MountService.cs → subprocess) or Python (Client/AsyncCli
 | `synology_filestation/fsspec.py`   | `SynologyFileSystem(AsyncFileSystem)` — fsspec backend registered as protocol `synofs` (opt-in via `pip install synology-filestation[fsspec]`) |
 | `tests/`                           | pytest + pytest-httpserver — covers atomic download, SID-expiry recovery, exception mapping, fsspec sync+async surface |
 
+### FFI bindings (`rust/synology-filestation-ffi/`)
+
+| File | Role |
+|------|------|
+| `src/lib.rs`     | C ABI: opaque `SynoClient`/`SynoMount` handles over an `Arc<SynologyClient>` + per-client Tokio runtime; `syno_connect` (returns `OtpRequired` so the GUI prompts), browse (`syno_list_*`/`syno_get_info`), transfers (`syno_download_to`/`syno_upload` with a progress callback), `syno_delete`/`syno_create_folder`/`syno_rename`, `syno_mount`/`syno_unmount`. Errors come back as a typed `SynoError` (status + DSM code + message); every export wraps `catch_unwind` |
+| `src/logging.rs` | Bridges `tracing` events to a registered C log callback (`syno_set_log_callback`) for the GUI log pane |
+
+The `kind`/`dsm_code` error classification mirrors the PyO3 exception mapping. Download progress is fine-grained (loops the core's ranged `download`); upload progress is coarse (the core upload is single-shot). Built/clipped/tested in CI alongside the CLI and core.
+
 ### .NET GUI (`SynologyFuse.Gui/`)
 
-MVVM pattern (Avalonia 11). `MountService.cs` launches the Rust CLI as a subprocess and streams its stdout/stderr. It detects when the CLI pauses for OTP input and injects the code. `SettingsService.cs` persists config to platform-specific app-data directories.
+MVVM pattern (Avalonia). The GUI calls the Rust core **directly via the FFI cdylib** (no subprocess):
+- `Interop/NativeMethods.cs` — `[LibraryImport]` P/Invoke declarations (UTF-8 strings, blittable `NativeError`) + a `NativeLibrary` resolver that finds `lib*synology_filestation_ffi*` beside the GUI, in `target/{release,debug}`, or via the `SYNOFS_NATIVE_DIR` override.
+- `Services/SynoClient.cs` — managed wrapper translating status codes to `SynoException`/`OtpRequiredException` and JSON to `SynoFileInfo`.
+- `Services/MountService.cs` — connect + mount + test orchestration; surfaces native log lines via `OutputReceived`.
+- `ViewModels/MainWindowViewModel.cs` — `IsConnecting` spinner, **Test Connection**, typed OTP retry (login once, reused for the mount).
+- `ViewModels/FileBrowserViewModel.cs` + `Views/FileBrowserWindow.axaml` — pre-mount NAS browser (list/download/upload/delete/mkdir) with transfer progress.
+
+`SettingsService.cs` persists config to platform-specific app-data directories.
 
 ### Caching (Linux Only)
 

@@ -1,0 +1,76 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:SynologyFuse.Gui.ViewModels"
+        xmlns:models="using:SynologyFuse.Gui.Models"
+        x:Class="SynologyFuse.Gui.Views.FileBrowserWindow"
+        x:DataType="vm:FileBrowserViewModel"
+        Icon="/Assets/app.ico"
+        Title="Browse NAS"
+        Width="640" Height="480"
+        MinWidth="480" MinHeight="320">
+
+  <DockPanel>
+
+    <!-- Toolbar -->
+    <Border DockPanel.Dock="Top" Padding="10,8"
+            BorderThickness="0,0,0,1"
+            BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}">
+      <Grid ColumnDefinitions="Auto,Auto,*,Auto,Auto,Auto,Auto">
+        <Button Grid.Column="0" Content="Up" Command="{Binding UpCommand}" Margin="0,0,6,0" />
+        <Button Grid.Column="1" Content="Refresh" Command="{Binding RefreshCommand}" Margin="0,0,6,0" />
+        <TextBlock Grid.Column="2" VerticalAlignment="Center" Margin="6,0"
+                   Text="{Binding CurrentPath}" FontFamily="Consolas,Menlo,monospace" />
+        <Button Grid.Column="3" Content="New Folder" Click="OnNewFolder" Margin="0,0,6,0" />
+        <Button Grid.Column="4" Content="Upload" Click="OnUpload" Margin="0,0,6,0" />
+        <Button Grid.Column="5" Content="Download" Click="OnDownload" Margin="0,0,6,0" />
+        <Button Grid.Column="6" Content="Delete" Command="{Binding DeleteCommand}" />
+      </Grid>
+    </Border>
+
+    <!-- Status / progress -->
+    <Border DockPanel.Dock="Bottom" Padding="10,6"
+            BorderThickness="0,1,0,0"
+            BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}">
+      <StackPanel Spacing="4">
+        <TextBlock Text="{Binding Status}" FontSize="12" />
+        <ProgressBar IsVisible="{Binding ShowProgress}"
+                     Minimum="0"
+                     Maximum="{Binding ProgressMax}"
+                     Value="{Binding ProgressValue}" />
+        <TextBlock IsVisible="{Binding ShowProgress}" Text="{Binding ProgressText}" FontSize="11" />
+      </StackPanel>
+    </Border>
+
+    <!-- 2FA banner -->
+    <Border DockPanel.Dock="Top"
+            IsVisible="{Binding ShowOtpPrompt}"
+            Background="#FFF3CD" Padding="10,8">
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBox Grid.Column="0" Text="{Binding PendingOtp, UpdateSourceTrigger=PropertyChanged}"
+                 PlaceholderText="6-digit TOTP code" Margin="0,0,8,0">
+          <TextBox.KeyBindings>
+            <KeyBinding Gesture="Enter" Command="{Binding SubmitOtpCommand}" />
+          </TextBox.KeyBindings>
+        </TextBox>
+        <Button Grid.Column="1" Content="Submit" Command="{Binding SubmitOtpCommand}" Classes="accent" />
+      </Grid>
+    </Border>
+
+    <!-- Listing -->
+    <ListBox ItemsSource="{Binding Items}"
+             SelectedItem="{Binding SelectedItem}"
+             DoubleTapped="OnItemDoubleTapped">
+      <ListBox.ItemTemplate>
+        <DataTemplate x:DataType="models:SynoFileInfo">
+          <Grid ColumnDefinitions="20,*,Auto">
+            <TextBlock Grid.Column="0" Text="{Binding IsDir, Converter={x:Static vm:BrowserConverters.DirGlyph}}" />
+            <TextBlock Grid.Column="1" Text="{Binding Name}" Margin="6,0,0,0" />
+            <TextBlock Grid.Column="2" Text="{Binding Size, Converter={x:Static vm:BrowserConverters.Size}}"
+                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
+          </Grid>
+        </DataTemplate>
+      </ListBox.ItemTemplate>
+    </ListBox>
+
+  </DockPanel>
+</Window>

@@ -7,7 +7,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
-use synology_filestation_core::error::SynoFsError;
+use synology_filestation_core::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
 use synology_filestation_core::types::SynoFileInfo;
 use synology_filestation_core::SynologyClient;
 use tokio::runtime::Runtime;
@@ -133,15 +133,22 @@ fn synofs_to_pyerr(py: Python<'_>, err: SynoFsError) -> PyErr {
             (py.get_type::<AuthError>().into_any(), inner_code)
         }
         SynoFsError::ApiError(c) => {
-            let cls = match *c {
-                119 => py.get_type::<SidNotFound>().into_any(),
-                400 => py.get_type::<InvalidArg>().into_any(),
-                403 | 414 | 415 => py.get_type::<NoSuchFile>().into_any(),
-                408 | 1805 => py.get_type::<PermissionDenied>().into_any(),
-                416 => py.get_type::<NotEmpty>().into_any(),
-                418 | 1101 => py.get_type::<AlreadyExists>().into_any(),
-                419 | 1804 => py.get_type::<NoSpace>().into_any(),
-                _ => py.get_type::<DSMError>().into_any(),
+            // Classify via the core's shared category table so the Python
+            // exceptions and the FFI status codes agree on every DSM code.
+            let cls = match dsm_code_to_category(*c) {
+                ErrorCategory::SidExpired => py.get_type::<SidNotFound>().into_any(),
+                ErrorCategory::InvalidArg => py.get_type::<InvalidArg>().into_any(),
+                ErrorCategory::NotFound => py.get_type::<NoSuchFile>().into_any(),
+                ErrorCategory::PermissionDenied => py.get_type::<PermissionDenied>().into_any(),
+                ErrorCategory::NotEmpty => py.get_type::<NotEmpty>().into_any(),
+                ErrorCategory::AlreadyExists => py.get_type::<AlreadyExists>().into_any(),
+                ErrorCategory::NoSpace => py.get_type::<NoSpace>().into_any(),
+                ErrorCategory::NotSupported => py.get_type::<NotSupported>().into_any(),
+                // Busy (402) and any unmapped code stay a generic DSMError, as
+                // before; Transport never originates from an ApiError code.
+                ErrorCategory::Busy | ErrorCategory::Transport | ErrorCategory::Other => {
+                    py.get_type::<DSMError>().into_any()
+                }
             };
             (cls, Some(*c))
         }

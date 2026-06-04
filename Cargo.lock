@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "synology-filestation-core"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "bytes",
  "libc",
@@ -1886,8 +1886,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "synology-filestation-ffi"
+version = "0.1.19"
+dependencies = [
+ "serde_json",
+ "synology-filestation-core",
+ "synology-filestation-fuse",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
 name = "synology-filestation-fuse"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1914,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "synology_filestation"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "pyo3",
  "pyo3-async-runtimes",

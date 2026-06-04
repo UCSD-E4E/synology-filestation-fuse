@@ -3,5 +3,6 @@ resolver = "2"
 members = [
     "rust/synology-filestation-core",
     "rust/synology-filestation-fuse",
+    "rust/synology-filestation-ffi",
     "python/synology_filestation",
 ]

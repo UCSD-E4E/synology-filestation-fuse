@@ -181,6 +181,16 @@ mkdir -p "${GUI_DEST}"
 cp -R "${GUI_PUBLISH_DIR}/"* "${GUI_DEST}/"
 chmod +x "${GUI_DEST}/${GUI_BINARY}"
 
+# The GUI calls the Rust core directly through this native library; the
+# resolver in NativeMethods.cs looks for it beside the GUI executable.
+FFI_LIB="libsynology_filestation_ffi.so"
+if [[ ! -f "${RUST_RELEASE_DIR}/${FFI_LIB}" ]]; then
+    echo "Error: FFI library not found at '${RUST_RELEASE_DIR}/${FFI_LIB}'." >&2
+    echo "Build it first: cargo build --release -p synology-filestation-ffi" >&2
+    exit 1
+fi
+install -Dm755 "${RUST_RELEASE_DIR}/${FFI_LIB}" "${GUI_DEST}/${FFI_LIB}"
+
 # ── Desktop entry ─────────────────────────────────────────────────────────────
 
 install -Dm644 /dev/stdin \

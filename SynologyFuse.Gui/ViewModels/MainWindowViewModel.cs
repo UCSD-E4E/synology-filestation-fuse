@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using SynologyFuse.Gui.Interop;
 using SynologyFuse.Gui.Models;
 using SynologyFuse.Gui.Services;
 
@@ -13,6 +14,14 @@ namespace SynologyFuse.Gui.ViewModels;
 public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 {
     private readonly MountService _mountService = new();
+
+    /// <summary>The action the OTP banner is gating: either a full mount or a
+    /// connection test. Set when a connect attempt reports OTP-required so
+    /// <see cref="SubmitOtp"/> knows which operation to retry.</summary>
+    private enum PendingAction { None, Mount, Test }
+
+    private PendingAction _pending = PendingAction.None;
+    private MountConfig? _pendingConfig;
 
     public MainWindowViewModel()
     {
@@ -25,6 +34,8 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _cacheTtl = s.CacheTtl;
         _readCacheMb = s.ReadCacheMb;
         _logLevel = s.LogLevel;
+
+        _mountService.OutputReceived += OnOutput;
 
         var v = UpdateCheckService.CurrentVersion();
         Version = $"v{v.Major}.{v.Minor}.{v.Build}";
@@ -51,10 +62,12 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(ConnectCommand))]
+    [NotifyCanExecuteChangedFor(nameof(TestConnectionCommand))]
     private string _host;
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(ConnectCommand))]
+    [NotifyCanExecuteChangedFor(nameof(TestConnectionCommand))]
     private string _username;
 
     [ObservableProperty]
@@ -90,9 +103,21 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [NotifyPropertyChangedFor(nameof(IsDisconnected))]
     [NotifyCanExecuteChangedFor(nameof(ConnectCommand))]
     [NotifyCanExecuteChangedFor(nameof(DisconnectCommand))]
+    [NotifyCanExecuteChangedFor(nameof(TestConnectionCommand))]
     private bool _isConnected;
 
     public bool IsDisconnected => !IsConnected;
+
+    /// <summary>True while a connect / test / mount attempt is in flight. Drives
+    /// the spinner and disables the action buttons.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsIdle))]
+    [NotifyCanExecuteChangedFor(nameof(ConnectCommand))]
+    [NotifyCanExecuteChangedFor(nameof(TestConnectionCommand))]
+    [NotifyCanExecuteChangedFor(nameof(DisconnectCommand))]
+    private bool _isConnecting;
+
+    public bool IsIdle => !IsConnecting;
 
     [ObservableProperty]
     private string _statusText = "Disconnected";
@@ -100,10 +125,8 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private string _logOutput = "";
 
-    /// <summary>
-    /// True when the CLI is blocked waiting for a 2FA code on stdin.
-    /// Shows an inline banner so the user can type the code without restarting.
-    /// </summary>
+    /// <summary>True when a 2FA code is required to finish connecting. Shows an
+    /// inline banner so the user can supply the code and retry.</summary>
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(SubmitOtpCommand))]
     private bool _showOtpPrompt;
@@ -150,131 +173,163 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [RelayCommand(CanExecute = nameof(CanConnect))]
     private async Task Connect()
     {
+        PersistSettings();
+        _pendingConfig = BuildConfig();
+        await RunConnectAsync(PendingAction.Mount, _pendingConfig, otp: null);
+    }
+
+    [RelayCommand(CanExecute = nameof(CanConnect))]
+    private async Task TestConnection()
+    {
+        PersistSettings();
+        _pendingConfig = BuildConfig();
+        await RunConnectAsync(PendingAction.Test, _pendingConfig, otp: null);
+    }
+
+    /// <summary>Shared connect path for both Mount and Test. Handles the spinner,
+    /// the OTP-required banner, and error reporting uniformly.</summary>
+    private async Task RunConnectAsync(PendingAction action, MountConfig config, string? otp)
+    {
         ShowOtpPrompt = false;
-        PendingOtp = "";
-        AppendLog($"Connecting to {Host}…");
-        StatusText = "Connecting…";
-
-        SettingsService.Save(new PersistedSettings
-        {
-            Host = Host,
-            Username = Username,
-            Port = Port,
-            UseHttps = UseHttps,
-            Mountpoint = Mountpoint,
-            CacheTtl = CacheTtl,
-            ReadCacheMb = ReadCacheMb,
-            LogLevel = LogLevel,
-        });
-
-        _mountService.OutputReceived += OnOutput;
-        _mountService.PromptRequired += OnPromptRequired;
-        _mountService.Exited += OnExited;
+        IsConnecting = true;
+        StatusText = action == PendingAction.Test ? "Testing connection…" : "Connecting…";
+        AppendLog(action == PendingAction.Test
+            ? $"Testing connection to {config.Host}…"
+            : $"Connecting to {config.Host}…");
 
         try
         {
-            var config = new MountConfig
+            if (action == PendingAction.Test)
             {
-                Host = Host,
-                Username = Username,
-                Password = Password,
-                Port = (ushort)Port,
-                UseHttps = UseHttps,
-                Mountpoint = Mountpoint,
-                CacheTtl = (ulong)CacheTtl,
-                ReadCacheMb = (ulong)ReadCacheMb,
-                LogLevel = LogLevel,
-            };
-
-            await _mountService.StartAsync(config);
-
-            if (_mountService.IsRunning)
-            {
-                IsConnected = true;
-                StatusText = $"Mounted at {Mountpoint}";
-                AppendLog("Mount process started.");
+                await _mountService.TestConnectionAsync(config, otp);
+                StatusText = "Connection OK";
+                AppendLog("Connection succeeded.");
+                _pending = PendingAction.None;
             }
             else
             {
-                // Process already exited — OnExited has handled state.
-                DetachEvents();
+                await _mountService.ConnectAndMountAsync(config, otp);
+                IsConnected = true;
+                StatusText = $"Mounted at {config.Mountpoint}";
+                AppendLog("Mounted.");
+                _pending = PendingAction.None;
             }
+        }
+        catch (OtpRequiredException)
+        {
+            // Not an error: stash the in-flight action and prompt for the code.
+            _pending = action;
+            ShowOtpPrompt = true;
+            StatusText = "2FA code required";
+            AppendLog("[2FA] Two-factor authentication code required.");
+        }
+        catch (SynoException ex)
+        {
+            StatusText = "Error";
+            IsConnected = false;
+            AppendLog(ex.DsmCode != 0 ? $"Error (DSM {ex.DsmCode}): {ex.Message}" : $"Error: {ex.Message}");
         }
         catch (Exception ex)
         {
-            AppendLog($"Error: {ex.Message}");
             StatusText = "Error";
             IsConnected = false;
-            DetachEvents();
+            AppendLog($"Error: {ex.Message}");
+        }
+        finally
+        {
+            IsConnecting = false;
         }
     }
 
     private bool CanConnect() =>
         !IsConnected &&
+        !IsConnecting &&
         !string.IsNullOrWhiteSpace(Host) &&
         !string.IsNullOrWhiteSpace(Username) &&
         !string.IsNullOrWhiteSpace(Mountpoint);
 
     [RelayCommand(CanExecute = nameof(CanDisconnect))]
-    private void Disconnect()
+    private async Task Disconnect()
     {
         AppendLog("Disconnecting…");
         StatusText = "Disconnecting…";
         ShowOtpPrompt = false;
-        _mountService.Stop();
-        // IsConnected → false via OnExited.
+        IsConnecting = true;
+        try
+        {
+            // Stop() disposes the native client and blocks while unmounting and
+            // joining the background worker — keep it off the UI thread.
+            await Task.Run(() => _mountService.Stop());
+            IsConnected = false;
+            StatusText = "Disconnected";
+            AppendLog("Unmounted.");
+        }
+        catch (Exception ex)
+        {
+            StatusText = "Error";
+            AppendLog($"Error during disconnect: {ex.Message}");
+        }
+        finally
+        {
+            IsConnecting = false;
+        }
     }
 
-    private bool CanDisconnect() => IsConnected;
+    private bool CanDisconnect() => IsConnected && !IsConnecting;
 
-    /// <summary>
-    /// Sends the user-entered OTP code to the waiting CLI process via stdin.
-    /// </summary>
+    /// <summary>Retry the gated connect/test with the user-entered OTP code.</summary>
     [RelayCommand(CanExecute = nameof(CanSubmitOtp))]
-    private void SubmitOtp()
+    private async Task SubmitOtp()
     {
         var code = PendingOtp.Trim();
-        AppendLog($"Sending 2FA code…");
+        var action = _pending;
+        var config = _pendingConfig;
         ShowOtpPrompt = false;
         PendingOtp = "";
-        _mountService.SendLine(code);
-        StatusText = "Verifying 2FA code…";
+        AppendLog("Submitting 2FA code…");
+
+        if (config is null || action == PendingAction.None) return;
+        await RunConnectAsync(action, config, code);
     }
 
     private bool CanSubmitOtp() =>
         ShowOtpPrompt && !string.IsNullOrWhiteSpace(PendingOtp);
 
+    // ── Helpers ─────────────────────────────────────────────────────────────────
+
+    /// <summary>Snapshot of the current form as a <see cref="MountConfig"/>,
+    /// used by the file browser window.</summary>
+    public MountConfig SnapshotConfig() => BuildConfig();
+
+    private MountConfig BuildConfig() => new()
+    {
+        Host = Host,
+        Username = Username,
+        Password = Password,
+        Port = (ushort)Port,
+        UseHttps = UseHttps,
+        Mountpoint = Mountpoint,
+        CacheTtl = (ulong)CacheTtl,
+        ReadCacheMb = (ulong)ReadCacheMb,
+        LogLevel = LogLevel,
+    };
+
+    private void PersistSettings() => SettingsService.Save(new PersistedSettings
+    {
+        Host = Host,
+        Username = Username,
+        Port = Port,
+        UseHttps = UseHttps,
+        Mountpoint = Mountpoint,
+        CacheTtl = CacheTtl,
+        ReadCacheMb = ReadCacheMb,
+        LogLevel = LogLevel,
+    });
+
     // ── Event handlers ────────────────────────────────────────────────────────
 
     private void OnOutput(string line) =>
         Dispatcher.UIThread.Post(() => AppendLog(line));
-
-    private void OnPromptRequired(string prompt) =>
-        Dispatcher.UIThread.Post(() =>
-        {
-            AppendLog($"[2FA] {prompt}");
-            ShowOtpPrompt = true;
-            StatusText = "2FA code required";
-        });
-
-    private void OnExited(int exitCode)
-    {
-        Dispatcher.UIThread.Post(() =>
-        {
-            DetachEvents();
-            IsConnected = false;
-            ShowOtpPrompt = false;
-            StatusText = exitCode == 0 ? "Disconnected" : $"Exited (code {exitCode})";
-            AppendLog($"Mount process exited with code {exitCode}.");
-        });
-    }
-
-    private void DetachEvents()
-    {
-        _mountService.OutputReceived -= OnOutput;
-        _mountService.PromptRequired -= OnPromptRequired;
-        _mountService.Exited -= OnExited;
-    }
 
     private void AppendLog(string line)
     {
@@ -283,5 +338,9 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
             : LogOutput + Environment.NewLine + line;
     }
 
-    public void Dispose() => _mountService.Dispose();
+    public void Dispose()
+    {
+        _mountService.OutputReceived -= OnOutput;
+        _mountService.Dispose();
+    }
 }
