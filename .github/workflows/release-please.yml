@@ -54,7 +54,7 @@ jobs:
       )
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Resolve release tag/version
         run: |
           TAG="${{ inputs.fuse_tag != '' && inputs.fuse_tag || needs.release-please.outputs.fuse_tag_name }}"
@@ -89,7 +89,7 @@ jobs:
       )
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Resolve release tag/version
         run: |
           TAG="${{ inputs.fuse_tag != '' && inputs.fuse_tag || needs.release-please.outputs.fuse_tag_name }}"
@@ -122,7 +122,7 @@ jobs:
       )
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Resolve release tag/version
         run: |
           $tag = "${{ inputs.fuse_tag != '' && inputs.fuse_tag || needs.release-please.outputs.fuse_tag_name }}"
@@ -166,7 +166,7 @@ jobs:
       )
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
