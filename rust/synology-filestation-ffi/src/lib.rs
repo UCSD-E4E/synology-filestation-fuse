@@ -17,10 +17,12 @@ use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::SynoFileInfo;
+use synology_filestation_core::ThrottleConfig;
 use synology_filestation_fuse::{is_otp_required, spawn_mount, MountOptions};
 use tokio::runtime::Runtime;
 
@@ -270,6 +272,21 @@ pub unsafe extern "C" fn syno_connect(
         } else {
             SynologyClient::new(host, port, https)
         };
+
+        // Default-on throttle for the FFI/GUI consumer: cap concurrency and
+        // bound retries with jittered backoff so a bulk download from the GUI's
+        // file browser can't saturate the appliance's shared synoscgi backend.
+        // The rate-limit belt is intentionally left off (min_interval = 0):
+        // this same client Arc backs a GUI-initiated mount, and spacing every
+        // ranged block read would stall interactive streaming. The pure-Rust
+        // FUSE/CLI mount path (main.rs) attaches no throttle at all.
+        let client = client.with_throttle(ThrottleConfig {
+            max_concurrency: 4,
+            min_interval: Duration::from_millis(0),
+            max_attempts: 5,
+            backoff_base: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(60),
+        });
 
         // Attempt login on a cheap current-thread runtime that spawns no worker
         // threads. Only on success do we build the persistent multi-thread
