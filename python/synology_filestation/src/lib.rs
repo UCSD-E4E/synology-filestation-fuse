@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -9,8 +10,35 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use synology_filestation_core::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
 use synology_filestation_core::types::SynoFileInfo;
-use synology_filestation_core::SynologyClient;
+use synology_filestation_core::{SynologyClient, ThrottleConfig};
 use tokio::runtime::Runtime;
+
+/// Apply the request throttle (concurrency cap + rate belt + bounded jittered
+/// backoff) to a freshly built client. Enabled by default for the Python
+/// surface because it is the bulk-transfer consumer (e.g. a Temporal pipeline
+/// staging `.ORF` files) that can saturate the NAS's shared `synoscgi` backend.
+/// Pass `throttle=False` to opt out.
+#[allow(clippy::too_many_arguments)]
+fn apply_throttle(
+    client: SynologyClient,
+    throttle: bool,
+    max_concurrency: usize,
+    min_interval_ms: u64,
+    max_attempts: u32,
+    backoff_base_ms: u64,
+    backoff_max_ms: u64,
+) -> SynologyClient {
+    if !throttle {
+        return client;
+    }
+    client.with_throttle(ThrottleConfig {
+        max_concurrency,
+        min_interval: Duration::from_millis(min_interval_ms),
+        max_attempts,
+        backoff_base: Duration::from_millis(backoff_base_ms),
+        backoff_max: Duration::from_millis(backoff_max_ms),
+    })
+}
 
 // ─── Exception hierarchy ─────────────────────────────────────────────────────
 //
@@ -252,7 +280,7 @@ impl Client {
 #[pymethods]
 impl Client {
     #[staticmethod]
-    #[pyo3(signature = (host, port, username, password, *, https=true, otp=None, auto_relogin=true))]
+    #[pyo3(signature = (host, port, username, password, *, https=true, otp=None, auto_relogin=true, throttle=true, max_concurrency=4, min_interval_ms=150, max_attempts=5, backoff_base_ms=1000, backoff_max_ms=60000))]
     #[allow(clippy::too_many_arguments)] // mirrors the Python kwargs surface
     fn login(
         py: Python<'_>,
@@ -263,6 +291,12 @@ impl Client {
         https: bool,
         otp: Option<&str>,
         auto_relogin: bool,
+        throttle: bool,
+        max_concurrency: usize,
+        min_interval_ms: u64,
+        max_attempts: u32,
+        backoff_base_ms: u64,
+        backoff_max_ms: u64,
     ) -> PyResult<Self> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -278,6 +312,15 @@ impl Client {
         } else {
             SynologyClient::new(host, port, https)
         };
+        let client = apply_throttle(
+            client,
+            throttle,
+            max_concurrency,
+            min_interval_ms,
+            max_attempts,
+            backoff_base_ms,
+            backoff_max_ms,
+        );
 
         // Login failures are always AuthError regardless of the underlying
         // DSM code: a 400 means "wrong password", a 408 means "OTP required",
@@ -541,7 +584,7 @@ struct AsyncClient {
 #[pymethods]
 impl AsyncClient {
     #[staticmethod]
-    #[pyo3(signature = (host, port, username, password, *, https=true, otp=None, auto_relogin=true))]
+    #[pyo3(signature = (host, port, username, password, *, https=true, otp=None, auto_relogin=true, throttle=true, max_concurrency=4, min_interval_ms=150, max_attempts=5, backoff_base_ms=1000, backoff_max_ms=60000))]
     #[allow(clippy::too_many_arguments)] // mirrors the Python kwargs surface
     fn login<'py>(
         py: Python<'py>,
@@ -552,6 +595,12 @@ impl AsyncClient {
         https: bool,
         otp: Option<String>,
         auto_relogin: bool,
+        throttle: bool,
+        max_concurrency: usize,
+        min_interval_ms: u64,
+        max_attempts: u32,
+        backoff_base_ms: u64,
+        backoff_max_ms: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         future_into_py(py, async move {
             let client = if auto_relogin {
@@ -559,6 +608,15 @@ impl AsyncClient {
             } else {
                 SynologyClient::new(&host, port, https)
             };
+            let client = apply_throttle(
+                client,
+                throttle,
+                max_concurrency,
+                min_interval_ms,
+                max_attempts,
+                backoff_base_ms,
+                backoff_max_ms,
+            );
             client
                 .login(&username, &password, otp.as_deref())
                 .await

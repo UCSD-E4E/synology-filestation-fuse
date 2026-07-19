@@ -18,6 +18,11 @@ FileStation surface, designed to fix three concrete footguns:
    re-authenticates and retries the operation once. The caller never sees
    `SidNotFound` unless the re-login itself fails.
 
+4. **Built-in throttle so bulk transfers can't take the NAS down.** Downloads
+   and uploads are capped to a small concurrency, spaced by a rate-limit belt,
+   and retried with bounded jittered backoff. On by default — see
+   [Throttling & reliability](#throttling--reliability).
+
 ## Installation
 
 ```bash
@@ -74,6 +79,67 @@ df = pd.read_csv(
 ```
 
 Both sync and async fsspec APIs are supported — `fs._cat_file(path)` returns an awaitable; `fs.cat_file(path)` is the auto-generated sync wrapper.
+
+## Throttling & reliability
+
+The FileStation Download API is proxied through `nginx → synoscgi`, a shared
+per-request CGI backend for the whole appliance. It is sized for a handful of
+large streams, **not** a task-per-file fan-out. Parallel downloads — not total
+volume — are what saturate it, and an inner retry storm (the same file fetched
+hundreds of times) turns a blip into an outage.
+
+Every `Client` / `AsyncClient` therefore ships with a throttle, **enabled by
+default**, that wraps `download`/`download_to`/`upload`:
+
+| Lever | Default | What it does |
+|---|---|---|
+| `max_concurrency` | `4` | Global semaphore around all transfer calls. Single-digit — a few big streams, not one request per file. |
+| `min_interval_ms` | `150` | Rate-limit belt: minimum spacing between request starts, even at full concurrency. |
+| `max_attempts` | `5` | Hard per-file retry cap. Once exhausted the error is raised — no unbounded inner loop. |
+| `backoff_base_ms` / `backoff_max_ms` | `1000` / `60000` | Full-jitter exponential backoff between attempts (1s → 60s). |
+
+```python
+# Defaults are conservative; tune per-workload or disable with throttle=False.
+nas = Client.login(
+    "nas.example.com", 5001, "alice", "secret",
+    max_concurrency=3,      # ≈3–4 is the safe band for synoscgi
+    min_interval_ms=200,
+    max_attempts=5,
+)
+```
+
+**Error classification.** The throttle distinguishes transient from permanent
+failures so it never retries something a retry can't fix:
+
+- **Transient → back off + bounded retry:** HTTP 502/503/504, HTTP 407 (the
+  backend fail-closing), connection/read errors, and DSM 402 *system busy*
+  (backed off *harder*).
+- **Permanent → fail fast, no retry:** missing file / no permission / invalid
+  argument and any other DSM code. Retrying these wastes the backend's
+  attention exactly like a 502 storm.
+
+### Using this under Temporal (or any outer retry policy)
+
+This client caps retries at `max_attempts` **and then raises** — deliberately.
+Do **not** wrap it in your own inner retry loop. Let the failure propagate out
+of the activity and let Temporal's retry policy reschedule it with its own
+(longer, jittered) backoff. Two nested retry loops are exactly what produced the
+200–250×-per-file storm that saturated the appliance. One activity ≈ one file;
+bound the work here, reschedule out there.
+
+## Bulk staging: prefer SMB/NFS over the Download API
+
+For sustained bulk transfer of large binaries (e.g. staging raw `.ORF` frames),
+the **structural fix is to not use the HTTP Download API at all**. It is an
+interactive file-browser endpoint; streaming gigabytes through `synoscgi` is
+outside what it is built for.
+
+If your host can mount the share over **SMB or NFS** (the UCSD campus firewall
+already permits both), read the bytes straight off the mounted share — that
+bypasses `synoscgi` entirely, so there is no CGI backend to saturate. Treat this
+package's HTTP Download path as the **fallback**, not the default, for bulk raw
+staging. The throttle above is the safety net for when the API path must be
+used; SMB/NFS is how you avoid needing it.
 
 ## Exceptions
 

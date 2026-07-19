@@ -6,6 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a cross-platform filesystem driver that mounts a Synology FileStation NAS share as a local directory. The core driver is written in **Rust**; an optional desktop GUI uses **.NET 10 / Avalonia**. Platform backends: Linux (FUSE via `fuser`), macOS (WebDAV via `dav-server`), Windows (WinFsp via `winfsp` crate). A **Python binding** (PyO3, see `python/synology_filestation/`) exposes the FileStation HTTP client surface as a `pip install`-able package — drop-in replacement for the `synology-api` PyPI package's FileStation operations, with typed exceptions, atomic downloads, and transparent SID-expiry recovery. The GUI talks to the Rust core **in-process** through a C ABI (`rust/synology-filestation-ffi`, a cdylib) via P/Invoke — it does not spawn the CLI.
 
+## Development Practice
+
+**Test-driven development is required for all behavioral changes.** Follow the red-green-refactor cycle:
+
+1. **Red** — write a failing test that pins down the new behavior (or reproduces the bug) *before* touching implementation code. Run it and confirm it fails for the expected reason.
+2. **Green** — write the minimum implementation needed to make the test pass.
+3. **Refactor** — clean up while keeping the test green.
+
+Every bug fix starts with a regression test that fails against the current code. Every new feature or API is specified by tests first. Do not write implementation code for which no failing test exists. Exceptions (pure refactors with no behavior change, docs, formatting, build/CI config) don't need new tests but must keep the existing suite green — run the relevant `cargo test` / `uv run pytest` / `dotnet test` before considering the change done.
+
 ## Repository layout
 
 The repo is a **Cargo workspace** with four crates plus the existing .NET projects:
@@ -136,7 +146,7 @@ The GUI path goes: MountService.cs / SynoClient.cs → P/Invoke (Interop/NativeM
 | File | Role |
 |------|------|
 | `lib.rs`    | Module declarations + re-exports of the public surface |
-| `client.rs` | Async HTTP client — all FileStation API calls, session/SID management, 2FA, auto-relogin, atomic `download_to_path` |
+| `client.rs` | Async HTTP client — all FileStation API calls, session/SID management, 2FA, auto-relogin, atomic `download_to_path`, and the opt-in transfer throttle (`ThrottleConfig`/`with_throttle`) |
 | `types.rs`  | Serde structs for API responses (`SynoFileInfo`, `SynoResponse<T>`, etc.) |
 | `error.rs`  | `SynoFsError` enum + Linux errno mapping (used by FUSE backend) |
 
@@ -169,6 +179,28 @@ The GUI path goes: MountService.cs / SynoClient.cs → P/Invoke (Interop/NativeM
 | `src/logging.rs` | Bridges `tracing` events to a registered C log callback (`syno_set_log_callback`) for the GUI log pane |
 
 The `kind`/`dsm_code` error classification mirrors the PyO3 exception mapping. Download progress is fine-grained (loops the core's ranged `download`); upload progress is coarse (the core upload is single-shot). Built/clipped/tested in CI alongside the CLI and core.
+
+### Request throttling (protecting the NAS)
+
+The FileStation Download API is proxied `nginx → synoscgi`, a **shared per-request CGI backend for the whole appliance** — sized for a handful of large streams, not a task-per-file fan-out. Parallel downloads (not total volume) saturate it, and an inner retry storm compounds a blip into an outage. The core client therefore offers an **opt-in throttle** (`ThrottleConfig` + `SynologyClient::with_throttle`) that wraps only the transfer calls (`download`/`upload`):
+
+- **Concurrency semaphore** (`max_concurrency`, default 4) — single-digit global cap.
+- **Rate-limit belt** (`min_interval`, default 150 ms) — spaces request starts even at full concurrency.
+- **Jittered exponential backoff** (`backoff_base`..`backoff_max`, 1s→60s full-jitter) on transient/degraded responses.
+- **Bounded per-file retries** (`max_attempts`, default 5) — then the error surfaces; no unbounded inner loop.
+- **Error classification:** HTTP 502/503/504, 407 (backend fail-closing), connection/read errors, and DSM 402 (busy, backed off *harder*) → transient/retry; missing-file / no-permission / invalid-arg / any other DSM code → fail fast, no retry.
+
+Who enables it:
+
+| Consumer | Throttle | Rationale |
+|---|---|---|
+| Python `Client`/`AsyncClient` | **on by default** (all levers, incl. the belt); tunable/disable via `login(..., throttle=…, max_concurrency=…, …)` | The bulk consumer (e.g. a Temporal pipeline staging `.ORF` files) — the one that saturated the NAS. |
+| FFI `syno_connect` (GUI) | **on**, concurrency + backoff + retry cap, **belt off** (`min_interval=0`) | The same client Arc also backs a GUI-initiated mount; spacing every ranged block read would stall interactive streaming. |
+| FUSE/CLI (`main.rs`) | **off** | Interactive mount; the 16-block prefetch fan-out must stay responsive. |
+
+**Temporal / outer-retry contract:** this client caps retries and then raises — do **not** nest it under your own inner retry loop. Let the activity fail and let Temporal reschedule with its (longer, jittered) backoff. Two nested retry loops are what produced the 200–250×-per-file storm.
+
+**Structural fix for bulk raw staging:** prefer **SMB/NFS** on a mounted share over the HTTP Download API — it bypasses `synoscgi` entirely (no CGI backend to saturate). The UCSD campus firewall already permits SMB/NFS. Treat the HTTP Download path as the fallback; the throttle is the safety net for when it must be used. (See `python/synology_filestation/README.md` → *Throttling & reliability* / *Bulk staging*.)
 
 ### .NET GUI (`SynologyFuse.Gui/`)
 

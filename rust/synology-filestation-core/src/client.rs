@@ -2,10 +2,11 @@ use bytes::Bytes;
 use reqwest::{multipart, Client};
 use std::path::Path;
 use std::sync::RwLock;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use tracing::{debug, warn};
 
-use crate::error::SynoFsError;
+use crate::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
 use crate::types::{
     AuthData, CreateFolderData, GetInfoData, ListData, ListShareData, RenameData, SynoFileInfo,
     SynoResponse, UploadData, ADDITIONAL_FIELDS, SHARE_ADDITIONAL_FIELDS,
@@ -30,11 +31,135 @@ struct StoredCreds {
     password: String,
 }
 
+/// Tuning for the request throttle that protects the DSM appliance's shared
+/// `synoscgi` CGI backend from saturation. Attach via
+/// [`SynologyClient::with_throttle`].
+///
+/// The throttle wraps the heavy transfer calls (`download`, `upload`) — not
+/// interactive metadata lookups — with three cooperating limits:
+///
+/// * a global concurrency **semaphore** (`max_concurrency`) so only a handful
+///   of transfers hit `:6021` at once — the CGI backend is sized for a few
+///   large streams, not one request per file;
+/// * a **rate-limit belt** (`min_interval`) that spaces request starts even at
+///   full concurrency;
+/// * **jittered exponential backoff** (`backoff_base`..`backoff_max`) on
+///   transient/degraded responses, bounded by `max_attempts` so a failing file
+///   is handed back to the caller (e.g. a Temporal activity) instead of being
+///   retried forever in an inner loop.
+///
+/// Transient (back off + retry): HTTP 502/503/504, HTTP 407 (backend
+/// fail-closing), connection/read errors, and DSM 402 (system busy, backed off
+/// *harder*). Permanent (fail fast, no retry): missing file / no permission /
+/// invalid argument and any other DSM error code.
+#[derive(Debug, Clone)]
+pub struct ThrottleConfig {
+    /// Maximum number of concurrent transfer requests. Keep this single-digit.
+    pub max_concurrency: usize,
+    /// Minimum spacing between transfer request starts. `Duration::ZERO`
+    /// disables the belt.
+    pub min_interval: Duration,
+    /// Hard cap on attempts per transfer call (the per-file retry bound). Once
+    /// exhausted the error surfaces so the outer scheduler can reschedule.
+    pub max_attempts: u32,
+    /// Base delay for the full-jitter exponential backoff.
+    pub backoff_base: Duration,
+    /// Ceiling on any single backoff sleep.
+    pub backoff_max: Duration,
+}
+
+impl Default for ThrottleConfig {
+    /// Conservative defaults sized to keep `synoscgi` healthy: 4 concurrent
+    /// transfers, a 150 ms belt, and ≤5 attempts per file with 1s→60s
+    /// full-jitter backoff.
+    fn default() -> Self {
+        Self {
+            max_concurrency: 4,
+            min_interval: Duration::from_millis(150),
+            max_attempts: 5,
+            backoff_base: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(60),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Throttle {
+    sem: Semaphore,
+    min_interval: Duration,
+    /// Earliest instant the next transfer request may start (rate-limit belt).
+    next_earliest: Mutex<Instant>,
+    max_attempts: u32,
+    backoff_base: Duration,
+    backoff_max: Duration,
+}
+
+/// Outcome of a single transfer attempt, deciding what the retry loop does next.
+enum TransferOutcome {
+    /// The request produced a final result.
+    Done(Bytes),
+    /// A permanent error — surface immediately, do not retry.
+    Fatal(SynoFsError),
+    /// A transient/degraded failure — back off and retry (unless attempts are
+    /// exhausted). `hard` requests the longer "system busy" backoff.
+    Retry { hard: bool, err: SynoFsError },
+}
+
+/// HTTP statuses that mean "backend degraded / fail-closing" — stand down and
+/// retry rather than hammer through. Everything else (incl. 500) is treated as
+/// permanent for a transfer.
+fn http_status_is_transient(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 502 | 503 | 504 | 407)
+}
+
+/// Classify a successful (HTTP 200) download body. DSM violates HTTP convention
+/// by returning `200 OK` with a JSON error envelope
+/// (`{"success":false,"error":{"code":N}}`) instead of a 4xx. Small bodies that
+/// plausibly *look* like an envelope are probed; real binary content passes
+/// through untouched.
+fn classify_download_body(body: Bytes) -> TransferOutcome {
+    if body.len() < 1024 && body.first() == Some(&b'{') {
+        if let Ok(envelope) = serde_json::from_slice::<SynoResponse<serde_json::Value>>(&body) {
+            if !envelope.success {
+                let code = envelope.error.map(|e| e.code).unwrap_or(0);
+                // 402 (system busy) is transient — back off harder and retry.
+                if dsm_code_to_category(code) == ErrorCategory::Busy {
+                    return TransferOutcome::Retry {
+                        hard: true,
+                        err: SynoFsError::ApiError(code),
+                    };
+                }
+                return TransferOutcome::Fatal(SynoFsError::ApiError(code));
+            }
+        }
+    }
+    TransferOutcome::Done(body)
+}
+
+/// Full-jitter backoff: a random duration in `[0, cap]`. Wall-clock nanoseconds
+/// seed the jitter so we avoid an RNG crate dependency — good enough to keep a
+/// fleet of retriers from resynchronising into a thundering herd.
+fn full_jitter(cap: Duration) -> Duration {
+    if cap.is_zero() {
+        return Duration::ZERO;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let frac = nanos as f64 / 1_000_000_000.0_f64;
+    cap.mul_f64(frac)
+}
+
 #[derive(Debug)]
 pub struct SynologyClient {
     http: Client,
     base_url: String,
     sid: RwLock<Option<String>>,
+    /// Optional request throttle protecting the NAS from bulk-transfer
+    /// saturation. `None` = unthrottled (the FUSE/CLI mount path); the Python
+    /// and FFI bulk entry points attach one via [`SynologyClient::with_throttle`].
+    throttle: Option<Throttle>,
     /// When true, operations that fail with `ApiError(119)` (SID not found)
     /// trigger a transparent re-login + single retry instead of surfacing the
     /// error. Off by default to preserve existing FUSE/WebDAV/WinFsp
@@ -74,6 +199,84 @@ impl SynologyClient {
             sid: RwLock::new(None),
             auto_relogin: false,
             creds: RwLock::new(None),
+            throttle: None,
+        }
+    }
+
+    /// Attach a [`ThrottleConfig`] that caps concurrency, spaces requests, and
+    /// bounds retries for the transfer calls (`download`/`upload`).
+    ///
+    /// Off by default: the FUSE/CLI mount path leaves it unset so interactive
+    /// ranged reads and prefetch stay snappy. The Python bindings and the FFI
+    /// `syno_connect` entry point — the bulk-transfer consumers that can
+    /// saturate the appliance — enable it. Metadata calls (list/getinfo/…) are
+    /// never gated by the semaphore, so a transfer holding a permit can never
+    /// deadlock on its own metadata lookup.
+    pub fn with_throttle(mut self, cfg: ThrottleConfig) -> Self {
+        self.throttle = Some(Throttle {
+            sem: Semaphore::new(cfg.max_concurrency.max(1)),
+            min_interval: cfg.min_interval,
+            next_earliest: Mutex::new(Instant::now()),
+            max_attempts: cfg.max_attempts.max(1),
+            backoff_base: cfg.backoff_base,
+            backoff_max: cfg.backoff_max,
+        });
+        self
+    }
+
+    /// Attempts a transfer call may make. Without a throttle this preserves the
+    /// historical behavior (3 tries).
+    fn max_transfer_attempts(&self) -> u32 {
+        self.throttle.as_ref().map(|t| t.max_attempts).unwrap_or(3)
+    }
+
+    /// Reserve a transfer slot: apply the rate-limit belt, then acquire a
+    /// concurrency permit. Returns `None` when unthrottled (the caller runs as
+    /// before). The permit releases when the returned guard is dropped, so
+    /// callers must hold it only for the request+body read and drop it before
+    /// backing off.
+    async fn acquire_transfer_slot(&self) -> Option<SemaphorePermit<'_>> {
+        let t = self.throttle.as_ref()?;
+        // Rate-limit belt: reserve this request's slot and sleep until it opens,
+        // without holding the lock across the sleep.
+        if t.min_interval > Duration::ZERO {
+            let wait = {
+                let mut next = t.next_earliest.lock().await;
+                let now = Instant::now();
+                let scheduled = (*next).max(now);
+                *next = scheduled + t.min_interval;
+                scheduled.saturating_duration_since(now)
+            };
+            if wait > Duration::ZERO {
+                tokio::time::sleep(wait).await;
+            }
+        }
+        Some(
+            t.sem
+                .acquire()
+                .await
+                .expect("throttle semaphore never closed"),
+        )
+    }
+
+    /// Sleep for a jittered exponential backoff before the next attempt.
+    /// `hard` (DSM 402 busy) doubles the base delay. No-op when unthrottled, so
+    /// the mount path retries with no added delay exactly as before.
+    async fn backoff_before_retry(&self, attempt: u32, hard: bool) {
+        let t = match self.throttle.as_ref() {
+            Some(t) => t,
+            None => return,
+        };
+        let base = if hard {
+            t.backoff_base.saturating_mul(2)
+        } else {
+            t.backoff_base
+        };
+        let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+        let cap = base.saturating_mul(factor).min(t.backoff_max);
+        let delay = full_jitter(cap);
+        if delay > Duration::ZERO {
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -423,74 +626,74 @@ impl SynologyClient {
             None
         };
 
+        let max_attempts = self.max_transfer_attempts();
         let mut last_err = SynoFsError::Io("no attempts".into());
-        for attempt in 0..3u8 {
+
+        for attempt in 0..max_attempts {
             if attempt > 0 {
                 debug!("download retry {} for {} offset={}", attempt, path, offset);
             }
 
-            let mut req = self.http.get(&url).query(&[
-                ("api", "SYNO.FileStation.Download"),
-                ("version", "2"),
-                ("method", "download"),
-                ("path", &path_json),
-                ("mode", "download"),
-                ("_sid", &self.sid()),
-            ]);
+            // One attempt. The concurrency permit is held only for the duration
+            // of the request+body read (this inner block); it is released before
+            // any backoff so a sleeping-then-retrying request never occupies a
+            // slot.
+            let outcome: TransferOutcome = {
+                let _slot = self.acquire_transfer_slot().await;
 
-            if let Some(ref range) = range_header {
-                req = req.header("Range", range.as_str());
-            }
+                let mut req = self.http.get(&url).query(&[
+                    ("api", "SYNO.FileStation.Download"),
+                    ("version", "2"),
+                    ("method", "download"),
+                    ("path", &path_json),
+                    ("mode", "download"),
+                    ("_sid", &self.sid()),
+                ]);
+                if let Some(ref range) = range_header {
+                    req = req.header("Range", range.as_str());
+                }
 
-            let resp = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    last_err = e.into();
-                    continue;
+                match req.send().await {
+                    Err(e) => TransferOutcome::Retry {
+                        hard: false,
+                        err: e.into(),
+                    },
+                    Ok(resp) => {
+                        let status = resp.status();
+                        // 416 Range Not Satisfiable = range starts past EOF;
+                        // return empty (EOF signal).
+                        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                            TransferOutcome::Done(Bytes::new())
+                        } else if !status.is_success() {
+                            let err = SynoFsError::Io(format!("download HTTP {}", status));
+                            if http_status_is_transient(status) {
+                                TransferOutcome::Retry { hard: false, err }
+                            } else {
+                                TransferOutcome::Fatal(err)
+                            }
+                        } else {
+                            match resp.bytes().await {
+                                Err(e) => TransferOutcome::Retry {
+                                    hard: false,
+                                    err: e.into(),
+                                },
+                                Ok(body) => classify_download_body(body),
+                            }
+                        }
+                    }
                 }
             };
 
-            let status = resp.status();
-
-            // 416 Range Not Satisfiable = requested range starts past EOF; return empty (EOF signal).
-            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-                return Ok(Bytes::new());
-            }
-            if !status.is_success() {
-                return Err(SynoFsError::Io(format!("download HTTP {}", status)));
-            }
-
-            let body = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    last_err = e.into();
-                    continue;
-                }
-            };
-
-            // DSM returns 200 OK with a JSON error envelope for SID-expired and
-            // similar errors instead of an HTTP error code. We can't trust
-            // Content-Type alone (some configurations omit it), so we always
-            // attempt to parse the body as a SynoResponse — if it parses *and*
-            // has success:false, it's a DSM error; otherwise it's binary file
-            // content. A real binary file is vanishingly unlikely to parse as
-            // a complete `{"success":false,"error":{"code":N}}` document.
-            //
-            // Only attempt parsing for small bodies that *plausibly* could be a
-            // JSON envelope (start with '{'); large file downloads skip the
-            // probe to avoid wasting CPU on multi-GB binaries.
-            if body.len() < 1024 && body.first() == Some(&b'{') {
-                if let Ok(envelope) =
-                    serde_json::from_slice::<SynoResponse<serde_json::Value>>(&body)
-                {
-                    if !envelope.success {
-                        let code = envelope.error.map(|e| e.code).unwrap_or(0);
-                        return Err(SynoFsError::ApiError(code));
+            match outcome {
+                TransferOutcome::Done(bytes) => return Ok(bytes),
+                TransferOutcome::Fatal(e) => return Err(e),
+                TransferOutcome::Retry { hard, err } => {
+                    last_err = err;
+                    if attempt + 1 < max_attempts {
+                        self.backoff_before_retry(attempt, hard).await;
                     }
                 }
             }
-
-            return Ok(body);
         }
         Err(last_err)
     }
@@ -527,8 +730,9 @@ impl SynologyClient {
             }
         }
 
+        let max_attempts = self.max_transfer_attempts();
         let mut last_err = SynoFsError::Io("no attempts".into());
-        for attempt in 0..3u8 {
+        for attempt in 0..max_attempts {
             if attempt > 0 {
                 debug!("upload retry {} for {}/{}", attempt, folder_path, filename);
             }
@@ -547,25 +751,30 @@ impl SynologyClient {
                 .text("overwrite", "false")
                 .part("file", file_part);
 
-            let resp = match self
-                .http
-                .post(&url)
-                .query(&[("_sid", self.sid())])
-                .multipart(form)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    last_err = e.into();
-                    continue;
+            // Hold a transfer slot only for the request+response read; drop it
+            // before any backoff so a retrying upload doesn't hog a permit.
+            let text = {
+                let _slot = self.acquire_transfer_slot().await;
+                match self
+                    .http
+                    .post(&url)
+                    .query(&[("_sid", self.sid())])
+                    .multipart(form)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r.text().await.map_err(SynoFsError::from),
+                    Err(e) => Err(e.into()),
                 }
             };
 
-            let text = match resp.text().await {
+            let text = match text {
                 Ok(t) => t,
                 Err(e) => {
-                    last_err = e.into();
+                    last_err = e;
+                    if attempt + 1 < max_attempts {
+                        self.backoff_before_retry(attempt, false).await;
+                    }
                     continue;
                 }
             };
@@ -1769,5 +1978,275 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SynoFsError::Io(_)));
         assert!(!dest.exists());
+    }
+
+    // ── throttle: concurrency cap, backoff, error classification, retry bound ──
+    //
+    // The NAS incident: parallel FileStation Download calls saturated the shared
+    // synoscgi CGI backend, and an inner retry storm re-fetched the same files
+    // 200-250×. The throttle is the fix — a small global concurrency semaphore,
+    // a rate-limit belt, jittered exponential backoff on transient/degraded
+    // responses (HTTP 502/503/504, 407, DSM 402 busy), fail-fast on permanent
+    // errors (missing file / no permission), and a hard per-file attempt cap so
+    // the outer scheduler (e.g. Temporal) owns re-scheduling instead of an
+    // unbounded inner loop.
+
+    /// A throttle tuned for fast tests: tiny backoff so retry tests don't sleep
+    /// for real seconds.
+    fn fast_throttle(max_concurrency: usize, max_attempts: u32) -> ThrottleConfig {
+        ThrottleConfig {
+            max_concurrency,
+            min_interval: Duration::from_millis(0),
+            max_attempts,
+            backoff_base: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(5),
+        }
+    }
+
+    fn client_throttled_for(server: &MockServer, cfg: ThrottleConfig) -> SynologyClient {
+        let uri = server.uri();
+        let without_scheme = uri.trim_start_matches("http://");
+        let (host, port_str) = without_scheme.rsplit_once(':').unwrap();
+        let port: u16 = port_str.parse().unwrap();
+        SynologyClient::new(host, port, false).with_throttle(cfg)
+    }
+
+    #[tokio::test]
+    async fn download_retries_http_502_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = client_throttled_for(&server, fast_throttle(4, 5));
+        let bytes = client.download("/share/f", 0, 0).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn download_retries_http_407_then_succeeds() {
+        // 407 during the incident was the backend fail-closing — back off and
+        // retry, don't hammer through it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(407))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = client_throttled_for(&server, fast_throttle(4, 5));
+        let bytes = client.download("/share/f", 0, 0).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn download_402_busy_backs_off_and_retries() {
+        // DSM 402 (system busy) arrives as a 200-OK JSON envelope. It is
+        // transient — back off (harder) and retry rather than fail fast.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"success":false,"error":{"code":402}}"#),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .set_body_bytes(b"after-busy".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_throttled_for(&server, fast_throttle(4, 5));
+        let bytes = client.download("/share/f", 0, 0).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"after-busy");
+    }
+
+    #[tokio::test]
+    async fn download_missing_file_fails_fast_without_retry() {
+        // A permanent error (DSM 415, no such file/folder) must NOT be retried —
+        // retrying wastes the backend's attention exactly like a 502 storm.
+        // .expect(1) fails on MockServer drop if we attempt it more than once.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"success":false,"error":{"code":415}}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_throttled_for(&server, fast_throttle(4, 5));
+        let err = client.download("/share/missing", 0, 0).await.unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(415)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn download_bounded_by_max_attempts() {
+        // Persistent transient failure must give up after max_attempts — no
+        // unbounded inner loop. .expect(3) pins the exact attempt count.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(502))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let client = client_throttled_for(&server, fast_throttle(4, 3));
+        let err = client.download("/share/f", 0, 0).await.unwrap_err();
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn download_concurrency_capped_by_semaphore() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Raw TCP server that records the peak number of simultaneously
+        // in-flight requests. Each connection holds its slot for 50 ms so
+        // parallel downloads overlap if the semaphore lets them.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cur = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let cur_s = cur.clone();
+        let peak_s = peak.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                let cur = cur_s.clone();
+                let peak = peak_s.clone();
+                tokio::spawn(async move {
+                    let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let body = b"OKOKOK";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.shutdown().await;
+                    cur.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        let client = Arc::new(
+            SynologyClient::new("127.0.0.1", port, false).with_throttle(fast_throttle(2, 3)),
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let c = client.clone();
+            tasks.push(tokio::spawn(
+                async move { c.download("/share/x", 0, 6).await },
+            ));
+        }
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(observed <= 2, "peak concurrency {observed} exceeded cap 2");
+        assert!(observed >= 2, "expected the cap to actually be reached");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn download_rate_gate_spaces_out_requests() {
+        // Even with plenty of concurrency, the min-interval belt keeps the
+        // request rate against synoscgi modest. 4 requests spaced 80 ms apart
+        // means the batch cannot finish faster than ~3 intervals.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"z".to_vec()))
+            .mount(&server)
+            .await;
+
+        let cfg = ThrottleConfig {
+            max_concurrency: 8,
+            min_interval: Duration::from_millis(80),
+            max_attempts: 1,
+            backoff_base: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(1),
+        };
+        let client = std::sync::Arc::new(client_throttled_for(&server, cfg));
+
+        let start = std::time::Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let c = client.clone();
+            tasks.push(tokio::spawn(
+                async move { c.download("/share/x", 0, 0).await },
+            ));
+        }
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "rate gate did not space requests: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unthrottled_client_download_unaffected() {
+        // The FUSE/CLI path constructs the client without a throttle: behavior
+        // is exactly as before (no cap, no added delay, plain success).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"plain".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let bytes = client.download("/share/f", 0, 0).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"plain");
     }
 }

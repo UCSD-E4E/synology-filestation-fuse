@@ -9,6 +9,6 @@ pub mod client;
 pub mod error;
 pub mod types;
 
-pub use client::SynologyClient;
+pub use client::{SynologyClient, ThrottleConfig};
 pub use error::SynoFsError;
 pub use types::{SynoAdditional, SynoFileInfo, SynoOwner, SynoPerm, SynoTime};
