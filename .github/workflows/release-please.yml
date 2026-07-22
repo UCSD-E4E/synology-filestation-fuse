@@ -65,7 +65,7 @@ jobs:
       - name: Build release CLI + FFI library
         run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi
       - name: Set up .NET 10
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.x'
       - name: Publish GUI
@@ -98,7 +98,7 @@ jobs:
       - name: Build release CLI + FFI library
         run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi
       - name: Set up .NET 10
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.x'
       - name: Publish GUI
@@ -135,7 +135,7 @@ jobs:
       - name: Build release CLI + FFI library
         run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi
       - name: Set up .NET 10
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.x'
       - name: Publish GUI

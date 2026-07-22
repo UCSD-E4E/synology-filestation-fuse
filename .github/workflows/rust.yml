@@ -21,7 +21,7 @@ jobs:
     - name: Rust formatting (cargo fmt)
       run: cargo fmt --all -- --check
     - name: Set up .NET 10
-      uses: actions/setup-dotnet@v5
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: '10.0.x'
     - name: C# formatting (dotnet format)
@@ -49,7 +49,7 @@ jobs:
     - name: Build release (required for installer)
       run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
-      uses: actions/setup-dotnet@v5
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: '10.0.x'
     - name: Run dotnet tests
@@ -86,7 +86,7 @@ jobs:
     - name: Build release (required for installer)
       run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
-      uses: actions/setup-dotnet@v5
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: '10.0.x'
     - name: Run dotnet tests
@@ -127,7 +127,7 @@ jobs:
     - name: Build release (required for installer)
       run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
-      uses: actions/setup-dotnet@v5
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: '10.0.x'
     - name: Run dotnet tests
