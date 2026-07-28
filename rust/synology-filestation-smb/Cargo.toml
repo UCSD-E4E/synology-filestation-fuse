@@ -1,0 +1,25 @@
+[package]
+name = "synology-filestation-smb"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "In-process SMB read transport for the Synology FileStation client — bypasses the HTTP Download API to protect the NAS's shared synoscgi backend."
+repository = "https://github.com/UCSD-E4E/synology-filestation"
+# Not published to crates.io yet; consumed in-tree once wired into core/python.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Pure-Rust SMB2/3 client (no C deps): SMB3 + signing + AES encryption + NTLMv2,
+# validated against the AD-joined, SMB3-only e4e-nas.
+smb2 = "0.13"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
+tracing = "0.1"
+# Shared error model so SMB failures classify the same way HTTP ones do.
+synology-filestation-core = { path = "../synology-filestation-core" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
