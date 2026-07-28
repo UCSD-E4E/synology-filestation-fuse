@@ -346,7 +346,8 @@ impl Client {
                     {
                         Some(smb) => client
                             .with_read_transport(smb.clone())
-                            .with_write_transport(smb),
+                            .with_write_transport(smb.clone())
+                            .with_stream_write_transport(smb),
                         None => client,
                     };
                     Ok::<_, SynoFsError>(client)
@@ -497,12 +498,6 @@ impl Client {
         overwrite: bool,
         _create_parents: bool,
     ) -> PyResult<()> {
-        // Read file bytes on the calling thread; this is the only sync I/O
-        // Python expects to be cheap (small files) or already fits in RAM
-        // for large ones — the existing core API takes a Vec<u8>.
-        let data = std::fs::read(local_path)
-            .map_err(|e| PyErr::new::<TransportError, _>(format!("read {local_path}: {e}")))?;
-
         // Filename is the last path component.
         let filename = std::path::Path::new(local_path)
             .file_name()
@@ -511,12 +506,15 @@ impl Client {
             .to_string();
 
         let inner = self.inner.clone();
+        let local = std::path::PathBuf::from(local_path);
         let remote_dir = remote_dir.to_string();
+        // Streams the file straight to SMB when available (no in-memory copy);
+        // falls back to reading it in + HTTP upload otherwise. API unchanged.
         py.allow_threads(|| {
             self.runtime.block_on(async {
                 inner
                     .with_relogin_retry(|| {
-                        inner.upload(&remote_dir, &filename, data.clone(), overwrite)
+                        inner.upload_from_path(&local, &remote_dir, &filename, overwrite)
                     })
                     .await
             })
@@ -651,7 +649,8 @@ impl AsyncClient {
                 match synology_filestation_smb::auto_connect(&host, &username, &password).await {
                     Some(smb) => client
                         .with_read_transport(smb.clone())
-                        .with_write_transport(smb),
+                        .with_write_transport(smb.clone())
+                        .with_stream_write_transport(smb),
                     None => client,
                 };
             Ok(AsyncClient {
@@ -792,11 +791,6 @@ impl AsyncClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            let data = std::fs::read(&local_path).map_err(|e| {
-                Python::with_gil(|py| {
-                    PyErr::new::<TransportError, _>(format!("read {local_path}: {e}")).clone_ref(py)
-                })
-            })?;
             let filename = std::path::Path::new(&local_path)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -806,9 +800,36 @@ impl AsyncClient {
                     })
                 })?
                 .to_string();
+            let local = std::path::PathBuf::from(&local_path);
+            // Streams to SMB when available (no in-memory copy); HTTP fallback
+            // otherwise. API unchanged.
             inner
                 .with_relogin_retry(|| {
-                    inner.upload(&remote_dir, &filename, data.clone(), overwrite)
+                    inner.upload_from_path(&local, &remote_dir, &filename, overwrite)
+                })
+                .await
+                .map_err(synofs_to_pyerr_gil)
+        })
+    }
+
+    /// Stream a local file to a full remote path (`/share/dir/name`). Like
+    /// `upload` but the remote filename may differ from the local one. Streams
+    /// to SMB when available, HTTP fallback otherwise.
+    #[pyo3(signature = (local_path, remote_path, *, overwrite=true))]
+    fn upload_file<'py>(
+        &self,
+        py: Python<'py>,
+        local_path: String,
+        remote_path: String,
+        overwrite: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let (folder, filename) = split_remote_path(&remote_path)?;
+            let local = std::path::PathBuf::from(&local_path);
+            inner
+                .with_relogin_retry(|| {
+                    inner.upload_from_path(&local, &folder, &filename, overwrite)
                 })
                 .await
                 .map_err(synofs_to_pyerr_gil)

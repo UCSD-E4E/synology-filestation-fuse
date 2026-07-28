@@ -113,7 +113,8 @@ fn main() -> anyhow::Result<()> {
         info!("SMB reachable — mount will prefer it over the HTTP API");
         client = client
             .with_read_transport(smb.clone())
-            .with_write_transport(smb);
+            .with_write_transport(smb.clone())
+            .with_stream_write_transport(smb);
     }
 
     let client = Arc::new(client);

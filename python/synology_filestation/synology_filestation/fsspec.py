@@ -204,12 +204,9 @@ class SynologyFileSystem(AsyncFileSystem):
     async def _put_file(self, lpath: str, rpath: str, **kwargs) -> None:
         rpath = self._strip_protocol(rpath)
         client = await self._get_client()
-        # Read locally and ship as bytes; matches fsspec's small-file
-        # contract. For multi-GB uploads, callers should use
-        # `client.upload(local_path, remote_dir)` directly.
-        with open(lpath, "rb") as f:
-            data = f.read()
-        await client.upload_bytes(rpath, data)
+        # Streams the local file to the NAS (straight to SMB when available, so
+        # multi-GB uploads aren't buffered in memory; HTTP fallback otherwise).
+        await client.upload_file(lpath, rpath)
 
     async def _pipe_file(self, path: str, value: bytes, **kwargs) -> None:
         path = self._strip_protocol(path)
