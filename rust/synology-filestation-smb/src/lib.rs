@@ -31,4 +31,4 @@ pub mod transport;
 
 pub use error::to_syno_error;
 pub use path::SmbPath;
-pub use transport::{auto_connect, FileMeta, SmbConfig, SmbTransport};
+pub use transport::{auto_attach, auto_connect, FileMeta, SmbConfig, SmbTransport};

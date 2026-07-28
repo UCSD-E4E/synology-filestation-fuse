@@ -339,17 +339,9 @@ impl Client {
                         .login(username, password, otp)
                         .await
                         .map_err(|e| SynoFsError::LoginFailed(Box::new(e)))?;
-                    let client = match synology_filestation_smb::auto_connect(
-                        host, username, password,
-                    )
-                    .await
-                    {
-                        Some(smb) => client
-                            .with_read_transport(smb.clone())
-                            .with_write_transport(smb.clone())
-                            .with_stream_write_transport(smb),
-                        None => client,
-                    };
+                    let client =
+                        synology_filestation_smb::auto_attach(client, host, username, password)
+                            .await;
                     Ok::<_, SynoFsError>(client)
                 })
             })
@@ -646,13 +638,7 @@ impl AsyncClient {
                 .map_err(|e| synofs_to_pyerr_gil(SynoFsError::LoginFailed(Box::new(e))))?;
             // Transparently prefer SMB when reachable; None → HTTP only.
             let client =
-                match synology_filestation_smb::auto_connect(&host, &username, &password).await {
-                    Some(smb) => client
-                        .with_read_transport(smb.clone())
-                        .with_write_transport(smb.clone())
-                        .with_stream_write_transport(smb),
-                    None => client,
-                };
+                synology_filestation_smb::auto_attach(client, &host, &username, &password).await;
             Ok(AsyncClient {
                 inner: Arc::new(client),
             })

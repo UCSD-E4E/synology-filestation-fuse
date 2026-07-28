@@ -328,15 +328,9 @@ pub unsafe extern "C" fn syno_connect(
                 // Transparently prefer SMB for transfers when reachable (the GUI
                 // browser's downloads, and a GUI-initiated mount, then bypass
                 // synoscgi); silently HTTP-only otherwise.
-                let client = match runtime.block_on(synology_filestation_smb::auto_connect(
-                    host, username, password,
-                )) {
-                    Some(smb) => client
-                        .with_read_transport(smb.clone())
-                        .with_write_transport(smb.clone())
-                        .with_stream_write_transport(smb),
-                    None => client,
-                };
+                let client = runtime.block_on(synology_filestation_smb::auto_attach(
+                    client, host, username, password,
+                ));
                 let handle = Box::new(SynoClient {
                     inner: Arc::new(client),
                     runtime,
