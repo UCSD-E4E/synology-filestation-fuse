@@ -240,6 +240,19 @@ impl SmbTransport {
         Ok(Bytes::from(data))
     }
 
+    /// Delete a file at `logical`.
+    pub async fn delete(&self, logical: &str) -> Result<(), SynoFsError> {
+        let loc = SmbPath::from_logical(logical)?;
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        ensure_tree(client, trees, &loc.share).await?;
+        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        client
+            .delete_file(tree, &loc.path)
+            .await
+            .map_err(|e| to_syno_error(&e))
+    }
+
     /// Read an entire file. Uses the pipelined, chunked read so multi-MB `.ORF`
     /// files (past the 8 MiB `MaxReadSize`) come back whole.
     pub async fn read_full(&self, logical: &str) -> Result<Bytes, SynoFsError> {
