@@ -38,6 +38,28 @@ fn part_name(path: &str, seq: u64) -> String {
     format!("{path}.part-{}-{}", std::process::id(), seq)
 }
 
+/// Map a **local** filesystem error to a *definitive* [`SynoFsError`] (never
+/// `Transport`).
+///
+/// A local failure — disk full, unwritable destination, missing source — can't
+/// be fixed by falling back to another transport (HTTP would hit the same local
+/// I/O, after buffering the whole file in memory first), so the selection layer
+/// must not retry it elsewhere. The detail is logged since the definitive
+/// variants carry no message.
+fn local_fs_error(what: &str, e: &std::io::Error) -> SynoFsError {
+    use std::io::ErrorKind;
+    tracing::warn!(error = %e, "{what}");
+    match e.kind() {
+        ErrorKind::PermissionDenied => SynoFsError::PermissionDenied,
+        ErrorKind::NotFound => SynoFsError::NotFound,
+        ErrorKind::AlreadyExists => SynoFsError::AlreadyExists,
+        // ENOSPC has no stable ErrorKind; detect via the raw errno (28 on unix).
+        _ if e.raw_os_error() == Some(28) => SynoFsError::NoSpace,
+        // Any other local FS failure is still definitive — don't fall back.
+        _ => SynoFsError::InvalidArg,
+    }
+}
+
 /// Connection parameters for [`SmbTransport::connect`].
 #[derive(Debug, Clone)]
 pub struct SmbConfig {
@@ -324,20 +346,20 @@ impl SmbTransport {
             // Pump SMB → local temp in bounded chunks (constant memory).
             let mut file = tokio::fs::File::create(&tmp)
                 .await
-                .map_err(|e| SynoFsError::Io(format!("create {}: {e}", tmp.display())))?;
+                .map_err(|e| local_fs_error(&format!("create {}", tmp.display()), &e))?;
             while let Some(chunk) = download.next_chunk().await {
                 let bytes = chunk.map_err(|e| to_syno_error(&e))?;
                 file.write_all(&bytes)
                     .await
-                    .map_err(|e| SynoFsError::Io(format!("write {}: {e}", tmp.display())))?;
+                    .map_err(|e| local_fs_error(&format!("write {}", tmp.display()), &e))?;
             }
             file.sync_all()
                 .await
-                .map_err(|e| SynoFsError::Io(format!("fsync {}: {e}", tmp.display())))?;
+                .map_err(|e| local_fs_error(&format!("fsync {}", tmp.display()), &e))?;
             drop(file);
             tokio::fs::rename(&tmp, local)
                 .await
-                .map_err(|e| SynoFsError::Io(format!("rename to {}: {e}", local.display())))
+                .map_err(|e| local_fs_error(&format!("rename to {}", local.display()), &e))
         }
         .await;
 
@@ -397,7 +419,7 @@ impl SmbTransport {
 
         let mut file = tokio::fs::File::open(local)
             .await
-            .map_err(|e| SynoFsError::Io(format!("open {}: {e}", local.display())))?;
+            .map_err(|e| local_fs_error(&format!("open {}", local.display()), &e))?;
 
         let mut guard = self.inner.lock().await;
         let Inner { client, trees } = &mut *guard;
