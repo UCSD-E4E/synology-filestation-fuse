@@ -50,6 +50,43 @@ fn is_connection_lost(kind: smb2::ErrorKind) -> bool {
     )
 }
 
+/// Tracks whether the SMB link needs re-establishing. Isolated from `SmbClient`
+/// so the reconnect decision is unit-testable without a live connection.
+#[derive(Debug, Default)]
+struct ReconnectState {
+    needs: AtomicBool,
+}
+
+impl ReconnectState {
+    /// Flag for reconnect if `kind` means the link is dead.
+    fn flag_if_lost(&self, kind: smb2::ErrorKind) {
+        if is_connection_lost(kind) {
+            self.needs.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// If flagged, run `reconnect` (clearing the flag first). Returns `Ok(true)`
+    /// when a reconnect ran and succeeded — the caller then drops its stale tree
+    /// cache. On failure the flag is re-set so the next operation retries, and
+    /// the error is returned. `Ok(false)` means no reconnect was needed.
+    async fn reconnect_if_needed<F, Fut>(&self, reconnect: F) -> Result<bool, smb2::Error>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), smb2::Error>>,
+    {
+        if !self.needs.swap(false, Ordering::SeqCst) {
+            return Ok(false);
+        }
+        match reconnect().await {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                self.needs.store(true, Ordering::SeqCst);
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Map a **local** filesystem error to a *definitive* [`SynoFsError`] (never
 /// `Transport`).
 ///
@@ -223,10 +260,10 @@ struct Inner {
 /// An authenticated SMB connection that reads NAS files.
 pub struct SmbTransport {
     inner: Mutex<Inner>,
-    /// Set when an operation sees the SMB link is dead; the next operation
-    /// reconnects before using it. `smb2` doesn't auto-reconnect, so without
-    /// this a mount would degrade to HTTP permanently after one network flap.
-    needs_reconnect: AtomicBool,
+    /// Tracks whether the SMB link needs re-establishing. `smb2` doesn't
+    /// auto-reconnect, so without this a mount would degrade to HTTP permanently
+    /// after one network flap.
+    reconnect: ReconnectState,
 }
 
 impl SmbTransport {
@@ -250,17 +287,23 @@ impl SmbTransport {
                 client,
                 trees: HashMap::new(),
             }),
-            needs_reconnect: AtomicBool::new(false),
+            reconnect: ReconnectState::default(),
         })
     }
 
     /// Map an `smb2::Error`, flagging the connection for reconnect when the
     /// error means the link is dead — so the next operation re-establishes it.
     fn mark_and_map(&self, e: &smb2::Error) -> SynoFsError {
-        if is_connection_lost(e.kind()) {
-            self.needs_reconnect.store(true, Ordering::SeqCst);
-        }
+        self.reconnect.flag_if_lost(e.kind());
         to_syno_error(e)
+    }
+
+    /// Run a best-effort cleanup op, ignoring its result **except** to flag the
+    /// link for reconnect if it revealed a dead connection.
+    fn note_cleanup(&self, r: Result<(), smb2::Error>) {
+        if let Err(e) = r {
+            self.reconnect.flag_if_lost(e.kind());
+        }
     }
 
     /// Reconnect if a prior operation flagged the SMB link dead, then attach the
@@ -274,11 +317,12 @@ impl SmbTransport {
         trees: &mut HashMap<String, Tree>,
         share: &str,
     ) -> Result<(), SynoFsError> {
-        if self.needs_reconnect.swap(false, Ordering::SeqCst) {
-            if let Err(e) = client.reconnect().await {
-                self.needs_reconnect.store(true, Ordering::SeqCst);
-                return Err(self.mark_and_map(&e));
-            }
+        let reconnected = self
+            .reconnect
+            .reconnect_if_needed(|| client.reconnect())
+            .await
+            .map_err(|e| self.mark_and_map(&e))?;
+        if reconnected {
             trees.clear(); // the cached trees belonged to the dead session
         }
         if !trees.contains_key(share) {
@@ -306,23 +350,23 @@ impl SmbTransport {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == smb2::ErrorKind::AlreadyExists => {} // replace below
             Err(e) => {
-                let _ = client.delete_file(tree, tmp).await;
+                self.note_cleanup(client.delete_file(tree, tmp).await);
                 return Err(self.mark_and_map(&e));
             }
         }
         // Move the old file aside so no step ever deletes the only copy.
         let backup = part_name(&format!("{target}.bak"), seq);
         if let Err(e) = client.rename(tree, target, &backup).await {
-            let _ = client.delete_file(tree, tmp).await;
+            self.note_cleanup(client.delete_file(tree, tmp).await);
             return Err(self.mark_and_map(&e));
         }
         match client.rename(tree, tmp, target).await {
             Ok(()) => {
-                let _ = client.delete_file(tree, &backup).await; // best-effort
+                self.note_cleanup(client.delete_file(tree, &backup).await); // best-effort
                 Ok(())
             }
             Err(e) => {
-                let _ = client.rename(tree, &backup, target).await; // restore old
+                self.note_cleanup(client.rename(tree, &backup, target).await); // restore old
                 Err(self.mark_and_map(&e))
             }
         }
@@ -490,7 +534,7 @@ impl SmbTransport {
         // New contents → temp file adjacent to the target (pipelined, so files
         // past the server's MaxWriteSize go in chunks).
         if let Err(e) = client.write_file_pipelined(tree, &tmp, data).await {
-            let _ = client.delete_file(tree, &tmp).await; // best-effort cleanup
+            self.note_cleanup(client.delete_file(tree, &tmp).await); // best-effort cleanup
             return Err(self.mark_and_map(&e));
         }
 
@@ -551,7 +595,7 @@ impl SmbTransport {
 
         if let Some(e) = stream_err {
             let tree = trees.get_mut(&loc.share).expect("tree just ensured");
-            let _ = client.delete_file(tree, &tmp).await; // best-effort cleanup
+            self.note_cleanup(client.delete_file(tree, &tmp).await); // best-effort cleanup
             return Err(e);
         }
 
@@ -610,6 +654,63 @@ mod tests {
         assert!(!is_connection_lost(smb2::ErrorKind::NotFound));
         assert!(!is_connection_lost(smb2::ErrorKind::AccessDenied));
         assert!(!is_connection_lost(smb2::ErrorKind::SharingViolation));
+    }
+
+    #[tokio::test]
+    async fn reconnect_runs_only_when_flagged_then_clears() {
+        let state = ReconnectState::default();
+        // Not flagged → no reconnect, and the closure is never run.
+        let ran = state
+            .reconnect_if_needed(|| async { panic!("should not reconnect") })
+            .await
+            .unwrap();
+        assert!(!ran);
+
+        // A connection-lost error flags it → reconnect runs once and succeeds.
+        state.flag_if_lost(smb2::ErrorKind::ConnectionLost);
+        let ran = state
+            .reconnect_if_needed(|| async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(
+            ran,
+            "flagged → reconnect ran (caller clears its tree cache)"
+        );
+
+        // Flag cleared on success → the next op is a no-op again.
+        let ran = state
+            .reconnect_if_needed(|| async { panic!("should not reconnect") })
+            .await
+            .unwrap();
+        assert!(!ran);
+    }
+
+    #[tokio::test]
+    async fn failed_reconnect_keeps_the_flag_set_for_retry() {
+        let state = ReconnectState::default();
+        state.flag_if_lost(smb2::ErrorKind::TimedOut);
+        // Reconnect fails → error surfaces, flag stays set.
+        assert!(state
+            .reconnect_if_needed(|| async { Err(smb2::Error::Disconnected) })
+            .await
+            .is_err());
+        // Still flagged → the next operation retries the reconnect.
+        let ran = state
+            .reconnect_if_needed(|| async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(ran, "flag persisted so reconnect is retried");
+    }
+
+    #[tokio::test]
+    async fn per_request_errors_do_not_flag_reconnect() {
+        let state = ReconnectState::default();
+        state.flag_if_lost(smb2::ErrorKind::NotFound); // not a link failure
+        let ran = state
+            .reconnect_if_needed(|| async { panic!("should not reconnect") })
+            .await
+            .unwrap();
+        assert!(!ran);
     }
 
     #[test]
