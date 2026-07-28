@@ -2211,6 +2211,7 @@ dependencies = [
  "serde_json",
  "synology-filestation-core",
  "synology-filestation-fuse",
+ "synology-filestation-smb",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2236,6 +2237,7 @@ dependencies = [
  "serde",
  "serde_json",
  "synology-filestation-core",
+ "synology-filestation-smb",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2264,6 +2266,7 @@ dependencies = [
  "pyo3-async-runtimes",
  "pyo3-log",
  "synology-filestation-core",
+ "synology-filestation-smb",
  "tokio",
  "tracing-log",
 ]

@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -69,11 +70,77 @@ impl SmbConfig {
         }
     }
 
+    /// Build an auto-SMB config from the same credentials the HTTP login uses,
+    /// parsing the domain out of the username so AD accounts work with no extra
+    /// input: `DOMAIN\user`, or `user@REALM` (NetBIOS domain = the first realm
+    /// label, upper-cased — e.g. `KRG.LOCAL` → `KRG`), else a local account with
+    /// no domain. Port defaults to 445.
+    pub fn from_login(host: &str, username: &str, password: &str) -> Self {
+        let (domain, user) = if let Some((d, u)) = username.split_once('\\') {
+            (d.to_string(), u.to_string())
+        } else if let Some((u, realm)) = username.split_once('@') {
+            let netbios = realm.split('.').next().unwrap_or(realm).to_uppercase();
+            (netbios, u.to_string())
+        } else {
+            (String::new(), username.to_string())
+        };
+        let mut cfg = SmbConfig::new(host, user, password);
+        cfg.domain = domain;
+        cfg
+    }
+
     fn addr(&self) -> String {
         if self.host.contains(':') {
             self.host.clone()
         } else {
             format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// Transparently connect an SMB backend from the HTTP login credentials, for the
+/// "always prefer SMB when reachable" policy — so bulk transfers avoid the HTTP
+/// Download/Upload API (and the shared `synoscgi` backend it can saturate).
+///
+/// Returns `None` (→ HTTP only) whenever SMB is disabled, unreachable, or auth
+/// fails — **never** an error, so a failed probe silently degrades to HTTP. A
+/// short probe timeout bounds the cost off-network (where port 445 is dropped),
+/// and the caller's circuit breaker takes over from there.
+///
+/// Deploy escape hatches (environment, invisible to any public API):
+/// * `SYNOLOGY_FS_SMB_DISABLE` (any value) — never use SMB.
+/// * `SYNOLOGY_FS_SMB_DOMAIN` — override the domain parsed from the username.
+/// * `SYNOLOGY_FS_SMB_PORT` — override the SMB port (default 445).
+/// * `SYNOLOGY_FS_SMB_TIMEOUT_MS` — probe timeout (default 2000).
+pub async fn auto_connect(host: &str, username: &str, password: &str) -> Option<Arc<SmbTransport>> {
+    if std::env::var_os("SYNOLOGY_FS_SMB_DISABLE").is_some() {
+        return None;
+    }
+    let mut cfg = SmbConfig::from_login(host, username, password);
+    if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
+        cfg.domain = domain;
+    }
+    if let Some(port) = std::env::var("SYNOLOGY_FS_SMB_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        cfg.port = port;
+    }
+    cfg.timeout = Duration::from_millis(
+        std::env::var("SYNOLOGY_FS_SMB_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2000),
+    );
+
+    match SmbTransport::connect(&cfg).await {
+        Ok(transport) => {
+            tracing::info!(host, "SMB transport enabled; preferring it over HTTP");
+            Some(Arc::new(transport))
+        }
+        Err(e) => {
+            tracing::debug!(host, error = %e, "SMB unavailable; using HTTP only");
+            None
         }
     }
 }
@@ -289,6 +356,25 @@ mod tests {
         // Different sequence numbers yield different temp names (so concurrent
         // writers to the same target don't collide).
         assert_ne!(part_name("x", 1), part_name("x", 2));
+    }
+
+    #[test]
+    fn from_login_parses_domain_from_username() {
+        // DOMAIN\user — unambiguous.
+        let c = SmbConfig::from_login("nas", "KRG\\c.crutchfield.642", "pw");
+        assert_eq!(c.domain, "KRG");
+        assert_eq!(c.username, "c.crutchfield.642");
+
+        // user@REALM (UPN) — NetBIOS domain is the first realm label, upper-cased.
+        let c = SmbConfig::from_login("nas", "c.crutchfield.642@krg.local", "pw");
+        assert_eq!(c.domain, "KRG");
+        assert_eq!(c.username, "c.crutchfield.642");
+
+        // Local account — no domain.
+        let c = SmbConfig::from_login("nas", "admin", "pw");
+        assert_eq!(c.domain, "");
+        assert_eq!(c.username, "admin");
+        assert_eq!(c.port, 445);
     }
 
     #[test]

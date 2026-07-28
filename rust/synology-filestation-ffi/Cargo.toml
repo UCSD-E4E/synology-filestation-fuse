@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 synology-filestation-core = { path = "../synology-filestation-core", version = "0.1.19" }
+synology-filestation-smb = { path = "../synology-filestation-smb" }
 synology-filestation-fuse = { path = "../synology-filestation-fuse", version = "0.1.19" }
 
 tokio       = { version = "1", features = ["rt", "rt-multi-thread"] }

@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         args.port
     );
 
-    let client = Arc::new(SynologyClient::new(&args.host, args.port, args.https));
+    let mut client = SynologyClient::new(&args.host, args.port, args.https);
 
     let password = match args.password {
         Some(p) => p,
@@ -101,6 +101,22 @@ fn main() -> anyhow::Result<()> {
     }
 
     info!("Logged in successfully");
+
+    // Transparently prefer SMB for the mount's reads/writes when the NAS's SMB
+    // service is reachable — this bypasses synoscgi entirely. Silently HTTP-only
+    // otherwise. Injected before the client is shared, since it consumes it.
+    if let Some(smb) = rt.block_on(synology_filestation_smb::auto_connect(
+        &args.host,
+        &args.username,
+        &password,
+    )) {
+        info!("SMB reachable — mount will prefer it over the HTTP API");
+        client = client
+            .with_read_transport(smb.clone())
+            .with_write_transport(smb);
+    }
+
+    let client = Arc::new(client);
 
     let opts = MountOptions {
         cache_ttl: args.cache_ttl,

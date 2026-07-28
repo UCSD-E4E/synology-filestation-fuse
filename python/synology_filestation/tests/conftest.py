@@ -8,10 +8,16 @@ mock the HTTP layer in Python because the requests are issued from Rust
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Iterator
 
 import pytest
 from pytest_httpserver import HTTPServer
+
+# The client now transparently prefers SMB when reachable. These tests exercise
+# the HTTP layer against a local mock server (no SMB), so disable the SMB probe
+# for determinism and speed — SMB behavior is covered by the Rust crate's tests.
+os.environ["SYNOLOGY_FS_SMB_DISABLE"] = "1"
 
 
 # Stock responses the tests assemble together. Keeping them in one place
