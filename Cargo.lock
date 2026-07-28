@@ -2193,6 +2193,7 @@ dependencies = [
 name = "synology-filestation-core"
 version = "0.1.20"
 dependencies = [
+ "async-trait",
  "bytes",
  "libc",
  "reqwest",
@@ -2247,6 +2248,7 @@ dependencies = [
 name = "synology-filestation-smb"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "smb2",
  "synology-filestation-core",

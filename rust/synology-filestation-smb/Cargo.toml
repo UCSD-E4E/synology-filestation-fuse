@@ -18,6 +18,7 @@ smb2 = "0.13"
 bytes = "1"
 tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 tracing = "0.1"
+async-trait = "0.1"
 # Shared error model so SMB failures classify the same way HTTP ones do.
 synology-filestation-core = { path = "../synology-filestation-core" }
 

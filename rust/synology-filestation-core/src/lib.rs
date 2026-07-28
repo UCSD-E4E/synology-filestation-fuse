@@ -7,8 +7,10 @@
 
 pub mod client;
 pub mod error;
+pub mod transport;
 pub mod types;
 
 pub use client::{SynologyClient, ThrottleConfig};
 pub use error::SynoFsError;
+pub use transport::{BreakerConfig, CircuitBreaker, ReadTransport, WriteTransport};
 pub use types::{SynoAdditional, SynoFileInfo, SynoOwner, SynoPerm, SynoTime};

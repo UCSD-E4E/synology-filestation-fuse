@@ -11,15 +11,26 @@
 //! connection pool (future work).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use smb2::{ClientConfig, SmbClient, Tree};
-use synology_filestation_core::SynoFsError;
+use synology_filestation_core::{ReadTransport, SynoFsError, WriteTransport};
 use tokio::sync::Mutex;
 
 use crate::error::to_syno_error;
 use crate::path::SmbPath;
+
+/// Process-wide sequence making temp write names unique so concurrent writers
+/// to the same target don't clobber each other's `.part` file.
+static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Name of the adjacent temp file an atomic write goes to before the rename.
+fn part_name(path: &str, seq: u64) -> String {
+    format!("{path}.part-{}-{}", std::process::id(), seq)
+}
 
 /// Connection parameters for [`SmbTransport::connect`].
 #[derive(Debug, Clone)]
@@ -176,6 +187,75 @@ impl SmbTransport {
             .map_err(|e| to_syno_error(&e))?;
         Ok(Bytes::from(data))
     }
+
+    /// Atomically replace the file at `logical` with `data`.
+    ///
+    /// Writes to an adjacent temp file, then renames it onto the target — so
+    /// the target is never observed partial (old-or-nothing), which is what
+    /// makes the selection layer's fallback to HTTP safe. DSM's rename won't
+    /// replace an existing file (`ReplaceIfExists=false`), so on a name
+    /// collision we delete the target first; the temp still holds the complete
+    /// new bytes throughout, so a failure there leaves the data recoverable
+    /// rather than a corrupt target.
+    pub async fn write_atomic(&self, logical: &str, data: &[u8]) -> Result<(), SynoFsError> {
+        let loc = SmbPath::from_logical(logical)?;
+        let tmp = part_name(&loc.path, PART_SEQ.fetch_add(1, Ordering::Relaxed));
+
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        ensure_tree(client, trees, &loc.share).await?;
+        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+
+        // Full contents → temp file adjacent to the target (pipelined, so files
+        // past the server's MaxWriteSize go in chunks).
+        if let Err(e) = client.write_file_pipelined(tree, &tmp, data).await {
+            let _ = client.delete_file(tree, &tmp).await; // best-effort cleanup
+            return Err(to_syno_error(&e));
+        }
+
+        // Move temp → target atomically. On collision (target exists), delete
+        // the target and retry the rename.
+        match client.rename(tree, &tmp, &loc.path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == smb2::ErrorKind::AlreadyExists => {
+                client
+                    .delete_file(tree, &loc.path)
+                    .await
+                    .map_err(|e| to_syno_error(&e))?;
+                if let Err(e) = client.rename(tree, &tmp, &loc.path).await {
+                    let _ = client.delete_file(tree, &tmp).await;
+                    return Err(to_syno_error(&e));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = client.delete_file(tree, &tmp).await;
+                Err(to_syno_error(&e))
+            }
+        }
+    }
+}
+
+// ── core transport traits (dependency inversion) ─────────────────────────────
+//
+// Implementing these is the entire integration surface: SynologyClient prefers
+// an injected backend over HTTP and falls back on transport failures, with no
+// change to any read/write call site.
+
+#[async_trait]
+impl ReadTransport for SmbTransport {
+    async fn read(&self, path: &str, offset: u64, length: u64) -> Result<Bytes, SynoFsError> {
+        // Delegate to the inherent method (inherent wins over the trait method
+        // for this path syntax, so this is not recursive).
+        SmbTransport::read(self, path, offset, length).await
+    }
+}
+
+#[async_trait]
+impl WriteTransport for SmbTransport {
+    async fn write(&self, path: &str, data: &[u8]) -> Result<(), SynoFsError> {
+        self.write_atomic(path, data).await
+    }
 }
 
 /// Attach `share` if it isn't already, caching the `Tree`. Split borrows of the
@@ -193,4 +273,34 @@ async fn ensure_tree(
         trees.insert(share.to_string(), tree);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn part_name_is_adjacent_and_unique_per_seq() {
+        let pid = std::process::id();
+        assert_eq!(
+            part_name("REEF/img.orf", 7),
+            format!("REEF/img.orf.part-{pid}-7")
+        );
+        // Different sequence numbers yield different temp names (so concurrent
+        // writers to the same target don't collide).
+        assert_ne!(part_name("x", 1), part_name("x", 2));
+    }
+
+    #[test]
+    fn smbconfig_new_defaults_and_addr() {
+        let cfg = SmbConfig::new("nas.example.com", "user", "pass");
+        assert_eq!(cfg.port, 445);
+        assert_eq!(cfg.addr(), "nas.example.com:445");
+        let cfg2 = SmbConfig::new("nas.example.com:1445", "user", "pass");
+        assert_eq!(
+            cfg2.addr(),
+            "nas.example.com:1445",
+            "explicit port preserved"
+        );
+    }
 }
