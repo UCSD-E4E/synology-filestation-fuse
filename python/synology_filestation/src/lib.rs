@@ -322,12 +322,37 @@ impl Client {
             backoff_max_ms,
         );
 
-        // Login failures are always AuthError regardless of the underlying
-        // DSM code: a 400 means "wrong password", a 408 means "OTP required",
-        // etc., but for the caller they're all "auth didn't work." Wrap in
-        // LoginFailed so synofs_to_pyerr routes to the AuthError class.
-        py.allow_threads(|| runtime.block_on(client.login(username, password, otp)))
-            .map_err(|e| synofs_to_pyerr(py, SynoFsError::LoginFailed(Box::new(e))))?;
+        // Log in, then transparently prefer SMB when it's reachable — bulk
+        // transfers then avoid the HTTP Download/Upload API (and the synoscgi
+        // backend it can saturate). `auto_connect` returns None on any failure,
+        // so this silently degrades to HTTP; it runs before the client is frozen
+        // into an Arc because injecting a backend consumes the client.
+        //
+        // Login failures are always AuthError regardless of the underlying DSM
+        // code (wrong password / OTP required / …); wrap in LoginFailed so
+        // synofs_to_pyerr routes to the AuthError class.
+        let rt = runtime.clone();
+        let client = py
+            .allow_threads(move || {
+                rt.block_on(async move {
+                    client
+                        .login(username, password, otp)
+                        .await
+                        .map_err(|e| SynoFsError::LoginFailed(Box::new(e)))?;
+                    let client = match synology_filestation_smb::auto_connect(
+                        host, username, password,
+                    )
+                    .await
+                    {
+                        Some(smb) => client
+                            .with_read_transport(smb.clone())
+                            .with_write_transport(smb),
+                        None => client,
+                    };
+                    Ok::<_, SynoFsError>(client)
+                })
+            })
+            .map_err(|e| synofs_to_pyerr(py, e))?;
 
         Ok(Self {
             inner: Arc::new(client),
@@ -621,6 +646,14 @@ impl AsyncClient {
                 .login(&username, &password, otp.as_deref())
                 .await
                 .map_err(|e| synofs_to_pyerr_gil(SynoFsError::LoginFailed(Box::new(e))))?;
+            // Transparently prefer SMB when reachable; None → HTTP only.
+            let client =
+                match synology_filestation_smb::auto_connect(&host, &username, &password).await {
+                    Some(smb) => client
+                        .with_read_transport(smb.clone())
+                        .with_write_transport(smb),
+                    None => client,
+                };
             Ok(AsyncClient {
                 inner: Arc::new(client),
             })

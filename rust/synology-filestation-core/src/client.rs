@@ -1,12 +1,13 @@
 use bytes::Bytes;
 use reqwest::{multipart, Client};
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use tracing::{debug, warn};
 
 use crate::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
+use crate::transport::{BreakerConfig, CircuitBreaker, ReadTransport, WriteTransport};
 use crate::types::{
     AuthData, CreateFolderData, GetInfoData, ListData, ListShareData, RenameData, SynoFileInfo,
     SynoResponse, UploadData, ADDITIONAL_FIELDS, SHARE_ADDITIONAL_FIELDS,
@@ -151,7 +152,23 @@ fn full_jitter(cap: Duration) -> Duration {
     cap.mul_f64(frac)
 }
 
-#[derive(Debug)]
+/// One injected backend plus the [`CircuitBreaker`] tracking its health. The
+/// breaker is a `std::sync::Mutex` (quick, non-async state mutation, never held
+/// across an `.await`).
+struct TransportEntry<T: ?Sized> {
+    transport: Arc<T>,
+    breaker: StdMutex<CircuitBreaker>,
+}
+
+impl<T: ?Sized> TransportEntry<T> {
+    fn new(transport: Arc<T>) -> Self {
+        Self {
+            transport,
+            breaker: StdMutex::new(CircuitBreaker::new(BreakerConfig::default())),
+        }
+    }
+}
+
 pub struct SynologyClient {
     http: Client,
     base_url: String,
@@ -166,6 +183,23 @@ pub struct SynologyClient {
     /// behavior; opt in via [`SynologyClient::with_auto_relogin`].
     auto_relogin: bool,
     creds: RwLock<Option<StoredCreds>>,
+    /// Injected read backends, tried in order before the HTTP Download API.
+    /// Empty (the default) = HTTP only, i.e. exactly today's behavior.
+    read_transports: Vec<TransportEntry<dyn ReadTransport>>,
+    /// Injected write backends, tried in order before the HTTP Upload API.
+    write_transports: Vec<TransportEntry<dyn WriteTransport>>,
+}
+
+impl std::fmt::Debug for SynologyClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SynologyClient")
+            .field("base_url", &self.base_url)
+            .field("auto_relogin", &self.auto_relogin)
+            .field("throttled", &self.throttle.is_some())
+            .field("read_transports", &self.read_transports.len())
+            .field("write_transports", &self.write_transports.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SynologyClient {
@@ -200,7 +234,30 @@ impl SynologyClient {
             auto_relogin: false,
             creds: RwLock::new(None),
             throttle: None,
+            read_transports: Vec::new(),
+            write_transports: Vec::new(),
         }
+    }
+
+    /// Inject a [`ReadTransport`] backend (e.g. SMB). `download` will prefer it
+    /// over the HTTP Download API when its circuit breaker is closed, falling
+    /// back to HTTP (and any later backends) on transport failures. Call more
+    /// than once to register several backends; they are tried in the order
+    /// added, with HTTP last.
+    ///
+    /// Read/write call sites never change — this is the only place a consumer
+    /// opts a backend in.
+    pub fn with_read_transport(mut self, transport: Arc<dyn ReadTransport>) -> Self {
+        self.read_transports.push(TransportEntry::new(transport));
+        self
+    }
+
+    /// Inject a [`WriteTransport`] backend. `upload` will prefer it over the
+    /// HTTP Upload API when healthy, falling back to HTTP on transport failures.
+    /// The backend's `write` must be atomic so fallback is safe.
+    pub fn with_write_transport(mut self, transport: Arc<dyn WriteTransport>) -> Self {
+        self.write_transports.push(TransportEntry::new(transport));
+        self
     }
 
     /// Attach a [`ThrottleConfig`] that caps concurrency, spaces requests, and
@@ -599,18 +656,58 @@ impl SynologyClient {
         Ok(())
     }
 
-    /// Download file bytes, optionally with a byte range.
+    /// Read file bytes, preferring any injected [`ReadTransport`] backend (SMB,
+    /// …) over the HTTP Download API.
     ///
-    /// Retries up to 2 times on transient connection errors (e.g. the NAS closing a
-    /// keep-alive connection mid-stream while the response body is being read).
+    /// Backends are tried in registration order; on a transport failure
+    /// (`category() == Transport`) the backend's circuit breaker trips and we
+    /// fall back to the next backend, ending at the HTTP path. A definitive
+    /// error (not-found / permission) from a backend propagates unchanged — the
+    /// backend answered, so re-asking HTTP the same question is pointless.
+    ///
+    /// With no backends injected this is exactly the HTTP download — today's
+    /// behavior, unchanged.
+    pub async fn download(
+        &self,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Bytes, SynoFsError> {
+        for entry in &self.read_transports {
+            // Lock only to read/update breaker state — never held across await.
+            let allowed = entry.breaker.lock().unwrap().allows(Instant::now());
+            if !allowed {
+                continue;
+            }
+            match entry.transport.read(path, offset, length).await {
+                Ok(bytes) => {
+                    entry.breaker.lock().unwrap().on_success();
+                    return Ok(bytes);
+                }
+                Err(e) if e.category() == ErrorCategory::Transport => {
+                    warn!("read backend failed (transient), falling back: {e}");
+                    entry.breaker.lock().unwrap().on_failure(Instant::now());
+                    continue;
+                }
+                Err(e) => {
+                    // Reachable backend, definitive answer — trust it, propagate.
+                    entry.breaker.lock().unwrap().on_success();
+                    return Err(e);
+                }
+            }
+        }
+        self.http_download(path, offset, length).await
+    }
+
+    /// The HTTP FileStation Download implementation: throttle, transient retry,
+    /// and DSM JSON-envelope detection. Used directly when no read backend is
+    /// injected, and as the fallback when a backend trips its breaker.
     ///
     /// DSM violates HTTP convention by returning `200 OK` with a JSON error
     /// envelope (`{"success":false,"error":{"code":119}}`) when the SID is
-    /// invalid, instead of a 4xx. We detect that case via the `Content-Type`
-    /// header and surface `ApiError(code)` rather than returning the JSON as
-    /// file content. Without this, a SID-expired download would silently
-    /// produce garbage data on disk.
-    pub async fn download(
+    /// invalid, instead of a 4xx. We detect that case via the response body and
+    /// surface `ApiError(code)` rather than returning the JSON as file content.
+    async fn http_download(
         &self,
         path: &str,
         offset: u64,
@@ -698,8 +795,55 @@ impl SynologyClient {
         Err(last_err)
     }
 
-    /// Upload file contents (replaces entire file).
+    /// Write a whole file, preferring any injected [`WriteTransport`] backend
+    /// (SMB, …) over the HTTP Upload API.
+    ///
+    /// Same selection + circuit-breaker semantics as [`download`](Self::download).
+    /// A backend's `write` is atomic (old-or-nothing), so falling back to HTTP
+    /// after a failed attempt can't collide with a half-written file. With no
+    /// backends injected this is exactly the HTTP upload.
     pub async fn upload(
+        &self,
+        folder_path: &str,
+        filename: &str,
+        data: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<(), SynoFsError> {
+        // Only route *replacing* writes through a write backend. A backend's
+        // `write` unconditionally replaces the file, so it can't honor
+        // `overwrite=false`'s "fail if the file already exists" contract —
+        // those go straight to the HTTP path, which does.
+        if overwrite && !self.write_transports.is_empty() {
+            let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
+            for entry in &self.write_transports {
+                let allowed = entry.breaker.lock().unwrap().allows(Instant::now());
+                if !allowed {
+                    continue;
+                }
+                match entry.transport.write(&full_path, &data).await {
+                    Ok(()) => {
+                        entry.breaker.lock().unwrap().on_success();
+                        return Ok(());
+                    }
+                    Err(e) if e.category() == ErrorCategory::Transport => {
+                        warn!("write backend failed (transient), falling back: {e}");
+                        entry.breaker.lock().unwrap().on_failure(Instant::now());
+                        continue;
+                    }
+                    Err(e) => {
+                        entry.breaker.lock().unwrap().on_success();
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        self.http_upload(folder_path, filename, data, overwrite)
+            .await
+    }
+
+    /// The HTTP FileStation Upload implementation. Used directly when no write
+    /// backend is injected, and as the fallback when a backend trips its breaker.
+    async fn http_upload(
         &self,
         folder_path: &str,
         filename: &str,
@@ -2248,5 +2392,188 @@ mod tests {
         let client = client_for(&server);
         let bytes = client.download("/share/f", 0, 0).await.unwrap();
         assert_eq!(bytes.as_ref(), b"plain");
+    }
+
+    // ── read/write backend selection + fallback ──────────────────────────────
+    //
+    // Dependency-inversion: a backend (SMB today) is injected and preferred over
+    // HTTP, with a per-backend circuit breaker. These pin the selection contract
+    // with a configurable fake backend so no real SMB server is needed.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    enum Behave {
+        Ok(&'static [u8]),
+        Transient, // category Transport → fall back
+        NotFound,  // definitive → propagate, no fallback
+    }
+
+    struct FakeBackend {
+        behave: Behave,
+        calls: AtomicUsize,
+    }
+
+    impl FakeBackend {
+        fn new(behave: Behave) -> Arc<Self> {
+            Arc::new(Self {
+                behave,
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+        fn outcome_bytes(&self) -> Result<Bytes, SynoFsError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behave {
+                Behave::Ok(b) => Ok(Bytes::from_static(b)),
+                Behave::Transient => Err(SynoFsError::Io("backend down".into())),
+                Behave::NotFound => Err(SynoFsError::NotFound),
+            }
+        }
+        fn outcome_unit(&self) -> Result<(), SynoFsError> {
+            self.outcome_bytes().map(|_| ())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadTransport for FakeBackend {
+        async fn read(&self, _p: &str, _o: u64, _l: u64) -> Result<Bytes, SynoFsError> {
+            self.outcome_bytes()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WriteTransport for FakeBackend {
+        async fn write(&self, _p: &str, _d: &[u8]) -> Result<(), SynoFsError> {
+            self.outcome_unit()
+        }
+    }
+
+    /// A client pointed at a dead address (no HTTP server) — proves a call is
+    /// served by the backend without ever touching HTTP.
+    fn offline_client() -> SynologyClient {
+        SynologyClient::new("127.0.0.1", 1, false)
+    }
+
+    #[tokio::test]
+    async fn download_prefers_healthy_backend_and_skips_http() {
+        let backend = FakeBackend::new(Behave::Ok(b"from-smb"));
+        let client = offline_client().with_read_transport(backend.clone());
+        // No HTTP server exists; if this returns, the backend served it.
+        let bytes = client.download("/share/f", 0, 0).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"from-smb");
+        assert_eq!(backend.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn download_propagates_definitive_backend_error_without_http() {
+        let backend = FakeBackend::new(Behave::NotFound);
+        let client = offline_client().with_read_transport(backend.clone());
+        let err = client.download("/share/missing", 0, 0).await.unwrap_err();
+        assert!(matches!(err, SynoFsError::NotFound));
+        assert_eq!(backend.call_count(), 1, "definitive error must not retry");
+    }
+
+    #[tokio::test]
+    async fn download_falls_back_to_http_on_transient_backend_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"from-http".to_vec()))
+            .mount(&server)
+            .await;
+
+        let backend = FakeBackend::new(Behave::Transient);
+        let client = client_for(&server).with_read_transport(backend.clone());
+        let bytes = client.download("/share/f", 0, 0).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"from-http", "fell back to HTTP");
+        assert_eq!(backend.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn breaker_opens_and_stops_probing_a_failing_backend() {
+        // Default breaker threshold is 2. A persistently-transient backend
+        // should be tried on the first two downloads, then skipped entirely
+        // while HTTP keeps serving.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"http".to_vec()))
+            .mount(&server)
+            .await;
+
+        let backend = FakeBackend::new(Behave::Transient);
+        let client = client_for(&server).with_read_transport(backend.clone());
+
+        for _ in 0..5 {
+            assert_eq!(
+                client.download("/share/f", 0, 0).await.unwrap().as_ref(),
+                b"http"
+            );
+        }
+        // Tried twice (to reach the threshold), then the open breaker skips it.
+        assert_eq!(backend.call_count(), 2, "breaker should stop probing");
+    }
+
+    #[tokio::test]
+    async fn upload_prefers_backend_then_falls_back_on_transient() {
+        // Healthy write backend serves a replacing upload with no HTTP server.
+        let ok_backend = FakeBackend::new(Behave::Ok(b""));
+        let client = offline_client().with_write_transport(ok_backend.clone());
+        client
+            .upload("/share", "f.bin", b"data".to_vec(), true)
+            .await
+            .unwrap();
+        assert_eq!(ok_backend.call_count(), 1);
+
+        // Transient write failure falls back to the HTTP upload.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+        let bad_backend = FakeBackend::new(Behave::Transient);
+        let client = client_for(&server).with_write_transport(bad_backend.clone());
+        client
+            .upload("/share", "f.bin", b"data".to_vec(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            bad_backend.call_count(),
+            1,
+            "attempted before HTTP fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_overwrite_false_bypasses_write_backend() {
+        // A backend's write always replaces, so it can't honor overwrite=false's
+        // "fail if the file exists" contract — that write must go to HTTP, not
+        // silently clobber an existing file over SMB.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+        let backend = FakeBackend::new(Behave::Ok(b""));
+        let client = client_for(&server).with_write_transport(backend.clone());
+        client
+            .upload("/share", "f.bin", b"data".to_vec(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.call_count(),
+            0,
+            "overwrite=false must skip the replacing write backend"
+        );
     }
 }

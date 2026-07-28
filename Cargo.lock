@@ -2193,6 +2193,7 @@ dependencies = [
 name = "synology-filestation-core"
 version = "0.1.20"
 dependencies = [
+ "async-trait",
  "bytes",
  "libc",
  "reqwest",
@@ -2210,6 +2211,7 @@ dependencies = [
  "serde_json",
  "synology-filestation-core",
  "synology-filestation-fuse",
+ "synology-filestation-smb",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2235,6 +2237,7 @@ dependencies = [
  "serde",
  "serde_json",
  "synology-filestation-core",
+ "synology-filestation-smb",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2247,6 +2250,7 @@ dependencies = [
 name = "synology-filestation-smb"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "smb2",
  "synology-filestation-core",
@@ -2262,6 +2266,7 @@ dependencies = [
  "pyo3-async-runtimes",
  "pyo3-log",
  "synology-filestation-core",
+ "synology-filestation-smb",
  "tokio",
  "tracing-log",
 ]
