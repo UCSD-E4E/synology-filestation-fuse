@@ -69,3 +69,60 @@ async fn live_read_over_smb() {
         full.len()
     );
 }
+
+/// Write-path validation — separate and doubly-gated so it never writes to the
+/// NAS by accident. Provide `SMB2_WRITE_LOGICAL` pointing at a **scratch** file
+/// you don't mind being created/overwritten/deleted (e.g. a temp share):
+///
+/// ```text
+/// SMB2_HOST=e4e-nas.ucsd.edu SMB2_DOMAIN=KRG SMB2_USER=… SMB2_PASS='…' \
+/// SMB2_WRITE_LOGICAL='/scratch/smb-spike-write-test.bin' \
+/// nix develop ../.. -c cargo test -p synology-filestation-smb -- --ignored --nocapture write_
+/// ```
+///
+/// Exercises both `write_atomic` paths: the create case (single rename) and the
+/// overwrite case (move-aside), reading the bytes back each time, then cleans up.
+#[tokio::test]
+#[ignore = "writes to the NAS; set SMB2_WRITE_LOGICAL to a scratch path and run with --ignored"]
+async fn write_roundtrip_over_smb() {
+    let (host, user, pass, logical) = match (
+        env("SMB2_HOST"),
+        env("SMB2_USER"),
+        env("SMB2_PASS"),
+        env("SMB2_WRITE_LOGICAL"),
+    ) {
+        (Some(h), Some(u), Some(p), Some(l)) => (h, u, p, l),
+        _ => panic!("set SMB2_HOST, SMB2_USER, SMB2_PASS, SMB2_WRITE_LOGICAL (a scratch path)"),
+    };
+
+    let mut cfg = SmbConfig::new(host, user, pass);
+    cfg.domain = env("SMB2_DOMAIN").unwrap_or_default();
+    let smb = SmbTransport::connect(&cfg).await.expect("connect + auth");
+
+    // 1. Create case: target should not exist → single-rename fast path.
+    let first = b"smb write roundtrip: create".to_vec();
+    smb.write_atomic(&logical, &first)
+        .await
+        .expect("create write");
+    let back = smb.read_full(&logical).await.expect("read back create");
+    assert_eq!(back.as_ref(), first.as_slice(), "create bytes round-trip");
+
+    // 2. Overwrite case: target now exists → move-aside replace path.
+    let second = b"smb write roundtrip: overwrite (longer than the first payload)".to_vec();
+    smb.write_atomic(&logical, &second)
+        .await
+        .expect("overwrite write");
+    let back = smb.read_full(&logical).await.expect("read back overwrite");
+    assert_eq!(
+        back.as_ref(),
+        second.as_slice(),
+        "overwrite bytes round-trip"
+    );
+
+    // 3. stat agrees, then clean up the scratch file.
+    let meta = smb.stat(&logical).await.expect("stat after write");
+    assert_eq!(meta.size, second.len() as u64);
+    let _ = smb.delete(&logical).await; // best-effort cleanup
+
+    println!("OK: write create + overwrite round-trip; scratch cleaned up");
+}

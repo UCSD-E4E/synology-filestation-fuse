@@ -7,7 +7,9 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use tracing::{debug, warn};
 
 use crate::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
-use crate::transport::{BreakerConfig, CircuitBreaker, ReadTransport, WriteTransport};
+use crate::transport::{
+    BreakerConfig, CircuitBreaker, ReadTransport, StreamWriteTransport, WriteTransport,
+};
 use crate::types::{
     AuthData, CreateFolderData, GetInfoData, ListData, ListShareData, RenameData, SynoFileInfo,
     SynoResponse, UploadData, ADDITIONAL_FIELDS, SHARE_ADDITIONAL_FIELDS,
@@ -188,6 +190,9 @@ pub struct SynologyClient {
     read_transports: Vec<TransportEntry<dyn ReadTransport>>,
     /// Injected write backends, tried in order before the HTTP Upload API.
     write_transports: Vec<TransportEntry<dyn WriteTransport>>,
+    /// Injected streaming write backends, tried in order by `upload_from_path`
+    /// before falling back to reading the file into memory + HTTP upload.
+    stream_write_transports: Vec<TransportEntry<dyn StreamWriteTransport>>,
 }
 
 impl std::fmt::Debug for SynologyClient {
@@ -198,6 +203,10 @@ impl std::fmt::Debug for SynologyClient {
             .field("throttled", &self.throttle.is_some())
             .field("read_transports", &self.read_transports.len())
             .field("write_transports", &self.write_transports.len())
+            .field(
+                "stream_write_transports",
+                &self.stream_write_transports.len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -236,6 +245,7 @@ impl SynologyClient {
             throttle: None,
             read_transports: Vec::new(),
             write_transports: Vec::new(),
+            stream_write_transports: Vec::new(),
         }
     }
 
@@ -257,6 +267,15 @@ impl SynologyClient {
     /// The backend's `write` must be atomic so fallback is safe.
     pub fn with_write_transport(mut self, transport: Arc<dyn WriteTransport>) -> Self {
         self.write_transports.push(TransportEntry::new(transport));
+        self
+    }
+
+    /// Inject a [`StreamWriteTransport`] backend. `upload_from_path` will stream
+    /// the local file straight to it when healthy, falling back to reading the
+    /// file into memory + HTTP upload on transport failures.
+    pub fn with_stream_write_transport(mut self, transport: Arc<dyn StreamWriteTransport>) -> Self {
+        self.stream_write_transports
+            .push(TransportEntry::new(transport));
         self
     }
 
@@ -837,6 +856,55 @@ impl SynologyClient {
                 }
             }
         }
+        self.http_upload(folder_path, filename, data, overwrite)
+            .await
+    }
+
+    /// Stream a local file to the NAS, preferring a [`StreamWriteTransport`]
+    /// backend (SMB) so a large file is never buffered in memory.
+    ///
+    /// Same selection + circuit-breaker + `overwrite` semantics as
+    /// [`upload`](Self::upload). On fallback (no stream backend, or a transient
+    /// failure) the file is read into memory and sent over HTTP — so the memory
+    /// win applies to the streaming path, and correctness holds either way.
+    pub async fn upload_from_path(
+        &self,
+        local: &Path,
+        folder_path: &str,
+        filename: &str,
+        overwrite: bool,
+    ) -> Result<(), SynoFsError> {
+        if overwrite && !self.stream_write_transports.is_empty() {
+            let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
+            for entry in &self.stream_write_transports {
+                let allowed = entry.breaker.lock().unwrap().allows(Instant::now());
+                if !allowed {
+                    continue;
+                }
+                match entry.transport.write_from_path(&full_path, local).await {
+                    Ok(()) => {
+                        entry.breaker.lock().unwrap().on_success();
+                        return Ok(());
+                    }
+                    Err(e) if e.category() == ErrorCategory::Transport => {
+                        warn!("stream write backend failed (transient), falling back: {e}");
+                        entry.breaker.lock().unwrap().on_failure(Instant::now());
+                        continue;
+                    }
+                    Err(e) => {
+                        entry.breaker.lock().unwrap().on_success();
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        // Fallback: read the file into memory and take the HTTP upload path.
+        let data = tokio::fs::read(local).await.map_err(|e| {
+            SynoFsError::Io(format!(
+                "upload_from_path: read {} failed: {e}",
+                local.display()
+            ))
+        })?;
         self.http_upload(folder_path, filename, data, overwrite)
             .await
     }
@@ -2450,6 +2518,13 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl StreamWriteTransport for FakeBackend {
+        async fn write_from_path(&self, _p: &str, _local: &Path) -> Result<(), SynoFsError> {
+            self.outcome_unit()
+        }
+    }
+
     /// A client pointed at a dead address (no HTTP server) — proves a call is
     /// served by the backend without ever touching HTTP.
     fn offline_client() -> SynologyClient {
@@ -2575,5 +2650,72 @@ mod tests {
             0,
             "overwrite=false must skip the replacing write backend"
         );
+    }
+
+    // ── streaming upload (upload_from_path) selection ────────────────────────
+
+    fn write_scratch_file(bytes: &[u8]) -> std::path::PathBuf {
+        let p = unique_tmp_path("stream-upload-src.bin");
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn upload_from_path_prefers_stream_backend_and_skips_http() {
+        let src = write_scratch_file(b"streamed payload");
+        let backend = FakeBackend::new(Behave::Ok(b""));
+        let client = offline_client().with_stream_write_transport(backend.clone());
+        client
+            .upload_from_path(&src, "/share", "f.bin", true)
+            .await
+            .unwrap();
+        assert_eq!(backend.call_count(), 1);
+        std::fs::remove_file(&src).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_from_path_falls_back_to_http_on_transient() {
+        let src = write_scratch_file(b"streamed payload");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+        let backend = FakeBackend::new(Behave::Transient);
+        let client = client_for(&server).with_stream_write_transport(backend.clone());
+        client
+            .upload_from_path(&src, "/share", "f.bin", true)
+            .await
+            .unwrap();
+        assert_eq!(backend.call_count(), 1, "attempted before HTTP fallback");
+        std::fs::remove_file(&src).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_from_path_overwrite_false_bypasses_stream_backend() {
+        let src = write_scratch_file(b"streamed payload");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+        let backend = FakeBackend::new(Behave::Ok(b""));
+        let client = client_for(&server).with_stream_write_transport(backend.clone());
+        client
+            .upload_from_path(&src, "/share", "f.bin", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.call_count(),
+            0,
+            "overwrite=false must skip the streaming backend"
+        );
+        std::fs::remove_file(&src).ok();
     }
 }

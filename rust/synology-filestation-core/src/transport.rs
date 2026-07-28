@@ -31,6 +31,7 @@
 //! *safe* — a failed primary write can't leave a half-file for the HTTP path (or
 //! another backend) to collide with. It need not be a single atomic operation.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -54,6 +55,20 @@ pub trait WriteTransport: Send + Sync {
     /// Replace the whole file at `path` with `data`. On failure the previous
     /// file must be preserved (old-or-new, never a partial target).
     async fn write(&self, path: &str, data: &[u8]) -> Result<(), SynoFsError>;
+}
+
+/// A write backend that **streams** a local file to `remote_path` without
+/// buffering it in memory — for staging large files (e.g. `.ORF`).
+///
+/// The source is a **local path**, not a reader, deliberately: a failed attempt
+/// must be retryable by the selection layer's HTTP fallback, and a consumed
+/// reader can't be rewound while a re-openable file can. Same old-or-new /
+/// error contract as [`WriteTransport`].
+#[async_trait]
+pub trait StreamWriteTransport: Send + Sync {
+    /// Stream the contents of local file `local` into `remote_path`, replacing
+    /// it (old-or-new).
+    async fn write_from_path(&self, remote_path: &str, local: &Path) -> Result<(), SynoFsError>;
 }
 
 /// Tuning for a backend's [`CircuitBreaker`].

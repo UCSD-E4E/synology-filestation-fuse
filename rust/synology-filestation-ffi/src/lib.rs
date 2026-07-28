@@ -333,7 +333,8 @@ pub unsafe extern "C" fn syno_connect(
                 )) {
                     Some(smb) => client
                         .with_read_transport(smb.clone())
-                        .with_write_transport(smb),
+                        .with_write_transport(smb.clone())
+                        .with_stream_write_transport(smb),
                     None => client,
                 };
                 let handle = Box::new(SynoClient {

@@ -11,6 +11,7 @@
 //! connection pool (future work).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +19,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use smb2::{ClientConfig, SmbClient, Tree};
-use synology_filestation_core::{ReadTransport, SynoFsError, WriteTransport};
+use synology_filestation_core::{ReadTransport, StreamWriteTransport, SynoFsError, WriteTransport};
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 use crate::error::to_syno_error;
@@ -240,6 +242,19 @@ impl SmbTransport {
         Ok(Bytes::from(data))
     }
 
+    /// Delete a file at `logical`.
+    pub async fn delete(&self, logical: &str) -> Result<(), SynoFsError> {
+        let loc = SmbPath::from_logical(logical)?;
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        ensure_tree(client, trees, &loc.share).await?;
+        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        client
+            .delete_file(tree, &loc.path)
+            .await
+            .map_err(|e| to_syno_error(&e))
+    }
+
     /// Read an entire file. Uses the pipelined, chunked read so multi-MB `.ORF`
     /// files (past the 8 MiB `MaxReadSize`) come back whole.
     pub async fn read_full(&self, logical: &str) -> Result<Bytes, SynoFsError> {
@@ -289,36 +304,69 @@ impl SmbTransport {
             return Err(to_syno_error(&e));
         }
 
-        // Fast path: the target name is free → a single rename commits.
-        match client.rename(tree, &tmp, &loc.path).await {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == smb2::ErrorKind::AlreadyExists => {} // replace below
-            Err(e) => {
-                let _ = client.delete_file(tree, &tmp).await;
-                return Err(to_syno_error(&e));
+        commit_temp(client, tree, &tmp, &loc.path, seq).await
+    }
+
+    /// Stream a local file to `logical` (old-or-new) **without buffering it in
+    /// memory** — for staging large files. Chunks are read from disk and written
+    /// straight to an SMB temp file via a streaming writer, then committed onto
+    /// the target with the same move-aside guarantee as [`write_atomic`].
+    ///
+    /// [`write_atomic`]: Self::write_atomic
+    pub async fn write_from_path(&self, logical: &str, local: &Path) -> Result<(), SynoFsError> {
+        let loc = SmbPath::from_logical(logical)?;
+        let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = part_name(&loc.path, seq);
+
+        let mut file = tokio::fs::File::open(local)
+            .await
+            .map_err(|e| SynoFsError::Io(format!("open {}: {e}", local.display())))?;
+
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        ensure_tree(client, trees, &loc.share).await?;
+
+        // Streaming writer to the temp file (owned; retains no borrow of client).
+        let mut writer = {
+            let tree = trees.get(&loc.share).expect("tree just ensured");
+            match client.create_file_writer(tree, &tmp).await {
+                Ok(w) => w,
+                Err(e) => return Err(to_syno_error(&e)),
             }
+        };
+
+        // Pump disk → SMB in bounded chunks (constant memory, ~1 MiB).
+        let mut buf = vec![0u8; 1 << 20];
+        let mut stream_err: Option<SynoFsError> = None;
+        loop {
+            match file.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = writer.write_chunk(&buf[..n]).await {
+                        stream_err = Some(to_syno_error(&e));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    stream_err = Some(SynoFsError::Io(format!("read {}: {e}", local.display())));
+                    break;
+                }
+            }
+        }
+        // Always finalize to close the SMB handle; surface a finish error only if
+        // the pump itself hadn't already failed.
+        if let Err(e) = writer.finish().await {
+            stream_err.get_or_insert_with(|| to_syno_error(&e));
         }
 
-        // Replace path: move the old file aside, move the new one in, drop the
-        // backup. We never delete the only copy of the data, so a failure at any
-        // step leaves the old file recoverable (from the backup) and the new
-        // bytes recoverable (from the temp).
-        let backup = part_name(&format!("{}.bak", loc.path), seq);
-        if let Err(e) = client.rename(tree, &loc.path, &backup).await {
-            let _ = client.delete_file(tree, &tmp).await;
-            return Err(to_syno_error(&e));
+        if let Some(e) = stream_err {
+            let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+            let _ = client.delete_file(tree, &tmp).await; // best-effort cleanup
+            return Err(e);
         }
-        match client.rename(tree, &tmp, &loc.path).await {
-            Ok(()) => {
-                let _ = client.delete_file(tree, &backup).await; // best-effort
-                Ok(())
-            }
-            Err(e) => {
-                // Put the old file back; leave the new bytes in `tmp`.
-                let _ = client.rename(tree, &backup, &loc.path).await;
-                Err(to_syno_error(&e))
-            }
-        }
+
+        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        commit_temp(client, tree, &tmp, &loc.path, seq).await
     }
 }
 
@@ -341,6 +389,54 @@ impl ReadTransport for SmbTransport {
 impl WriteTransport for SmbTransport {
     async fn write(&self, path: &str, data: &[u8]) -> Result<(), SynoFsError> {
         self.write_atomic(path, data).await
+    }
+}
+
+#[async_trait]
+impl StreamWriteTransport for SmbTransport {
+    async fn write_from_path(&self, remote_path: &str, local: &Path) -> Result<(), SynoFsError> {
+        SmbTransport::write_from_path(self, remote_path, local).await
+    }
+}
+
+/// Commit a fully-written temp file onto `target` with an **old-or-new**
+/// guarantee. Fast path: a single rename. On a name collision (DSM's rename is
+/// `ReplaceIfExists=false`) the old file is moved aside to a backup, the temp is
+/// renamed in, and the backup dropped — restoring the old file on failure and
+/// never deleting the only copy of the data. Shared by [`SmbTransport::write_atomic`]
+/// and [`SmbTransport::write_from_path`].
+async fn commit_temp(
+    client: &mut SmbClient,
+    tree: &mut Tree,
+    tmp: &str,
+    target: &str,
+    seq: u64,
+) -> Result<(), SynoFsError> {
+    // Fast path: the target name is free → a single rename commits.
+    match client.rename(tree, tmp, target).await {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == smb2::ErrorKind::AlreadyExists => {} // replace below
+        Err(e) => {
+            let _ = client.delete_file(tree, tmp).await;
+            return Err(to_syno_error(&e));
+        }
+    }
+
+    // Replace path: move-aside so no step ever deletes the only copy.
+    let backup = part_name(&format!("{target}.bak"), seq);
+    if let Err(e) = client.rename(tree, target, &backup).await {
+        let _ = client.delete_file(tree, tmp).await;
+        return Err(to_syno_error(&e));
+    }
+    match client.rename(tree, tmp, target).await {
+        Ok(()) => {
+            let _ = client.delete_file(tree, &backup).await; // best-effort
+            Ok(())
+        }
+        Err(e) => {
+            let _ = client.rename(tree, &backup, target).await; // restore old
+            Err(to_syno_error(&e))
+        }
     }
 }
 
