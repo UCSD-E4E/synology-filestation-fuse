@@ -809,7 +809,11 @@ impl SynologyClient {
         data: Vec<u8>,
         overwrite: bool,
     ) -> Result<(), SynoFsError> {
-        if !self.write_transports.is_empty() {
+        // Only route *replacing* writes through a write backend. A backend's
+        // `write` unconditionally replaces the file, so it can't honor
+        // `overwrite=false`'s "fail if the file already exists" contract —
+        // those go straight to the HTTP path, which does.
+        if overwrite && !self.write_transports.is_empty() {
             let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
             for entry in &self.write_transports {
                 let allowed = entry.breaker.lock().unwrap().allows(Instant::now());
@@ -2516,11 +2520,11 @@ mod tests {
 
     #[tokio::test]
     async fn upload_prefers_backend_then_falls_back_on_transient() {
-        // Healthy write backend serves the upload with no HTTP server present.
+        // Healthy write backend serves a replacing upload with no HTTP server.
         let ok_backend = FakeBackend::new(Behave::Ok(b""));
         let client = offline_client().with_write_transport(ok_backend.clone());
         client
-            .upload("/share", "f.bin", b"data".to_vec(), false)
+            .upload("/share", "f.bin", b"data".to_vec(), true)
             .await
             .unwrap();
         assert_eq!(ok_backend.call_count(), 1);
@@ -2537,13 +2541,39 @@ mod tests {
         let bad_backend = FakeBackend::new(Behave::Transient);
         let client = client_for(&server).with_write_transport(bad_backend.clone());
         client
-            .upload("/share", "f.bin", b"data".to_vec(), false)
+            .upload("/share", "f.bin", b"data".to_vec(), true)
             .await
             .unwrap();
         assert_eq!(
             bad_backend.call_count(),
             1,
             "attempted before HTTP fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_overwrite_false_bypasses_write_backend() {
+        // A backend's write always replaces, so it can't honor overwrite=false's
+        // "fail if the file exists" contract — that write must go to HTTP, not
+        // silently clobber an existing file over SMB.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+        let backend = FakeBackend::new(Behave::Ok(b""));
+        let client = client_for(&server).with_write_transport(backend.clone());
+        client
+            .upload("/share", "f.bin", b"data".to_vec(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.call_count(),
+            0,
+            "overwrite=false must skip the replacing write backend"
         );
     }
 }

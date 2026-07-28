@@ -255,48 +255,67 @@ impl SmbTransport {
         Ok(Bytes::from(data))
     }
 
-    /// Atomically replace the file at `logical` with `data`.
+    /// Replace the file at `logical` with `data`, guaranteeing **old-or-new**:
+    /// a reader always sees either the previous file or the fully-written new
+    /// one — never a partial/corrupt file — and no data is lost on failure.
+    /// That is what makes the selection layer's fallback to HTTP safe.
     ///
-    /// Writes to an adjacent temp file, then renames it onto the target — so
-    /// the target is never observed partial (old-or-nothing), which is what
-    /// makes the selection layer's fallback to HTTP safe. DSM's rename won't
-    /// replace an existing file (`ReplaceIfExists=false`), so on a name
-    /// collision we delete the target first; the temp still holds the complete
-    /// new bytes throughout, so a failure there leaves the data recoverable
-    /// rather than a corrupt target.
+    /// New bytes go to an adjacent temp file first. If the target name is free,
+    /// a single rename commits. If it already exists (DSM's rename is
+    /// `ReplaceIfExists=false`, so it can't replace in one step) the old file is
+    /// moved aside to a backup, the new file is renamed in, and the backup is
+    /// dropped; a failure mid-swap restores the old file, and the new bytes stay
+    /// in the temp — so no copy of the data is ever the only casualty of a
+    /// failed step.
+    ///
+    /// Caveat: during the swap there is a brief window where the target *name*
+    /// is momentarily absent (the bytes are safe in the backup/temp). A truly
+    /// atomic replace needs `ReplaceIfExists=true` in the SMB layer — tracked as
+    /// a follow-up.
     pub async fn write_atomic(&self, logical: &str, data: &[u8]) -> Result<(), SynoFsError> {
         let loc = SmbPath::from_logical(logical)?;
-        let tmp = part_name(&loc.path, PART_SEQ.fetch_add(1, Ordering::Relaxed));
+        let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = part_name(&loc.path, seq);
 
         let mut guard = self.inner.lock().await;
         let Inner { client, trees } = &mut *guard;
         ensure_tree(client, trees, &loc.share).await?;
         let tree = trees.get_mut(&loc.share).expect("tree just ensured");
 
-        // Full contents → temp file adjacent to the target (pipelined, so files
+        // New contents → temp file adjacent to the target (pipelined, so files
         // past the server's MaxWriteSize go in chunks).
         if let Err(e) = client.write_file_pipelined(tree, &tmp, data).await {
             let _ = client.delete_file(tree, &tmp).await; // best-effort cleanup
             return Err(to_syno_error(&e));
         }
 
-        // Move temp → target atomically. On collision (target exists), delete
-        // the target and retry the rename.
+        // Fast path: the target name is free → a single rename commits.
         match client.rename(tree, &tmp, &loc.path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == smb2::ErrorKind::AlreadyExists => {
-                client
-                    .delete_file(tree, &loc.path)
-                    .await
-                    .map_err(|e| to_syno_error(&e))?;
-                if let Err(e) = client.rename(tree, &tmp, &loc.path).await {
-                    let _ = client.delete_file(tree, &tmp).await;
-                    return Err(to_syno_error(&e));
-                }
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == smb2::ErrorKind::AlreadyExists => {} // replace below
+            Err(e) => {
+                let _ = client.delete_file(tree, &tmp).await;
+                return Err(to_syno_error(&e));
+            }
+        }
+
+        // Replace path: move the old file aside, move the new one in, drop the
+        // backup. We never delete the only copy of the data, so a failure at any
+        // step leaves the old file recoverable (from the backup) and the new
+        // bytes recoverable (from the temp).
+        let backup = part_name(&format!("{}.bak", loc.path), seq);
+        if let Err(e) = client.rename(tree, &loc.path, &backup).await {
+            let _ = client.delete_file(tree, &tmp).await;
+            return Err(to_syno_error(&e));
+        }
+        match client.rename(tree, &tmp, &loc.path).await {
+            Ok(()) => {
+                let _ = client.delete_file(tree, &backup).await; // best-effort
                 Ok(())
             }
             Err(e) => {
-                let _ = client.delete_file(tree, &tmp).await;
+                // Put the old file back; leave the new bytes in `tmp`.
+                let _ = client.rename(tree, &backup, &loc.path).await;
                 Err(to_syno_error(&e))
             }
         }

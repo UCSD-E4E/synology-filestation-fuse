@@ -25,10 +25,11 @@
 //!
 //! ## Write contract
 //!
-//! [`WriteTransport::write`] MUST be **atomic**: on success the whole file is
-//! replaced; on failure the target is left untouched (old-or-nothing, never a
-//! partial). That is what makes fallback *safe* — a failed primary write can't
-//! leave a half-file for the HTTP path (or another backend) to collide with.
+//! [`WriteTransport::write`] MUST NOT leave a partial/corrupt target: on success
+//! the whole file is replaced; on failure the previous file is preserved
+//! (**old-or-new**, never a partial, no data lost). That is what makes fallback
+//! *safe* — a failed primary write can't leave a half-file for the HTTP path (or
+//! another backend) to collide with. It need not be a single atomic operation.
 
 use std::time::{Duration, Instant};
 
@@ -46,10 +47,12 @@ pub trait ReadTransport: Send + Sync {
 }
 
 /// A write backend replacing a whole file, as an alternative to the HTTP Upload
-/// API. Implementations MUST be atomic — see the [module docs](self#write-contract).
+/// API. Implementations MUST NOT leave a partial target on failure — see the
+/// [module docs](self#write-contract).
 #[async_trait]
 pub trait WriteTransport: Send + Sync {
-    /// Atomically replace the file at `path` with `data`.
+    /// Replace the whole file at `path` with `data`. On failure the previous
+    /// file must be preserved (old-or-new, never a partial target).
     async fn write(&self, path: &str, data: &[u8]) -> Result<(), SynoFsError>;
 }
 
