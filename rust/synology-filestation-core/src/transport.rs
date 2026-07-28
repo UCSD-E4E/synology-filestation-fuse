@@ -47,6 +47,20 @@ pub trait ReadTransport: Send + Sync {
     async fn read(&self, path: &str, offset: u64, length: u64) -> Result<Bytes, SynoFsError>;
 }
 
+/// A read backend that **streams** a remote file to a local path without
+/// buffering it in memory — the symmetric counterpart of [`StreamWriteTransport`],
+/// for fetching large files (e.g. `.ORF`).
+///
+/// The destination is a **local path**: the implementor writes it atomically
+/// (old-or-nothing — a failed fetch leaves no file, so the selection layer's
+/// HTTP fallback can write cleanly). Same transient-vs-definitive error contract
+/// as [`ReadTransport`].
+#[async_trait]
+pub trait StreamReadTransport: Send + Sync {
+    /// Stream `remote_path` into the local file `local`, atomically.
+    async fn read_to_path(&self, remote_path: &str, local: &Path) -> Result<(), SynoFsError>;
+}
+
 /// A write backend replacing a whole file, as an alternative to the HTTP Upload
 /// API. Implementations MUST NOT leave a partial target on failure — see the
 /// [module docs](self#write-contract).

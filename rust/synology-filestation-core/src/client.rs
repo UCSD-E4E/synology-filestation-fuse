@@ -8,7 +8,8 @@ use tracing::{debug, warn};
 
 use crate::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
 use crate::transport::{
-    BreakerConfig, CircuitBreaker, ReadTransport, StreamWriteTransport, WriteTransport,
+    BreakerConfig, CircuitBreaker, ReadTransport, StreamReadTransport, StreamWriteTransport,
+    WriteTransport,
 };
 use crate::types::{
     AuthData, CreateFolderData, GetInfoData, ListData, ListShareData, RenameData, SynoFileInfo,
@@ -193,6 +194,9 @@ pub struct SynologyClient {
     /// Injected streaming write backends, tried in order by `upload_from_path`
     /// before falling back to reading the file into memory + HTTP upload.
     stream_write_transports: Vec<TransportEntry<dyn StreamWriteTransport>>,
+    /// Injected streaming read backends, tried in order by `download_to_path`
+    /// before falling back to the buffering HTTP download.
+    stream_read_transports: Vec<TransportEntry<dyn StreamReadTransport>>,
 }
 
 impl std::fmt::Debug for SynologyClient {
@@ -207,6 +211,7 @@ impl std::fmt::Debug for SynologyClient {
                 "stream_write_transports",
                 &self.stream_write_transports.len(),
             )
+            .field("stream_read_transports", &self.stream_read_transports.len())
             .finish_non_exhaustive()
     }
 }
@@ -246,6 +251,7 @@ impl SynologyClient {
             read_transports: Vec::new(),
             write_transports: Vec::new(),
             stream_write_transports: Vec::new(),
+            stream_read_transports: Vec::new(),
         }
     }
 
@@ -275,6 +281,15 @@ impl SynologyClient {
     /// file into memory + HTTP upload on transport failures.
     pub fn with_stream_write_transport(mut self, transport: Arc<dyn StreamWriteTransport>) -> Self {
         self.stream_write_transports
+            .push(TransportEntry::new(transport));
+        self
+    }
+
+    /// Inject a [`StreamReadTransport`] backend. `download_to_path` will stream
+    /// straight to disk through it when healthy, falling back to the buffering
+    /// HTTP download on transport failures.
+    pub fn with_stream_read_transport(mut self, transport: Arc<dyn StreamReadTransport>) -> Self {
+        self.stream_read_transports
             .push(TransportEntry::new(transport));
         self
     }
@@ -628,20 +643,53 @@ impl SynologyClient {
         }
     }
 
-    /// Download a remote file atomically to `local_path`.
+    /// Download a remote file atomically to `local_path`, preferring a
+    /// [`StreamReadTransport`] backend (SMB) so a large file streams straight to
+    /// disk with no in-memory copy.
     ///
-    /// Bytes are first written to `<local_path>.part`, fsynced, then renamed
-    /// to `local_path`. The final file is therefore never observed in a
-    /// partial state — either it's complete and correct, or it doesn't exist.
-    /// If any step fails (network error, DSM JSON-error envelope, I/O error)
-    /// the temporary file is removed and `local_path` is left untouched.
-    ///
-    /// This guards against the common DSM footgun of `200 OK` responses whose
-    /// body is `{"success":false,"error":{"code":119}}` — the synology-api
-    /// PyPI package opens its destination in `'wb'` first and silently leaves
-    /// a 0-byte file in this scenario.
+    /// The destination is never observed partial — either complete or absent.
+    /// On a transport failure the backend's breaker trips and we fall back to
+    /// the buffering HTTP download; a definitive error (not-found / permission)
+    /// propagates. With no stream backend injected this is exactly the HTTP
+    /// download — today's behavior.
     #[allow(dead_code)] // unused by the FUSE binary today; consumed by python bindings.
     pub async fn download_to_path(
+        &self,
+        remote_path: &str,
+        local_path: &Path,
+    ) -> Result<(), SynoFsError> {
+        for entry in &self.stream_read_transports {
+            let allowed = entry.breaker.lock().unwrap().allows(Instant::now());
+            if !allowed {
+                continue;
+            }
+            match entry.transport.read_to_path(remote_path, local_path).await {
+                Ok(()) => {
+                    entry.breaker.lock().unwrap().on_success();
+                    return Ok(());
+                }
+                Err(e) if e.category() == ErrorCategory::Transport => {
+                    warn!("stream read backend failed (transient), falling back: {e}");
+                    entry.breaker.lock().unwrap().on_failure(Instant::now());
+                    continue;
+                }
+                Err(e) => {
+                    entry.breaker.lock().unwrap().on_success();
+                    return Err(e);
+                }
+            }
+        }
+        self.http_download_to_path(remote_path, local_path).await
+    }
+
+    /// HTTP download-to-file: buffer the bytes, then write atomically
+    /// (`<local_path>.part`, fsync, rename). Used when no stream backend is
+    /// injected, and as the fallback when one trips its breaker.
+    ///
+    /// Guards against the DSM footgun of `200 OK` responses whose body is
+    /// `{"success":false,"error":{"code":119}}` — the synology-api PyPI package
+    /// opens its destination in `'wb'` first and silently leaves a 0-byte file.
+    async fn http_download_to_path(
         &self,
         remote_path: &str,
         local_path: &Path,
@@ -2525,6 +2573,23 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl StreamReadTransport for FakeBackend {
+        async fn read_to_path(&self, _remote: &str, local: &Path) -> Result<(), SynoFsError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behave {
+                // A real backend writes the destination; do the same so tests
+                // can assert on the file it produced.
+                Behave::Ok(b) => {
+                    std::fs::write(local, b).map_err(|e| SynoFsError::Io(e.to_string()))?;
+                    Ok(())
+                }
+                Behave::Transient => Err(SynoFsError::Io("backend down".into())),
+                Behave::NotFound => Err(SynoFsError::NotFound),
+            }
+        }
+    }
+
     /// A client pointed at a dead address (no HTTP server) — proves a call is
     /// served by the backend without ever touching HTTP.
     fn offline_client() -> SynologyClient {
@@ -2717,5 +2782,54 @@ mod tests {
             "overwrite=false must skip the streaming backend"
         );
         std::fs::remove_file(&src).ok();
+    }
+
+    // ── streaming download (download_to_path) selection ──────────────────────
+
+    #[tokio::test]
+    async fn download_to_path_prefers_stream_backend_and_skips_http() {
+        let backend = FakeBackend::new(Behave::Ok(b"streamed to disk"));
+        let client = offline_client().with_stream_read_transport(backend.clone());
+        let dest = unique_tmp_path("stream-dl.bin");
+        client.download_to_path("/share/f", &dest).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"streamed to disk");
+        assert_eq!(backend.call_count(), 1);
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[tokio::test]
+    async fn download_to_path_falls_back_to_http_on_transient() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"from-http".to_vec()))
+            .mount(&server)
+            .await;
+        let backend = FakeBackend::new(Behave::Transient);
+        let client = client_for(&server).with_stream_read_transport(backend.clone());
+        let dest = unique_tmp_path("stream-dl-fallback.bin");
+        client.download_to_path("/share/f", &dest).await.unwrap();
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"from-http",
+            "fell back to HTTP"
+        );
+        assert_eq!(backend.call_count(), 1);
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[tokio::test]
+    async fn download_to_path_propagates_definitive_backend_error() {
+        let backend = FakeBackend::new(Behave::NotFound);
+        let client = offline_client().with_stream_read_transport(backend.clone());
+        let dest = unique_tmp_path("stream-dl-missing.bin");
+        let err = client
+            .download_to_path("/share/missing", &dest)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::NotFound));
+        assert_eq!(backend.call_count(), 1);
+        assert!(!dest.exists(), "definitive failure leaves no file");
     }
 }

@@ -19,8 +19,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use smb2::{ClientConfig, SmbClient, Tree};
-use synology_filestation_core::{ReadTransport, StreamWriteTransport, SynoFsError, WriteTransport};
-use tokio::io::AsyncReadExt;
+use synology_filestation_core::{
+    ReadTransport, StreamReadTransport, StreamWriteTransport, SynoFsError, SynologyClient,
+    WriteTransport,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::error::to_syno_error;
@@ -147,6 +150,28 @@ pub async fn auto_connect(host: &str, username: &str, password: &str) -> Option<
     }
 }
 
+/// [`auto_connect`] + attach: connect SMB from the login credentials and inject
+/// it into `client` as the preferred backend for **reads, writes, and streaming
+/// transfers**. Returns the client unchanged when SMB is unavailable.
+///
+/// This one call is the entire consumer integration — a consumer never lists the
+/// individual backends, so adding a future backend here never touches consumers.
+pub async fn auto_attach(
+    client: SynologyClient,
+    host: &str,
+    username: &str,
+    password: &str,
+) -> SynologyClient {
+    match auto_connect(host, username, password).await {
+        Some(smb) => client
+            .with_read_transport(smb.clone())
+            .with_write_transport(smb.clone())
+            .with_stream_write_transport(smb.clone())
+            .with_stream_read_transport(smb),
+        None => client,
+    }
+}
+
 /// Minimal file metadata — enough for the verify-once integrity check that
 /// compares SMB against the FileStation API's `getinfo` before trusting SMB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +293,58 @@ impl SmbTransport {
             .await
             .map_err(|e| to_syno_error(&e))?;
         Ok(Bytes::from(data))
+    }
+
+    /// Stream a remote file to the local path `local` **without buffering it in
+    /// memory** — for fetching large files. Chunks stream from SMB straight to a
+    /// local temp file, which is fsynced and renamed onto `local` (atomic
+    /// old-or-nothing; a failure leaves no destination).
+    pub async fn read_to_path(&self, logical: &str, local: &Path) -> Result<(), SynoFsError> {
+        let loc = SmbPath::from_logical(logical)?;
+        let tmp = {
+            let mut t = local.as_os_str().to_os_string();
+            t.push(".part");
+            std::path::PathBuf::from(t)
+        };
+
+        let result: Result<(), SynoFsError> = async {
+            let mut guard = self.inner.lock().await;
+            let Inner { client, trees } = &mut *guard;
+            ensure_tree(client, trees, &loc.share).await?;
+
+            // Streaming download handle (owned; retains no borrow of client).
+            let mut download = {
+                let tree = trees.get(&loc.share).expect("tree just ensured");
+                client
+                    .download(tree, &loc.path)
+                    .await
+                    .map_err(|e| to_syno_error(&e))?
+            };
+
+            // Pump SMB → local temp in bounded chunks (constant memory).
+            let mut file = tokio::fs::File::create(&tmp)
+                .await
+                .map_err(|e| SynoFsError::Io(format!("create {}: {e}", tmp.display())))?;
+            while let Some(chunk) = download.next_chunk().await {
+                let bytes = chunk.map_err(|e| to_syno_error(&e))?;
+                file.write_all(&bytes)
+                    .await
+                    .map_err(|e| SynoFsError::Io(format!("write {}: {e}", tmp.display())))?;
+            }
+            file.sync_all()
+                .await
+                .map_err(|e| SynoFsError::Io(format!("fsync {}: {e}", tmp.display())))?;
+            drop(file);
+            tokio::fs::rename(&tmp, local)
+                .await
+                .map_err(|e| SynoFsError::Io(format!("rename to {}: {e}", local.display())))
+        }
+        .await;
+
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await; // best-effort cleanup
+        }
+        result
     }
 
     /// Replace the file at `logical` with `data`, guaranteeing **old-or-new**:
@@ -396,6 +473,13 @@ impl WriteTransport for SmbTransport {
 impl StreamWriteTransport for SmbTransport {
     async fn write_from_path(&self, remote_path: &str, local: &Path) -> Result<(), SynoFsError> {
         SmbTransport::write_from_path(self, remote_path, local).await
+    }
+}
+
+#[async_trait]
+impl StreamReadTransport for SmbTransport {
+    async fn read_to_path(&self, remote_path: &str, local: &Path) -> Result<(), SynoFsError> {
+        SmbTransport::read_to_path(self, remote_path, local).await
     }
 }
 
