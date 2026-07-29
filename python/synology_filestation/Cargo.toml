@@ -11,7 +11,7 @@ name = "synology_filestation"
 crate-type = ["cdylib"]
 
 [dependencies]
-synology-filestation-core = { path = "../../rust/synology-filestation-core", version = "0.1.16" }
+synology-filestation-core = { path = "../../rust/synology-filestation-core" }
 # In-process SMB backend. The client transparently prefers it over the HTTP
 # Download/Upload API when reachable, protecting the NAS's shared synoscgi
 # backend; falls back to HTTP automatically otherwise.

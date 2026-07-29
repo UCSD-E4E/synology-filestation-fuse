@@ -15,7 +15,7 @@ name = "synology-filestation-fuse"
 path = "src/main.rs"
 
 [dependencies]
-synology-filestation-core = { path = "../synology-filestation-core", version = "0.1.16" }
+synology-filestation-core = { path = "../synology-filestation-core" }
 synology-filestation-smb = { path = "../synology-filestation-smb" }
 
 tokio       = { version = "1", features = ["full"] }
