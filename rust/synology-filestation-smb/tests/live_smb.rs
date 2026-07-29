@@ -20,6 +20,37 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
+/// Require the three connection env vars plus a fourth (a path), or panic.
+fn require4(fourth: &str) -> (String, String, String, String) {
+    match (
+        env("SMB2_HOST"),
+        env("SMB2_USER"),
+        env("SMB2_PASS"),
+        env(fourth),
+    ) {
+        (Some(h), Some(u), Some(p), Some(x)) => (h, u, p, x),
+        _ => panic!("set SMB2_HOST, SMB2_USER, SMB2_PASS, {fourth}"),
+    }
+}
+
+async fn connect_from_env(host: String, user: String, pass: String) -> SmbTransport {
+    let mut cfg = SmbConfig::new(host, user, pass);
+    cfg.domain = env("SMB2_DOMAIN").unwrap_or_default();
+    SmbTransport::connect(&cfg)
+        .await
+        .expect("connect + auth should succeed")
+}
+
+fn report_throughput(label: &str, bytes: u64, elapsed: std::time::Duration) {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        mib / elapsed.as_secs_f64()
+    } else {
+        f64::INFINITY
+    };
+    println!("  {label}: {bytes} bytes in {elapsed:.2?}  ({rate:.1} MiB/s)");
+}
+
 #[tokio::test]
 #[ignore = "needs a reachable NAS + credentials; run with --ignored"]
 async fn live_read_over_smb() {
@@ -125,4 +156,74 @@ async fn write_roundtrip_over_smb() {
     let _ = smb.delete(&logical).await; // best-effort cleanup
 
     println!("OK: write create + overwrite round-trip; scratch cleaned up");
+}
+
+/// Streaming write (`write_from_path`) — the path Python `upload` /
+/// `upload_from_path` actually use. Streams a local file larger than the 8 MiB
+/// MaxWriteSize (so the writer chunks) to `SMB2_WRITE_LOGICAL`, reads it back,
+/// verifies the bytes, and cleans up both ends. Prints throughput.
+#[tokio::test]
+#[ignore = "streams a file to the NAS; set SMB2_WRITE_LOGICAL to a scratch path and run with --ignored"]
+async fn write_from_path_stream_over_smb() {
+    let (host, user, pass, logical) = require4("SMB2_WRITE_LOGICAL");
+    let smb = connect_from_env(host, user, pass).await;
+
+    // Deterministic payload, > MaxWriteSize so the streaming write chunks.
+    let len = 12 * 1024 * 1024usize;
+    let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let src = std::env::temp_dir().join("smb-stream-src-DELETEME.bin");
+    std::fs::write(&src, &payload).expect("write local source file");
+
+    let start = std::time::Instant::now();
+    smb.write_from_path(&logical, &src)
+        .await
+        .expect("streaming write to NAS");
+    report_throughput("write_from_path", len as u64, start.elapsed());
+
+    // Read back and verify the whole payload round-tripped.
+    let back = smb.read_full(&logical).await.expect("read back");
+    assert_eq!(back.len(), len, "size round-trip");
+    assert_eq!(back.as_ref(), payload.as_slice(), "bytes round-trip");
+
+    let _ = smb.delete(&logical).await;
+    let _ = std::fs::remove_file(&src);
+    println!(
+        "OK: streaming write ({} MiB) round-trip; cleaned up",
+        len / (1024 * 1024)
+    );
+}
+
+/// Streaming read (`read_to_path`) — the path Python `download_to` /
+/// `download_to_path` actually use. Streams `SMB2_LOGICAL` to a local temp file
+/// and verifies it matches both `stat` and a whole-file read. Prints throughput.
+#[tokio::test]
+#[ignore = "streams a NAS file to disk; set SMB2_LOGICAL and run with --ignored"]
+async fn read_to_path_stream_over_smb() {
+    let (host, user, pass, logical) = require4("SMB2_LOGICAL");
+    let smb = connect_from_env(host, user, pass).await;
+
+    let meta = smb.stat(&logical).await.expect("stat");
+    let dest = std::env::temp_dir().join("smb-stream-dst-DELETEME.bin");
+
+    let start = std::time::Instant::now();
+    smb.read_to_path(&logical, &dest)
+        .await
+        .expect("streaming read to disk");
+    report_throughput("read_to_path", meta.size, start.elapsed());
+
+    // On-disk size matches stat, and bytes match the whole-file read path.
+    let on_disk = std::fs::read(&dest).expect("read local dest");
+    assert_eq!(on_disk.len() as u64, meta.size, "size matches stat");
+    let whole = smb.read_full(&logical).await.expect("whole-file read");
+    assert_eq!(
+        on_disk,
+        whole.as_ref(),
+        "streamed-to-disk bytes match the whole-file read"
+    );
+
+    let _ = std::fs::remove_file(&dest);
+    println!(
+        "OK: streaming read ({} bytes) to disk matches whole-file read; cleaned up",
+        meta.size
+    );
 }
