@@ -216,8 +216,23 @@ impl std::fmt::Debug for SynologyClient {
     }
 }
 
+/// Install the ring `CryptoProvider` as the process default exactly once.
+///
+/// reqwest 0.13 is built with `rustls-no-provider`, so rustls has no compiled-in
+/// provider and needs one installed before the first TLS `ClientConfig` is built.
+/// We use ring (not aws-lc-rs) to keep the build free of cmake/NASM. `install_default`
+/// errors if a provider is already set — by another crate or a second client — which
+/// is exactly the idempotent outcome we want, so the result is intentionally ignored.
+fn install_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl SynologyClient {
     pub fn new(host: &str, port: u16, https: bool) -> Self {
+        install_crypto_provider();
         let scheme = if https { "https" } else { "http" };
         let base_url = format!("{}://{}:{}/webapi", scheme, host, port);
         let http = Client::builder()
@@ -1197,6 +1212,23 @@ mod tests {
         let (host, port_str) = without_scheme.rsplit_once(':').unwrap();
         let port: u16 = port_str.parse().unwrap();
         SynologyClient::with_auto_relogin(host, port, false)
+    }
+
+    // ── TLS crypto provider ────────────────────────────────────────────────────
+
+    /// reqwest 0.13 is built with `rustls-no-provider`, so rustls ships no
+    /// compiled-in crypto provider. `SynologyClient::new` must install one (ring)
+    /// as the process default, otherwise the first HTTPS handshake to the NAS
+    /// panics/fails. The wiremock tests only speak HTTP and would not catch this,
+    /// so pin it directly: after constructing an HTTPS client a default provider
+    /// must be present.
+    #[test]
+    fn https_client_installs_default_crypto_provider() {
+        let _client = SynologyClient::new("nas.example.invalid", 5001, true);
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "SynologyClient::new must install a default rustls CryptoProvider"
+        );
     }
 
     // ── login ────────────────────────────────────────────────────────────────
