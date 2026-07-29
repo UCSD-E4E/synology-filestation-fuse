@@ -41,6 +41,16 @@ async fn connect_from_env(host: String, user: String, pass: String) -> SmbTransp
         .expect("connect + auth should succeed")
 }
 
+/// A per-run-unique path under the temp dir, so concurrent/repeated runs (or a
+/// leftover file from a crashed run) never collide.
+fn scratch_local(name: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("smb-live-{}-{}-{name}", std::process::id(), nanos))
+}
+
 fn report_throughput(label: &str, bytes: u64, elapsed: std::time::Duration) {
     let mib = bytes as f64 / (1024.0 * 1024.0);
     let rate = if elapsed.as_secs_f64() > 0.0 {
@@ -171,22 +181,24 @@ async fn write_from_path_stream_over_smb() {
     // Deterministic payload, > MaxWriteSize so the streaming write chunks.
     let len = 12 * 1024 * 1024usize;
     let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-    let src = std::env::temp_dir().join("smb-stream-src-DELETEME.bin");
+    let src = scratch_local("stream-src.bin");
     std::fs::write(&src, &payload).expect("write local source file");
 
     let start = std::time::Instant::now();
-    smb.write_from_path(&logical, &src)
-        .await
-        .expect("streaming write to NAS");
-    report_throughput("write_from_path", len as u64, start.elapsed());
+    let write_res = smb.write_from_path(&logical, &src).await;
+    let elapsed = start.elapsed();
+    let readback = smb.read_full(&logical).await;
 
-    // Read back and verify the whole payload round-tripped.
-    let back = smb.read_full(&logical).await.expect("read back");
-    assert_eq!(back.len(), len, "size round-trip");
-    assert_eq!(back.as_ref(), payload.as_slice(), "bytes round-trip");
-
+    // Best-effort cleanup BEFORE asserting, so a failed assertion never leaves
+    // the NAS scratch file or the local temp behind.
     let _ = smb.delete(&logical).await;
     let _ = std::fs::remove_file(&src);
+
+    write_res.expect("streaming write to NAS");
+    report_throughput("write_from_path", len as u64, elapsed);
+    let back = readback.expect("read back");
+    assert_eq!(back.len(), len, "size round-trip");
+    assert_eq!(back.as_ref(), payload.as_slice(), "bytes round-trip");
     println!(
         "OK: streaming write ({} MiB) round-trip; cleaned up",
         len / (1024 * 1024)
@@ -203,25 +215,27 @@ async fn read_to_path_stream_over_smb() {
     let smb = connect_from_env(host, user, pass).await;
 
     let meta = smb.stat(&logical).await.expect("stat");
-    let dest = std::env::temp_dir().join("smb-stream-dst-DELETEME.bin");
+    let dest = scratch_local("stream-dst.bin");
 
     let start = std::time::Instant::now();
-    smb.read_to_path(&logical, &dest)
-        .await
-        .expect("streaming read to disk");
-    report_throughput("read_to_path", meta.size, start.elapsed());
+    let read_res = smb.read_to_path(&logical, &dest).await;
+    let elapsed = start.elapsed();
+    let on_disk = std::fs::read(&dest);
+    let whole = smb.read_full(&logical).await;
 
-    // On-disk size matches stat, and bytes match the whole-file read path.
-    let on_disk = std::fs::read(&dest).expect("read local dest");
+    // Best-effort cleanup BEFORE asserting, so a failure leaves nothing behind.
+    let _ = std::fs::remove_file(&dest);
+
+    read_res.expect("streaming read to disk");
+    report_throughput("read_to_path", meta.size, elapsed);
+    let on_disk = on_disk.expect("read local dest");
     assert_eq!(on_disk.len() as u64, meta.size, "size matches stat");
-    let whole = smb.read_full(&logical).await.expect("whole-file read");
+    let whole = whole.expect("whole-file read");
     assert_eq!(
         on_disk,
         whole.as_ref(),
         "streamed-to-disk bytes match the whole-file read"
     );
-
-    let _ = std::fs::remove_file(&dest);
     println!(
         "OK: streaming read ({} bytes) to disk matches whole-file read; cleaned up",
         meta.size
