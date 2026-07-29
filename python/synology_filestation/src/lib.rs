@@ -272,7 +272,7 @@ impl Client {
         // We must release the GIL while blocking on async work — otherwise
         // every Python thread waiting on a network call would serialize and
         // deadlock-prone code in user-land would pay through the nose.
-        py.allow_threads(|| self.runtime.block_on(fut))
+        py.detach(|| self.runtime.block_on(fut))
             .map_err(|e| synofs_to_pyerr(py, e))
     }
 }
@@ -333,7 +333,7 @@ impl Client {
         // synofs_to_pyerr routes to the AuthError class.
         let rt = runtime.clone();
         let client = py
-            .allow_threads(move || {
+            .detach(move || {
                 rt.block_on(async move {
                     client
                         .login(username, password, otp)
@@ -361,7 +361,7 @@ impl Client {
     fn exists(&self, py: Python<'_>, path: &str) -> PyResult<bool> {
         let inner = self.inner.clone();
         let path = path.to_string();
-        let result = py.allow_threads(|| {
+        let result = py.detach(|| {
             self.runtime
                 .block_on(async { inner.with_relogin_retry(|| inner.get_info(&path)).await })
         });
@@ -379,7 +379,7 @@ impl Client {
         let inner = self.inner.clone();
         let path_owned = path.to_string();
         let info = py
-            .allow_threads(|| {
+            .detach(|| {
                 self.runtime.block_on(async {
                     inner
                         .with_relogin_retry(|| inner.get_info(&path_owned))
@@ -409,7 +409,7 @@ impl Client {
         let inner = self.inner.clone();
         let path_owned = path.to_string();
         let bytes = py
-            .allow_threads(|| {
+            .detach(|| {
                 self.runtime.block_on(async {
                     inner
                         .with_relogin_retry(|| inner.download(&path_owned, offset, length))
@@ -424,7 +424,7 @@ impl Client {
         let inner = self.inner.clone();
         let path_owned = path.to_string();
         let entries = py
-            .allow_threads(|| {
+            .detach(|| {
                 self.runtime.block_on(async {
                     inner
                         .with_relogin_retry(|| inner.list_dir(&path_owned))
@@ -438,7 +438,7 @@ impl Client {
     fn list_shares<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let inner = self.inner.clone();
         let shares = py
-            .allow_threads(|| {
+            .detach(|| {
                 self.runtime
                     .block_on(async { inner.with_relogin_retry(|| inner.list_shares()).await })
             })
@@ -460,7 +460,7 @@ impl Client {
         let (folder, filename) = split_remote_path(remote_path)?;
         let buf = data.to_vec();
         let inner = self.inner.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime.block_on(async {
                 inner
                     .with_relogin_retry(|| inner.upload(&folder, &filename, buf.clone(), overwrite))
@@ -474,7 +474,7 @@ impl Client {
         let inner = self.inner.clone();
         let remote = remote_path.to_string();
         let local: PathBuf = local_path.into();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime
                 .block_on(async { inner.download_to_path(&remote, &local).await })
         })
@@ -502,7 +502,7 @@ impl Client {
         let remote_dir = remote_dir.to_string();
         // Streams the file straight to SMB when available (no in-memory copy);
         // falls back to reading it in + HTTP upload otherwise. API unchanged.
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime.block_on(async {
                 inner
                     .with_relogin_retry(|| {
@@ -525,7 +525,7 @@ impl Client {
         let inner = self.inner.clone();
         let parent = parent_dir.to_string();
         let name = name.to_string();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime.block_on(async {
                 inner
                     .with_relogin_retry(|| inner.create_folder(&parent, &name))
@@ -539,7 +539,7 @@ impl Client {
     fn delete(&self, py: Python<'_>, remote_path: &str) -> PyResult<()> {
         let inner = self.inner.clone();
         let path = remote_path.to_string();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.runtime
                 .block_on(async { inner.with_relogin_retry(|| inner.delete(&path)).await })
         })
@@ -554,14 +554,14 @@ impl Client {
     fn __exit__(
         &self,
         py: Python<'_>,
-        exc_type: PyObject,
-        exc_value: PyObject,
-        traceback: PyObject,
+        exc_type: Py<PyAny>,
+        exc_value: Py<PyAny>,
+        traceback: Py<PyAny>,
     ) -> PyResult<bool> {
         // Best-effort logout: a failure during logout shouldn't shadow an
         // exception in the `with` body, so swallow logout errors entirely.
         let inner = self.inner.clone();
-        let _ = py.allow_threads(|| self.runtime.block_on(async move { inner.logout().await }));
+        let _ = py.detach(|| self.runtime.block_on(async move { inner.logout().await }));
         Ok(false) // do not suppress exceptions raised inside the `with` block
     }
 }
@@ -579,13 +579,13 @@ use pyo3_async_runtimes::tokio::future_into_py;
 /// blocks where we don't have a Python token in scope but need to construct
 /// a typed Python exception before returning.
 fn synofs_to_pyerr_gil(e: SynoFsError) -> PyErr {
-    Python::with_gil(|py| synofs_to_pyerr(py, e))
+    Python::attach(|py| synofs_to_pyerr(py, e))
 }
 
 /// Same as `synofs_to_pyerr_gil` but applies the getinfo-specific 408 →
 /// NoSuchFile remap. Centralized so sync and async getinfo agree.
 fn getinfo_err_gil(e: SynoFsError) -> PyErr {
-    Python::with_gil(|py| match e {
+    Python::attach(|py| match e {
         SynoFsError::ApiError(408) => synofs_to_pyerr(py, SynoFsError::NotFound),
         other => synofs_to_pyerr(py, other),
     })
@@ -672,7 +672,7 @@ impl AsyncClient {
                 .with_relogin_retry(|| inner.get_info(&path))
                 .await
                 .map_err(getinfo_err_gil)?;
-            Python::with_gil(|py| -> PyResult<Py<PyDict>> {
+            Python::attach(|py| -> PyResult<Py<PyDict>> {
                 fileinfo_to_pydict(py, &info).map(|d| d.unbind())
             })
         })
@@ -692,9 +692,7 @@ impl AsyncClient {
                 .with_relogin_retry(|| inner.download(&path, offset, length))
                 .await
                 .map_err(synofs_to_pyerr_gil)?;
-            Python::with_gil(|py| -> PyResult<Py<PyBytes>> {
-                Ok(PyBytes::new(py, &bytes).unbind())
-            })
+            Python::attach(|py| -> PyResult<Py<PyBytes>> { Ok(PyBytes::new(py, &bytes).unbind()) })
         })
     }
 
@@ -705,7 +703,7 @@ impl AsyncClient {
                 .with_relogin_retry(|| inner.list_dir(&path))
                 .await
                 .map_err(synofs_to_pyerr_gil)?;
-            Python::with_gil(|py| -> PyResult<Py<pyo3::types::PyList>> {
+            Python::attach(|py| -> PyResult<Py<pyo3::types::PyList>> {
                 let dicts: Vec<Bound<'_, PyDict>> = entries
                     .iter()
                     .map(|f| fileinfo_to_pydict(py, f))
@@ -722,7 +720,7 @@ impl AsyncClient {
                 .with_relogin_retry(|| inner.list_shares())
                 .await
                 .map_err(synofs_to_pyerr_gil)?;
-            Python::with_gil(|py| -> PyResult<Py<pyo3::types::PyList>> {
+            Python::attach(|py| -> PyResult<Py<pyo3::types::PyList>> {
                 let dicts: Vec<Bound<'_, PyDict>> = shares
                     .iter()
                     .map(|s| fileinfo_to_pydict(py, s))
@@ -781,9 +779,7 @@ impl AsyncClient {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| {
-                    Python::with_gil(|_py| {
-                        PyErr::new::<InvalidArg, _>("local_path has no filename")
-                    })
+                    Python::attach(|_py| PyErr::new::<InvalidArg, _>("local_path has no filename"))
                 })?
                 .to_string();
             let local = std::path::PathBuf::from(&local_path);

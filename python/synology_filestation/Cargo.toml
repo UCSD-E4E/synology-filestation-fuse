@@ -19,15 +19,14 @@ synology-filestation-smb = { path = "../../rust/synology-filestation-smb" }
 
 # abi3-py310 lets a single Linux wheel cover Python 3.10 through whatever's
 # current. Tied to pyproject.toml's `requires-python = ">=3.10"` and the CI
-# test matrix (3.10–3.13). Bumping pyo3 itself to 0.24+ later is a straight
-# find/replace; pyo3-async-runtimes versions track pyo3 versions.
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
-pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+# test matrix (3.10–3.13). pyo3-async-runtimes versions track pyo3 versions.
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 
 # pyo3-log routes Rust `log` records into Python's `logging`. tracing-log
 # adapts our existing `tracing` events to the `log` crate so the bridge is
 # end-to-end.
-pyo3-log = "0.12"
+pyo3-log = "0.13"
 tracing-log = "0.2"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
