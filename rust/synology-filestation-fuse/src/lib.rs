@@ -174,7 +174,7 @@ pub fn spawn_mount(
     config.acl = acl;
 
     info!("Mounting shares on {}", mountpoint.display());
-    let session = fuser::spawn_mount2(fs, &mountpoint, &config).map_err(|e| {
+    let session = fuser::spawn_mount(fs, &mountpoint, &config).map_err(|e| {
         SynoFsError::Io(format!("failed to mount on {}: {e}", mountpoint.display()))
     })?;
     info!("Mounted at {}", mountpoint.display());
