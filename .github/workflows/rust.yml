@@ -15,13 +15,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install Dependencies
       run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
     - name: Rust formatting (cargo fmt)
       run: cargo fmt --all -- --check
     - name: Set up .NET 10
-      uses: actions/setup-dotnet@v5
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: '10.0.x'
     - name: C# formatting (dotnet format)
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install Dependencies
       run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
     # We restrict Rust CI to the FUSE crate + its `core` library dependency.
@@ -49,7 +49,7 @@ jobs:
     - name: Build release (required for installer)
       run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
-      uses: actions/setup-dotnet@v5
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: '10.0.x'
     - name: Run dotnet tests
@@ -71,7 +71,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     # We restrict Rust CI to the FUSE crate + its `core` library dependency.
     # The Python crate (`python/synology_filestation`) has its own workflow
     # (`python.yml` / `maturin.yml`) and pulling it in here would require
@@ -86,7 +86,7 @@ jobs:
     - name: Build release (required for installer)
       run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
-      uses: actions/setup-dotnet@v5
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: '10.0.x'
     - name: Run dotnet tests
@@ -108,7 +108,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Set up MSVC environment
       uses: ilammy/msvc-dev-cmd@v1
     - name: Install WinFsp
@@ -127,7 +127,7 @@ jobs:
     - name: Build release (required for installer)
       run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
-      uses: actions/setup-dotnet@v5
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: '10.0.x'
     - name: Run dotnet tests
