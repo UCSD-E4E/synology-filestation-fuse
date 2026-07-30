@@ -1,5 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "381d1b8eaa5a87f621350a19b1ecda07b5db5320",
   "plugins": [
     {
       "type": "linked-versions",
@@ -7,12 +8,32 @@
       "components": [
         "synology-filestation-core",
         "synology-filestation-fuse",
+        "synology-filestation-gui",
         "synology_filestation"
       ],
       "merge": false
     }
   ],
   "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "synology-filestation-gui",
+      "changelog-path": "SynologyFuse.Gui/CHANGELOG.md",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "exclude-paths": [
+        "rust",
+        "python",
+        ".github",
+        "nix"
+      ],
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "SynologyFuse.Gui/SynologyFuse.Gui.csproj"
+        }
+      ]
+    },
     "rust/synology-filestation-core": {
       "release-type": "rust",
       "package-name": "synology-filestation-core",
@@ -23,22 +44,7 @@
       "release-type": "rust",
       "package-name": "synology-filestation-fuse",
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true,
-      "include-paths": [
-        "rust/synology-filestation-fuse",
-        "SynologyFuse.Gui",
-        "SynologyFuse.Tests",
-        "SynologyFuse.MacInstaller",
-        "SynologyFuse.DebInstaller",
-        "SynologyFuse.Installer",
-        "SynologyFuse.sln"
-      ],
-      "extra-files": [
-        {
-          "type": "generic",
-          "path": "SynologyFuse.Gui/SynologyFuse.Gui.csproj"
-        }
-      ]
+      "bump-patch-for-minor-pre-major": true
     },
     "python/synology_filestation": {
       "release-type": "rust",
