@@ -1,11 +1,14 @@
 using System;
 using System.Linq;
 using System.Threading.Tasks;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
+using Avalonia.VisualTree;
 using SynologyFuse.Gui.Models;
+using SynologyFuse.Gui.Services;
 using SynologyFuse.Gui.ViewModels;
 
 namespace SynologyFuse.Gui.Views;
@@ -16,7 +19,7 @@ public partial class FileBrowserWindow : Window
 
     public FileBrowserWindow(MountConfig config) : this()
     {
-        var vm = new FileBrowserViewModel(config);
+        var vm = new FileBrowserViewModel(config, new ClipboardService(this));
         DataContext = vm;
         Opened += async (_, _) => await vm.ConnectAsync();
         Closed += (_, _) => vm.Dispose();
@@ -28,6 +31,18 @@ public partial class FileBrowserWindow : Window
     {
         if (Vm is { } vm && vm.OpenCommand.CanExecute(null))
             await vm.OpenCommand.ExecuteAsync(null);
+    }
+
+    /// <summary>Right-clicking an entry acts on that entry: select it before the
+    /// context menu opens, so the copy/download/delete commands target it.</summary>
+    private void OnListContextRequested(object? sender, ContextRequestedEventArgs e)
+    {
+        if (Vm is not { } vm) return;
+        if (e.Source is Visual source &&
+            source.FindAncestorOfType<ListBoxItem>(includeSelf: true) is { DataContext: SynoFileInfo item })
+        {
+            vm.SelectedItem = item;
+        }
     }
 
     private async void OnDownload(object? sender, RoutedEventArgs e)

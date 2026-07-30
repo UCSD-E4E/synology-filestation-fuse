@@ -5,7 +5,7 @@
         x:Class="SynologyFuse.Gui.Views.FileBrowserWindow"
         x:DataType="vm:FileBrowserViewModel"
         Icon="/Assets/app.ico"
-        Title="Browse NAS"
+        Title="{Binding Title, FallbackValue='Browse NAS'}"
         Width="640" Height="480"
         MinWidth="480" MinHeight="320">
 
@@ -18,8 +18,23 @@
       <Grid ColumnDefinitions="Auto,Auto,*,Auto,Auto,Auto,Auto">
         <Button Grid.Column="0" Content="Up" Command="{Binding UpCommand}" Margin="0,0,6,0" />
         <Button Grid.Column="1" Content="Refresh" Command="{Binding RefreshCommand}" Margin="0,0,6,0" />
-        <TextBlock Grid.Column="2" VerticalAlignment="Center" Margin="6,0"
-                   Text="{Binding CurrentPath}" FontFamily="Consolas,Menlo,monospace" />
+        <!-- Path bar: shows the browsed directory (mirrored in the window title)
+             and offers it up for copying via button, context menu, or selection. -->
+        <Grid Grid.Column="2" ColumnDefinitions="*,Auto" Margin="6,0">
+          <SelectableTextBlock Grid.Column="0" VerticalAlignment="Center"
+                               Text="{Binding CurrentPath}"
+                               FontFamily="Consolas,Menlo,monospace"
+                               ToolTip.Tip="{Binding CurrentPath}">
+            <SelectableTextBlock.ContextFlyout>
+              <MenuFlyout>
+                <MenuItem Header="Copy Path" Command="{Binding CopyCurrentPathCommand}" />
+              </MenuFlyout>
+            </SelectableTextBlock.ContextFlyout>
+          </SelectableTextBlock>
+          <Button Grid.Column="1" Content="Copy" Padding="8,2" Margin="4,0,0,0"
+                  Command="{Binding CopyCurrentPathCommand}"
+                  ToolTip.Tip="Copy current path" />
+        </Grid>
         <Button Grid.Column="3" Content="New Folder" Click="OnNewFolder" Margin="0,0,6,0" />
         <Button Grid.Column="4" Content="Upload" Click="OnUpload" Margin="0,0,6,0" />
         <Button Grid.Column="5" Content="Download" Click="OnDownload" Margin="0,0,6,0" />
@@ -59,7 +74,23 @@
     <!-- Listing -->
     <ListBox ItemsSource="{Binding Items}"
              SelectedItem="{Binding SelectedItem}"
-             DoubleTapped="OnItemDoubleTapped">
+             DoubleTapped="OnItemDoubleTapped"
+             ContextRequested="OnListContextRequested">
+      <ListBox.KeyBindings>
+        <KeyBinding Gesture="Ctrl+C" Command="{Binding CopySelectedPathCommand}" />
+      </ListBox.KeyBindings>
+      <ListBox.ContextMenu>
+        <ContextMenu>
+          <MenuItem Header="Open" Command="{Binding OpenCommand}" />
+          <Separator />
+          <MenuItem Header="Copy Path" Command="{Binding CopySelectedPathCommand}" InputGesture="Ctrl+C" />
+          <MenuItem Header="Copy Name" Command="{Binding CopySelectedNameCommand}" />
+          <MenuItem Header="Copy Current Folder Path" Command="{Binding CopyCurrentPathCommand}" />
+          <Separator />
+          <MenuItem Header="Download…" Click="OnDownload" />
+          <MenuItem Header="Delete" Command="{Binding DeleteCommand}" />
+        </ContextMenu>
+      </ListBox.ContextMenu>
       <ListBox.ItemTemplate>
         <DataTemplate x:DataType="models:SynoFileInfo">
           <Grid ColumnDefinitions="20,*,Auto">
