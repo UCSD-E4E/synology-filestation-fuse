@@ -22,6 +22,7 @@ namespace SynologyFuse.Gui.ViewModels;
 public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
 {
     private readonly MountConfig _config;
+    private readonly IClipboardService? _clipboard;
     private SynoClient? _client;
     private bool _disposed;
 
@@ -34,17 +35,29 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     /// <summary>Path stack for breadcrumb navigation; "" denotes the shares root.</summary>
     private readonly Stack<string> _history = new();
 
-    public FileBrowserViewModel(MountConfig config) => _config = config;
+    public FileBrowserViewModel(MountConfig config, IClipboardService? clipboard = null)
+    {
+        _config = config;
+        _clipboard = clipboard;
+    }
 
     public ObservableCollection<SynoFileInfo> Items { get; } = new();
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(UpCommand))]
     [NotifyCanExecuteChangedFor(nameof(RefreshCommand))]
+    [NotifyCanExecuteChangedFor(nameof(CopyCurrentPathCommand))]
+    [NotifyPropertyChangedFor(nameof(Title))]
     private string _currentPath = "";
 
     [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(CopySelectedPathCommand))]
+    [NotifyCanExecuteChangedFor(nameof(CopySelectedNameCommand))]
     private SynoFileInfo? _selectedItem;
+
+    /// <summary>Window title — carries the directory being browsed so the path
+    /// is visible (and copyable, via <see cref="CopyCurrentPathCommand"/>) at a glance.</summary>
+    public string Title => CurrentPath.Length == 0 ? "Browse NAS" : $"Browse NAS — {CurrentPath}";
 
     [ObservableProperty]
     private string _status = "Connecting…";
@@ -182,6 +195,39 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     private Task Refresh() => LoadAsync(CurrentPath);
 
     private bool CanRefresh() => IsConnected;
+
+    // ── Clipboard ────────────────────────────────────────────────────────────────
+
+    /// <summary>Copy the directory currently being browsed (the path bar / title).</summary>
+    [RelayCommand(CanExecute = nameof(CanCopyCurrentPath))]
+    private Task CopyCurrentPath() => CopyAsync(CurrentPath);
+
+    private bool CanCopyCurrentPath() => CurrentPath.Length != 0;
+
+    /// <summary>Copy the full NAS path of the selected file or folder.</summary>
+    [RelayCommand(CanExecute = nameof(HasSelection))]
+    private Task CopySelectedPath() => CopyAsync(SelectedItem?.Path ?? "");
+
+    /// <summary>Copy just the name of the selected file or folder.</summary>
+    [RelayCommand(CanExecute = nameof(HasSelection))]
+    private Task CopySelectedName() => CopyAsync(SelectedItem?.Name ?? "");
+
+    private bool HasSelection() => SelectedItem is not null;
+
+    private async Task CopyAsync(string text)
+    {
+        if (text.Length == 0) return;
+        try
+        {
+            // Null when no window is attached (headless/tests) — copying is then a no-op.
+            if (_clipboard is not null) await _clipboard.SetTextAsync(text);
+            Status = $"Copied {text}";
+        }
+        catch (Exception ex)
+        {
+            Status = $"Error: {ex.Message}";
+        }
+    }
 
     // ── Operations (invoked by the view, which supplies file-picker paths) ──────
 
