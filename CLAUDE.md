@@ -230,13 +230,16 @@ MVVM pattern (Avalonia). The GUI calls the Rust core **directly via the FFI cdyl
 
 Uses [release-please](https://github.com/googleapis/release-please-action) on the `main` branch. Commit messages follow **Conventional Commits** (`fix:` → patch, `feat:` → minor, `feat!:` → major).
 
-The repo has **three release-please packages** linked together via the `linked-versions` plugin (so they always bump to the same version, but each ships its own changelog and tag):
+The repo has **four release-please packages** linked together via the `linked-versions` plugin (so they always bump to the same version, but each ships its own changelog and tag):
 
 | Package | Tag prefix | Artifacts on release |
 |---|---|---|
+| `.` (GUI + installers)            | `synology-filestation-gui-v...`   | (changelog + `SynologyFuse.Gui.csproj` `<Version>` bump) |
 | `rust/synology-filestation-core`  | `synology-filestation-core-v...`  | (Cargo.toml bump only) |
 | `rust/synology-filestation-fuse`  | `synology-filestation-fuse-v...`  | `.deb`, `.pkg`, `.msi`, `*-Setup.exe` |
 | `python/synology_filestation`     | `synology_filestation-v...`       | `*.whl` (manylinux 2_34, x86_64) |
+
+**Why a root package exists.** release-please attributes a commit to a package by *path*, and the .NET projects (`SynologyFuse.Gui/`, `SynologyFuse.Tests/`, `SynologyFuse.*Installer/`) live at the repo root — outside every `rust/` and `python/` package. Without a package keyed `"."` those commits are "homeless": no package sees them, so no release PR is opened at all. (`include-paths` is *not* a release-please option — only `exclude-paths` is — so an earlier attempt to attribute them to the fuse package was a silent no-op.) The root package is given all commits and then filtered by `exclude-paths`, which drops any commit whose files live entirely under `rust/`, `python/`, `.github/`, or `nix/`. Since it is in the linked-versions group, a GUI-only change still bumps the fuse package and ships the installers. Note `exclude-paths` matches directories only, so a commit touching just a root-level *file* (`flake.nix`, `README.md`) lands in the GUI package; only `feat`/`fix` types actually trigger a bump. `extra-files` paths are resolved **relative to the package path**, which is why the `SynologyFuse.Gui.csproj` version bump belongs to the root package, not the fuse package.
 
 CI workflows:
 
