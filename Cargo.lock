@@ -2100,9 +2100,9 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smb2"
-version = "0.13.1"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9b40c52123c3f76b299d42489961543dc7713775c71d7ee4f880c853787c3c4"
+checksum = "5f68d69984762b69f4825a8d97b321e2831ad10449c4535a6f326abeaa11b0c9"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "synology-filestation-core"
-version = "0.1.20"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2222,7 +2222,7 @@ dependencies = [
 
 [[package]]
 name = "synology-filestation-fuse"
-version = "0.1.20"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "synology_filestation"
-version = "0.1.20"
+version = "0.2.1"
 dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
