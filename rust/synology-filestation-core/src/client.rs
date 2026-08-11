@@ -1104,6 +1104,7 @@ impl SynologyClient {
                 .map_err(|e| SynoFsError::Io(e.to_string()))?;
             let mut form = multipart::Form::new()
                 .text("overwrite", "false")
+                .text("create_parents", "true")
                 .text("path", folder_path.to_string());
             if let Some(ms) = &mtime_ms {
                 form = form.text("mtime", ms.clone());
@@ -3332,6 +3333,43 @@ mod tests {
             vec![(1024, 2500), (2048, 2500), (2500, 2500)],
             "cumulative bytes after each slice"
         );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_sends_create_parents_like_the_one_shot_path() {
+        // Both paths are reached through the same public API, so a large file
+        // must not lose directory auto-creation that a small one gets.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"blSkip": false, "tmpfile": "slice.1.0.9224"}
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("parents.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share/new/dir", "big.bin", false)
+            .await
+            .unwrap();
+
+        for req in server.received_requests().await.unwrap() {
+            let body = String::from_utf8_lossy(&req.body).to_string();
+            assert!(
+                body.contains("name=\"create_parents\""),
+                "every slice carries create_parents"
+            );
+            // Deliberately absent: DSM's own uploader sends `size` only on the
+            // one-shot path and puts the total in X-FILE-SIZE when slicing.
+            assert!(
+                !body.contains("name=\"size\""),
+                "the slice path uses the X-FILE-SIZE header, not a size field"
+            );
+        }
         std::fs::remove_file(&local).ok();
     }
 }

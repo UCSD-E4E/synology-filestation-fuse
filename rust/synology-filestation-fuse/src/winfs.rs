@@ -317,20 +317,34 @@ impl FileSystemContext for SynologyWinFs {
         // buffer deletes its temp file, which is exactly what we are uploading.
         let mut taken = context.write_buf.lock().unwrap().take();
         if let Some(buf) = taken.as_mut() {
-            if let Ok(payload) = payload_for(buf) {
-                tracing::debug!(
-                    "close: last-chance upload {} ({} bytes)",
-                    context.nas_path,
-                    payload.len()
-                );
-                let (parent, name) = split_path(&context.nas_path);
-                let _ = self.runtime.block_on(upload_payload(
-                    &self.client,
-                    parent,
-                    name,
-                    payload,
-                    !context.is_new,
-                ));
+            match payload_for(buf) {
+                Ok(payload) => {
+                    tracing::debug!(
+                        "close: last-chance upload {} ({} bytes)",
+                        context.nas_path,
+                        payload.len()
+                    );
+                    let (parent, name) = split_path(&context.nas_path);
+                    if let Err(e) = self.runtime.block_on(upload_payload(
+                        &self.client,
+                        parent,
+                        name,
+                        payload,
+                        !context.is_new,
+                    )) {
+                        // Nothing left to retry with — the handle is closing.
+                        tracing::error!(
+                            "close: last-chance upload of {} failed: {e}",
+                            context.nas_path
+                        );
+                    }
+                }
+                // This path exists to stop data loss when flush() never ran, so
+                // failing to even read the buffer must not pass silently.
+                Err(e) => tracing::error!(
+                    "close: cannot read write buffer for {}, data not uploaded: {e}",
+                    context.nas_path
+                ),
             }
         }
         tracing::debug!("close: removing pending {}", context.nas_path);

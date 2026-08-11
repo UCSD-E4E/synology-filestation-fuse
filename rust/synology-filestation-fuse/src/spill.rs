@@ -17,6 +17,23 @@ use std::path::{Path, PathBuf};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 
+/// How many candidate names a spill tries before giving up. Collisions should
+/// be impossible (the sequence number is process-unique), so this only matters
+/// if somebody is actively planting files at our candidate paths.
+const SPILL_NAME_ATTEMPTS: u32 = 8;
+
+/// Process-wide counter making each buffer's temp name unique without pulling
+/// in a random-number dependency. Uniqueness is what create_new needs; it is
+/// not a secret, which is why the open refuses to follow an existing path.
+static SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn temp_path(seq: u64, attempt: u32) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "synofs-write-{}-{seq}-{attempt}.tmp",
+        std::process::id()
+    ))
+}
+
 /// Files larger than this are written to a temp file instead of RAM. Sized to
 /// cover the overwhelming majority of desktop file writes while capping what a
 /// single handle can pin in memory.
@@ -34,6 +51,8 @@ enum Store {
 
 pub struct SpillBuffer {
     store: Store,
+    /// Process-unique id feeding this buffer's temp-file name.
+    seq: u64,
     /// Logical length, tracked separately so a sparse write past the end
     /// extends the buffer the same way in both stores.
     len: u64,
@@ -48,6 +67,7 @@ impl SpillBuffer {
     pub fn with_spill_at(spill_at: usize) -> Self {
         SpillBuffer {
             store: Store::Memory(Vec::new()),
+            seq: SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             len: 0,
             spill_at,
         }
@@ -107,8 +127,12 @@ impl SpillBuffer {
         Ok(())
     }
 
-    /// Read the whole buffer back. Only sound for unspilled buffers — a spilled
-    /// one is precisely the case we refuse to materialize in memory.
+    /// Read the whole buffer back, from disk if it has spilled.
+    ///
+    /// Allocates the full length, so callers on the upload path must go through
+    /// [`payload_for`], which only reaches for this when the buffer is still in
+    /// memory and therefore under the spill threshold. Calling it directly on a
+    /// spilled buffer defeats the point of this type.
     pub fn as_bytes(&mut self) -> std::io::Result<Vec<u8>> {
         match &mut self.store {
             Store::Memory(v) => Ok(v.clone()),
@@ -135,24 +159,35 @@ impl SpillBuffer {
 
     /// Move the accumulated bytes out of RAM and onto disk.
     fn spill(&mut self) -> std::io::Result<()> {
-        let existing = match &self.store {
-            Store::Memory(v) => v.clone(),
+        // Moved, not cloned: a clone would briefly double the very allocation
+        // this type exists to bound.
+        let existing = match &mut self.store {
+            Store::Memory(v) => std::mem::take(v),
             Store::Spilled { .. } => return Ok(()),
         };
-        let path = std::env::temp_dir().join(format!(
-            "synofs-write-{}-{:p}.tmp",
-            std::process::id(),
-            self as *const _
-        ));
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        file.write_all(&existing)?;
-        self.store = Store::Spilled { file, path };
-        Ok(())
+        // create_new, so an occupied name is stepped over rather than
+        // truncated. The temp dir is world-writable on Unix, and a predictable
+        // name plus create+truncate is how you end up destroying somebody
+        // else's file — or, through a symlink they planted, a file of their
+        // choosing.
+        let mut last_err = None;
+        for attempt in 0..SPILL_NAME_ATTEMPTS {
+            let path = temp_path(self.seq, attempt);
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    file.write_all(&existing)?;
+                    self.store = Store::Spilled { file, path };
+                    return Ok(());
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| std::io::Error::other("no spill path available")))
     }
 }
 
@@ -352,5 +387,40 @@ mod tests {
             10,
             "the temp file shrinks with the buffer"
         );
+    }
+
+    #[test]
+    fn concurrent_buffers_get_distinct_temp_files() {
+        let mut a = SpillBuffer::with_spill_at(4);
+        let mut b = SpillBuffer::with_spill_at(4);
+        a.write_at(0, &[1u8; 16]).unwrap();
+        b.write_at(0, &[2u8; 16]).unwrap();
+        let pa = a.spilled_path().unwrap().unwrap().to_path_buf();
+        let pb = b.spilled_path().unwrap().unwrap().to_path_buf();
+        assert_ne!(pa, pb, "two live buffers must not share a temp file");
+        assert_eq!(std::fs::read(&pa).unwrap(), vec![1u8; 16]);
+        assert_eq!(std::fs::read(&pb).unwrap(), vec![2u8; 16]);
+    }
+
+    #[test]
+    fn spill_does_not_clobber_an_occupied_candidate_path() {
+        // The temp dir is world-writable on Unix, so a predictable name opened
+        // with create+truncate would let another user pre-place a file (or a
+        // symlink to one) and have us destroy it. Spilling must step over an
+        // occupied name, not truncate it.
+        let mut b = SpillBuffer::with_spill_at(4);
+        let occupied = temp_path(b.seq, 0);
+        std::fs::write(&occupied, b"precious").unwrap();
+
+        b.write_at(0, &[6u8; 16]).unwrap();
+        let used = b.spilled_path().unwrap().unwrap().to_path_buf();
+
+        assert_ne!(used, occupied, "spill must skip the occupied candidate");
+        assert_eq!(
+            std::fs::read(&occupied).unwrap(),
+            b"precious",
+            "the pre-existing file is left untouched"
+        );
+        std::fs::remove_file(&occupied).ok();
     }
 }
