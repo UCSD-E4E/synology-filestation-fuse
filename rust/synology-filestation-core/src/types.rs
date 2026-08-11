@@ -69,16 +69,25 @@ pub struct AuthData {
     pub sid: String,
 }
 
-/// List response data
+/// List response data. `total` is the entry count for the *whole* directory,
+/// not this page — the paging loop uses it to know when it is done.
 #[derive(Debug, Deserialize)]
 pub struct ListData {
+    #[serde(default)]
     pub files: Vec<SynoFileInfo>,
+    /// Absent on DSM versions that omit it; paging then falls back to
+    /// "stop on the first partial page".
+    #[serde(default)]
+    pub total: Option<u64>,
 }
 
-/// ListShare response data
+/// ListShare response data. See [`ListData::total`].
 #[derive(Debug, Deserialize)]
 pub struct ListShareData {
+    #[serde(default)]
     pub shares: Vec<SynoFileInfo>,
+    #[serde(default)]
+    pub total: Option<u64>,
 }
 
 /// Sentinel path stored in the inode cache for the virtual root (the share listing).
