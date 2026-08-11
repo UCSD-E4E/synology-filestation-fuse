@@ -122,6 +122,24 @@
                      IsEnabled="{Binding IsDisconnected}" />
         </Grid>
 
+        <!-- Certificate verification. Off means the connection is encrypted but
+             not authenticated, so it is presented as the exception, not a peer
+             of "Use HTTPS". -->
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+          <TextBlock Grid.Column="0" Text="Certificate" VerticalAlignment="Center" />
+          <StackPanel Grid.Column="1">
+            <CheckBox IsChecked="{Binding VerifySsl}"
+                      Content="Verify the NAS TLS certificate"
+                      IsEnabled="{Binding IsDisconnected}" />
+            <TextBlock Text="Untick only for a self-signed DSM certificate. The connection stays encrypted, but nothing proves you are talking to your NAS."
+                       TextWrapping="Wrap"
+                       FontSize="11"
+                       Opacity="0.7"
+                       IsVisible="{Binding !VerifySsl}"
+                       Margin="24,2,0,0" />
+          </StackPanel>
+        </Grid>
+
         <!-- Mount section -->
         <TextBlock Text="Mount"
                    FontWeight="SemiBold"

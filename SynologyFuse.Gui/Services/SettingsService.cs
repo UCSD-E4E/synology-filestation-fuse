@@ -13,6 +13,14 @@ public sealed class PersistedSettings
     public string Username { get; set; } = "";
     public decimal Port { get; set; } = 5001;
     public bool UseHttps { get; set; } = true;
+
+    /// <summary>
+    /// Verify the NAS TLS certificate. Defaults to true, and because
+    /// System.Text.Json only assigns properties actually present in the file,
+    /// a settings.json written before this option existed deserializes as
+    /// verifying — the secure value, not <c>default(bool)</c>.
+    /// </summary>
+    public bool VerifySsl { get; set; } = true;
     public string Mountpoint { get; set; } = "";
     public decimal CacheTtl { get; set; } = 30;
     public decimal ReadCacheMb { get; set; } = 256;

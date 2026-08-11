@@ -103,7 +103,8 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         try
         {
             var client = await Task.Run(() => SynoClient.Connect(
-                _config.Host, _config.Port, _config.UseHttps, _config.Username, _config.Password, otp));
+                _config.Host, _config.Port, _config.UseHttps, _config.Username, _config.Password, otp,
+                autoRelogin: true, verifySsl: _config.VerifySsl));
             // If the window was closed (Dispose ran) while the login was in
             // flight, the handle would otherwise leak — dispose it and bail.
             // The await resumed on the UI thread, so this can't race Dispose().

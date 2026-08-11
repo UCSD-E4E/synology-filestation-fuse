@@ -26,6 +26,17 @@ struct Args {
     #[arg(long, default_value_t = true)]
     https: bool,
 
+    /// Accept any TLS certificate, including self-signed, expired, or
+    /// wrong-hostname ones.
+    ///
+    /// A DSM appliance ships with a self-signed certificate, so this is often
+    /// needed — but it means the encrypted connection is not authenticated:
+    /// anything able to intercept it can present its own certificate and read
+    /// your password. Prefer installing the NAS's certificate in the system
+    /// trust store.
+    #[arg(long, env = "SYNO_INSECURE")]
+    insecure: bool,
+
     /// NAS account username
     #[arg(long, short = 'u')]
     username: String,
@@ -82,6 +93,17 @@ fn main() -> anyhow::Result<()> {
     );
 
     let client = SynologyClient::new(&args.host, args.port, args.https);
+    let client = if args.insecure {
+        if args.https {
+            tracing::warn!(
+                "--insecure: TLS certificate verification is OFF; the connection \
+                 is encrypted but not authenticated"
+            );
+        }
+        client.with_insecure_tls()
+    } else {
+        client
+    };
 
     let password = match args.password {
         Some(p) => p,
@@ -96,6 +118,19 @@ fn main() -> anyhow::Result<()> {
         Err(ref e) if is_otp_required(e) => {
             let code = prompt("Two-factor authentication code")?;
             rt.block_on(client.login(&args.username, &password, Some(&code)))?;
+        }
+        // A TLS failure here is almost always a self-signed NAS certificate, and
+        // the fix is a flag the user has no reason to know exists. Name it.
+        Err(e) if args.https && !args.insecure && e.is_tls_error() => {
+            return Err(anyhow::anyhow!(
+                "could not verify the TLS certificate for {}:{} ({e}).\n\
+                 \n\
+                 If this NAS uses a self-signed certificate, either install it in \
+                 your system trust store, or re-run with --insecure to accept any \
+                 certificate (encrypted, but not authenticated).",
+                args.host,
+                args.port
+            ));
         }
         Err(e) => return Err(e.into()),
     }

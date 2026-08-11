@@ -7,6 +7,11 @@ public sealed class MountConfig
     public string Password { get; init; } = "";
     public ushort Port { get; init; } = 5001;
     public bool UseHttps { get; init; } = true;
+
+    /// <summary>Verify the NAS TLS certificate. Turn off only for a self-signed
+    /// DSM certificate -- the connection is then encrypted but not authenticated.
+    /// Absent from an older settings file, the initialiser keeps it on.</summary>
+    public bool VerifySsl { get; init; } = true;
     public string Mountpoint { get; init; } = "";
     public ulong CacheTtl { get; init; } = 30;
     public ulong ReadCacheMb { get; init; } = 256;

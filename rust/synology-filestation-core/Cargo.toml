@@ -11,7 +11,9 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio       = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "io-util", "fs"] }
-reqwest     = { version = "0.13", features = ["json", "multipart", "query", "rustls-no-provider"], default-features = false }
+# `form` is what lets login send credentials as a request body instead of a
+# query string; like `query`, reqwest 0.13 gates it behind a feature.
+reqwest     = { version = "0.13", features = ["json", "multipart", "query", "form", "rustls-no-provider"], default-features = false }
 # reqwest 0.13 drops ring as the rustls crypto provider in favour of aws-lc-rs
 # (which needs cmake + a C toolchain, and NASM on Windows). We keep the pre-0.13
 # ring provider — matching the old `rustls-tls` build footprint so CI needs no
@@ -33,3 +35,8 @@ libc = "0.2"
 [dev-dependencies]
 tokio   = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
+# A self-signed HTTPS listener, so the TLS-verification tests exercise a real
+# handshake rather than asserting on a configuration flag. wiremock speaks
+# plain HTTP only, hence the hand-rolled listener.
+rcgen        = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

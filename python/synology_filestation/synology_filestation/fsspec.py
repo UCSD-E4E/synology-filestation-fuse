@@ -53,6 +53,9 @@ class SynologyFileSystem(AsyncFileSystem):
       * ``host`` (str), ``port`` (int): DSM HTTPS endpoint
       * ``username`` (str), ``password`` (str)
       * ``https`` (bool, default True)
+      * ``verify_ssl`` (bool, default True): verify the NAS TLS certificate.
+        Set False only for a self-signed DSM certificate — the connection is
+        then encrypted but not authenticated.
       * ``otp`` (str | None, default None): one-time TOTP code for 2FA
       * ``auto_relogin`` (bool, default True): transparent re-auth on SID
         expiry. Turn off only for 2FA accounts (where re-login can't reuse
@@ -73,6 +76,7 @@ class SynologyFileSystem(AsyncFileSystem):
         password: str,
         *,
         https: bool = True,
+        verify_ssl: bool = True,
         otp: str | None = None,
         auto_relogin: bool = True,
         asynchronous: bool = False,
@@ -85,6 +89,7 @@ class SynologyFileSystem(AsyncFileSystem):
         self._username = username
         self._password = password
         self._https = https
+        self._verify_ssl = verify_ssl
         self._otp = otp
         self._auto_relogin = auto_relogin
         self._client: AsyncClient | None = None
@@ -123,6 +128,7 @@ class SynologyFileSystem(AsyncFileSystem):
                 self._username,
                 self._password,
                 https=self._https,
+                verify_ssl=self._verify_ssl,
                 otp=self._otp,
                 auto_relogin=self._auto_relogin,
             )

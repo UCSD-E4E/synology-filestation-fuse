@@ -26,6 +26,7 @@ from ._native import (  # noqa: F401 — re-exported for users
     InvalidArg,
     NotSupported,
     TransportError,
+    TlsError,
     DSMError,
 )
 
@@ -44,5 +45,6 @@ __all__ = [
     "InvalidArg",
     "NotSupported",
     "TransportError",
+    "TlsError",
     "DSMError",
 ]

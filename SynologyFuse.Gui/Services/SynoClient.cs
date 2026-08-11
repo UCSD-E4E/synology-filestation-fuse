@@ -37,14 +37,18 @@ public sealed class SynoClient : IDisposable
     /// caller should prompt and retry with <paramref name="otp"/> set), or
     /// <see cref="SynoException"/> on any other failure.
     /// </summary>
+    /// <param name="verifySsl">Verify the NAS TLS certificate. Pass false only
+    /// for a self-signed DSM certificate — the connection is then encrypted but
+    /// not authenticated. Throws <see cref="TlsVerificationException"/> when
+    /// verification is on and the certificate is rejected.</param>
     public static SynoClient Connect(
         string host, ushort port, bool https, string username, string password,
-        string? otp = null, bool autoRelogin = true)
+        string? otp = null, bool autoRelogin = true, bool verifySsl = true)
     {
         NativeMethods.EnsureResolver();
         var err = default(NativeError);
         int rc = syno_connect(host, port, https, username, password, otp, autoRelogin,
-            out var handle, ref err);
+            verifySsl, out var handle, ref err);
         Check(rc, ref err);
         return new SynoClient(handle);
     }
@@ -262,8 +266,17 @@ public sealed class SynoClient : IDisposable
         }
         if (message.Length == 0) message = $"native error {rc}";
 
-        throw status == SynoStatus.OtpRequired
-            ? new OtpRequiredException(message)
-            : new SynoException(status, dsm, message);
+        throw status switch
+        {
+            SynoStatus.OtpRequired => new OtpRequiredException(message),
+            // Rewritten rather than passed through: the native message says what
+            // rustls objected to, which is not what the user needs to know.
+            SynoStatus.TlsError => new TlsVerificationException(
+                "The NAS's TLS certificate could not be verified. If this NAS uses "
+                + "a self-signed certificate, tick \"Accept self-signed certificate\" "
+                + "and try again — the connection will be encrypted but not "
+                + $"authenticated. ({message})"),
+            _ => new SynoException(status, dsm, message),
+        };
     }
 }

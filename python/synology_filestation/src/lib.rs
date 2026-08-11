@@ -126,6 +126,20 @@ create_exception!(
 
 create_exception!(
     synology_filestation,
+    TlsError,
+    TransportError,
+    "The NAS's TLS certificate could not be verified.\n\n\
+     A DSM appliance ships with a self-signed certificate, so this is the \
+     expected first-connect result against a stock NAS. Either install the \
+     certificate in the system trust store, or pass `verify_ssl=False` to \
+     accept any certificate — the connection is then encrypted but not \
+     authenticated, so anything able to intercept it can read your password.\n\n\
+     Subclasses TransportError, so existing `except TransportError` handlers \
+     still catch it."
+);
+
+create_exception!(
+    synology_filestation,
     DSMError,
     FileStationError,
     "Unmapped DSM error. The numeric code is available on `.code`."
@@ -137,6 +151,15 @@ create_exception!(
 /// in the same place across both backends.
 fn synofs_to_pyerr(py: Python<'_>, err: SynoFsError) -> PyErr {
     let message = err.to_string();
+
+    // A rejected certificate is checked ahead of everything else, including the
+    // LoginFailed wrapper. It happens during login, so it would otherwise
+    // present as AuthError — but nothing was authenticated, or even asked: the
+    // handshake failed. Reporting it as bad credentials sends the user to fix
+    // the wrong thing. Mirrors the same ordering in the FFI's `classify`.
+    if err.is_tls_error() {
+        return PyErr::new::<TlsError, _>(message);
+    }
 
     // Per-variant routing first; the ApiError branch maps DSM codes onto the
     // same typed exceptions so callers see consistent classes regardless of
@@ -280,7 +303,7 @@ impl Client {
 #[pymethods]
 impl Client {
     #[staticmethod]
-    #[pyo3(signature = (host, port, username, password, *, https=true, otp=None, auto_relogin=true, throttle=true, max_concurrency=4, min_interval_ms=150, max_attempts=5, backoff_base_ms=1000, backoff_max_ms=60000))]
+    #[pyo3(signature = (host, port, username, password, *, https=true, verify_ssl=true, otp=None, auto_relogin=true, throttle=true, max_concurrency=4, min_interval_ms=150, max_attempts=5, backoff_base_ms=1000, backoff_max_ms=60000))]
     #[allow(clippy::too_many_arguments)] // mirrors the Python kwargs surface
     fn login(
         py: Python<'_>,
@@ -289,6 +312,7 @@ impl Client {
         username: &str,
         password: &str,
         https: bool,
+        verify_ssl: bool,
         otp: Option<&str>,
         auto_relogin: bool,
         throttle: bool,
@@ -311,6 +335,11 @@ impl Client {
             SynologyClient::with_auto_relogin(host, port, https)
         } else {
             SynologyClient::new(host, port, https)
+        };
+        let client = if verify_ssl {
+            client
+        } else {
+            client.with_insecure_tls()
         };
         let client = apply_throttle(
             client,
@@ -599,7 +628,7 @@ struct AsyncClient {
 #[pymethods]
 impl AsyncClient {
     #[staticmethod]
-    #[pyo3(signature = (host, port, username, password, *, https=true, otp=None, auto_relogin=true, throttle=true, max_concurrency=4, min_interval_ms=150, max_attempts=5, backoff_base_ms=1000, backoff_max_ms=60000))]
+    #[pyo3(signature = (host, port, username, password, *, https=true, verify_ssl=true, otp=None, auto_relogin=true, throttle=true, max_concurrency=4, min_interval_ms=150, max_attempts=5, backoff_base_ms=1000, backoff_max_ms=60000))]
     #[allow(clippy::too_many_arguments)] // mirrors the Python kwargs surface
     fn login<'py>(
         py: Python<'py>,
@@ -608,6 +637,7 @@ impl AsyncClient {
         username: String,
         password: String,
         https: bool,
+        verify_ssl: bool,
         otp: Option<String>,
         auto_relogin: bool,
         throttle: bool,
@@ -622,6 +652,11 @@ impl AsyncClient {
                 SynologyClient::with_auto_relogin(&host, port, https)
             } else {
                 SynologyClient::new(&host, port, https)
+            };
+            let client = if verify_ssl {
+                client
+            } else {
+                client.with_insecure_tls()
             };
             let client = apply_throttle(
                 client,
@@ -868,6 +903,7 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("InvalidArg", py.get_type::<InvalidArg>())?;
     m.add("NotSupported", py.get_type::<NotSupported>())?;
     m.add("TransportError", py.get_type::<TransportError>())?;
+    m.add("TlsError", py.get_type::<TlsError>())?;
     m.add("DSMError", py.get_type::<DSMError>())?;
 
     Ok(())

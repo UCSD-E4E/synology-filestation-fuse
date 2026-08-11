@@ -211,6 +211,11 @@ pub struct SynologyClient {
     /// behavior; opt in via [`SynologyClient::with_auto_relogin`].
     auto_relogin: bool,
     creds: RwLock<Option<StoredCreds>>,
+    /// True when TLS certificate verification has been turned off via
+    /// [`SynologyClient::with_insecure_tls`]. Tracked separately from the
+    /// `reqwest::Client` (which does not expose its own settings) so consumers
+    /// can tell the user which mode they are connecting in.
+    insecure_tls: bool,
     /// Injected read backends, tried in order before the HTTP Download API.
     /// Empty (the default) = HTTP only, i.e. exactly today's behavior.
     read_transports: Vec<TransportEntry<dyn ReadTransport>>,
@@ -233,6 +238,7 @@ impl std::fmt::Debug for SynologyClient {
         f.debug_struct("SynologyClient")
             .field("base_url", &self.base_url)
             .field("auto_relogin", &self.auto_relogin)
+            .field("insecure_tls", &self.insecure_tls)
             .field("throttled", &self.throttle.is_some())
             .field("read_transports", &self.read_transports.len())
             .field("write_transports", &self.write_transports.len())
@@ -264,34 +270,14 @@ impl SynologyClient {
         install_crypto_provider();
         let scheme = if https { "https" } else { "http" };
         let base_url = format!("{}://{}:{}/webapi", scheme, host, port);
-        let http = Client::builder()
-            .danger_accept_invalid_certs(true) // common for self-signed NAS certs
-            // Drop idle connections after 4 s so we don't reuse connections the NAS
-            // has already closed on its side (~7 s keep-alive on most DSM versions).
-            .pool_idle_timeout(Duration::from_secs(4))
-            // Fail fast if the NAS is unreachable rather than waiting for the OS-level
-            // TCP timeout (~75 s on macOS, ETIMEDOUT / os error 60).
-            .connect_timeout(Duration::from_secs(10))
-            // Send TCP keepalive probes so stalled mid-transfer connections are
-            // detected in seconds rather than waiting for the full OS TCP timeout
-            // (~75 s on macOS, ETIMEDOUT / os error 60).
-            .tcp_keepalive(Duration::from_secs(10))
-            // Bound how long we'll wait for data on a request. Without this, a
-            // silently-dead connection (e.g. routes changed when a VPN comes up
-            // mid-session) hangs the FUSE callback indefinitely — the user sees
-            // their file manager freeze with no error. read_timeout fires when
-            // no bytes have arrived for the duration, so it doesn't cap
-            // legitimately long large-file uploads.
-            .read_timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
         Self {
-            http,
+            http: build_http(false),
             base_url,
             sid: RwLock::new(None),
             auto_relogin: false,
             creds: RwLock::new(None),
             throttle: None,
+            insecure_tls: false,
             read_transports: Vec::new(),
             write_transports: Vec::new(),
             stream_write_transports: Vec::new(),
@@ -300,6 +286,60 @@ impl SynologyClient {
         }
     }
 
+    /// Accept any TLS certificate, including self-signed and expired ones, and
+    /// ignore hostname mismatches.
+    ///
+    /// This turns HTTPS into encryption-without-authentication: anything able to
+    /// intercept the connection can present its own certificate and read the
+    /// password in the login exchange. It exists because a self-signed
+    /// certificate is the out-of-the-box state for a DSM appliance, and is
+    /// surfaced to users as an explicit opt-in (`--insecure` on the CLI, a
+    /// checkbox in the GUI, `verify_ssl=False` in the Python bindings) rather
+    /// than being the silent default it used to be.
+    ///
+    /// Prefer installing the NAS's certificate in the system trust store.
+    pub fn with_insecure_tls(mut self) -> Self {
+        self.http = build_http(true);
+        self.insecure_tls = true;
+        self
+    }
+
+    /// Whether TLS certificate verification has been disabled on this client.
+    /// Consumers use it to tell the user which mode they are connecting in.
+    pub fn insecure_tls(&self) -> bool {
+        self.insecure_tls
+    }
+}
+
+/// Build the shared HTTP client. `accept_invalid_certs` is the only knob that
+/// varies; everything else is the timeout/keepalive policy the whole crate
+/// depends on, so it lives in one place rather than being repeated per
+/// constructor.
+fn build_http(accept_invalid_certs: bool) -> Client {
+    Client::builder()
+        .danger_accept_invalid_certs(accept_invalid_certs)
+        // Drop idle connections after 4 s so we don't reuse connections the NAS
+        // has already closed on its side (~7 s keep-alive on most DSM versions).
+        .pool_idle_timeout(Duration::from_secs(4))
+        // Fail fast if the NAS is unreachable rather than waiting for the OS-level
+        // TCP timeout (~75 s on macOS, ETIMEDOUT / os error 60).
+        .connect_timeout(Duration::from_secs(10))
+        // Send TCP keepalive probes so stalled mid-transfer connections are
+        // detected in seconds rather than waiting for the full OS TCP timeout
+        // (~75 s on macOS, ETIMEDOUT / os error 60).
+        .tcp_keepalive(Duration::from_secs(10))
+        // Bound how long we'll wait for data on a request. Without this, a
+        // silently-dead connection (e.g. routes changed when a VPN comes up
+        // mid-session) hangs the FUSE callback indefinitely — the user sees
+        // their file manager freeze with no error. read_timeout fires when
+        // no bytes have arrived for the duration, so it doesn't cap
+        // legitimately long large-file uploads.
+        .read_timeout(Duration::from_secs(30))
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+impl SynologyClient {
     /// Inject a [`ReadTransport`] backend (e.g. SMB). `download` will prefer it
     /// over the HTTP Download API when its circuit breaker is closed, falling
     /// back to HTTP (and any later backends) on transport failures. Call more
@@ -481,6 +521,13 @@ impl SynologyClient {
     ///
     /// `otp_code` is the 6-digit TOTP code required when the account has 2-factor
     /// authentication enabled. Pass `None` if 2FA is not configured.
+    ///
+    /// Sent as a form-encoded **POST**. It used to be a GET with
+    /// `passwd=<plaintext>` in the query string, which put the account password
+    /// into DSM's own nginx access log — and into any proxy's log between here
+    /// and the NAS — on every single login. Request bodies are not logged that
+    /// way. DSM's `auth.cgi` accepts either verb; this is the same exchange, it
+    /// just stops writing the password to disk on the way past.
     pub async fn login(
         &self,
         user: &str,
@@ -502,8 +549,8 @@ impl SynologyClient {
         }
         let resp = self
             .http
-            .get(&url)
-            .query(&params)
+            .post(&url)
+            .form(&params)
             .send()
             .await?
             .json::<SynoResponse<AuthData>>()
@@ -1479,7 +1526,7 @@ async fn local_mtime_ms(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_string_contains, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Build a client pointed at the given mock server.
@@ -1517,19 +1564,141 @@ mod tests {
         );
     }
 
+    // ── TLS verification ─────────────────────────────────────────────────────
+
+    /// A one-shot HTTPS listener presenting a self-signed certificate for
+    /// `localhost` — i.e. exactly the NAS setup that made someone reach for
+    /// `danger_accept_invalid_certs` in the first place. Answers any request
+    /// with a successful login envelope, so the only thing that can fail a test
+    /// against it is the TLS handshake.
+    ///
+    /// Hand-rolled because wiremock speaks plain HTTP; the response is a canned
+    /// HTTP/1.1 message rather than a real server.
+    async fn self_signed_https_server() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        install_crypto_provider();
+
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = issued.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
+
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return; // handshake refused by the client — the point of the test
+                    };
+                    let mut buf = [0u8; 4096];
+                    let _ = tls.read(&mut buf).await;
+                    let body = r#"{"success":true,"data":{"sid":"tls_ok"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// Regression: the client called `danger_accept_invalid_certs(true)`
+    /// unconditionally, so `https` bought encryption against a passive observer
+    /// and nothing else — any machine able to intercept the connection could
+    /// present its own certificate and read the password. Verification is now
+    /// on by default.
+    #[tokio::test]
+    async fn https_rejects_a_self_signed_certificate_by_default() {
+        let port = self_signed_https_server().await;
+        let client = SynologyClient::new("localhost", port, true);
+
+        let err = client
+            .login("alice", "secret", None)
+            .await
+            .expect_err("an unverifiable certificate must not be silently accepted");
+
+        assert!(
+            matches!(err, SynoFsError::Io(_)),
+            "expected a transport/TLS failure, got {err:?}"
+        );
+    }
+
+    /// The escape hatch has to actually work: a self-signed NAS certificate is
+    /// the normal case for this appliance, and `--insecure` is what those users
+    /// are told to pass.
+    #[tokio::test]
+    async fn with_insecure_tls_accepts_a_self_signed_certificate() {
+        let port = self_signed_https_server().await;
+        let client = SynologyClient::new("localhost", port, true).with_insecure_tls();
+
+        client
+            .login("alice", "secret", None)
+            .await
+            .expect("--insecure must accept a self-signed certificate");
+        assert_eq!(client.sid(), "tls_ok");
+    }
+
+    /// The CLI and GUI turn a rejected certificate into "…re-run with
+    /// --insecure", which only works if the error is recognisable as a TLS
+    /// failure. Pin `is_tls_error` against a real handshake so it tracks the
+    /// string rustls actually produces.
+    #[tokio::test]
+    async fn a_rejected_certificate_is_recognisable_as_a_tls_failure() {
+        let port = self_signed_https_server().await;
+        let err = SynologyClient::new("localhost", port, true)
+            .login("alice", "secret", None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.is_tls_error(),
+            "a rejected certificate must be recognisable so the user can be \
+             pointed at --insecure; got: {err}"
+        );
+    }
+
+    /// The flag is inspectable so the CLI/GUI/bindings can report which mode
+    /// they are in, and so a future change cannot silently invert the default.
+    #[test]
+    fn tls_verification_is_on_unless_explicitly_disabled() {
+        let strict = SynologyClient::new("nas.example.invalid", 5001, true);
+        assert!(!strict.insecure_tls());
+        assert!(strict.with_insecure_tls().insecure_tls());
+    }
+
     // ── login ────────────────────────────────────────────────────────────────
+
+    /// Mount an auth.cgi handler and return the login response body it serves.
+    async fn mount_auth(server: &MockServer, body: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(path("/webapi/auth.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
 
     #[tokio::test]
     async fn login_stores_sid_on_success() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/webapi/auth.cgi"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true,
-                "data": {"sid": "abc123def"}
-            })))
-            .mount(&server)
-            .await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": true, "data": {"sid": "abc123def"}}),
+        )
+        .await;
 
         let client = client_for(&server);
         client.login("alice", "secret", None).await.unwrap();
@@ -1539,14 +1708,11 @@ mod tests {
     #[tokio::test]
     async fn login_returns_api_error_on_failure() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/webapi/auth.cgi"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": false,
-                "error": {"code": 400}
-            })))
-            .mount(&server)
-            .await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": false, "error": {"code": 400}}),
+        )
+        .await;
 
         let client = client_for(&server);
         let err = client.login("alice", "wrong", None).await.unwrap_err();
@@ -1554,17 +1720,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_with_otp_includes_otp_param() {
+    async fn login_with_otp_sends_the_otp_code() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/webapi/auth.cgi"))
-            .and(query_param("otp_code", "123456"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true,
-                "data": {"sid": "otp_sid_xyz"}
-            })))
-            .mount(&server)
-            .await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": true, "data": {"sid": "otp_sid_xyz"}}),
+        )
+        .await;
 
         let client = client_for(&server);
         client
@@ -1572,6 +1734,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(client.sid(), "otp_sid_xyz");
+
+        let reqs = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            body.contains("otp_code=123456"),
+            "otp missing from body: {body}"
+        );
+    }
+
+    /// Regression: login was a GET carrying `passwd=<plaintext>` in the query
+    /// string. Query strings are written to DSM's own nginx access log and to
+    /// any proxy in between, so every login left the account password sitting
+    /// in plaintext on disk in at least one place. Credentials belong in the
+    /// request body.
+    #[tokio::test]
+    async fn login_never_puts_credentials_in_the_url() {
+        let server = MockServer::start().await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": true, "data": {"sid": "s"}}),
+        )
+        .await;
+
+        let client = client_for(&server);
+        client
+            .login("alice", "placeholder-not-a-real-password", Some("998877"))
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let req = &reqs[0];
+        let url = req.url.as_str();
+        assert!(
+            !url.contains("placeholder-not-a-real-password"),
+            "password leaked into the URL: {url}"
+        );
+        assert!(!url.contains("passwd"), "passwd param in the URL: {url}");
+        assert!(!url.contains("998877"), "otp leaked into the URL: {url}");
+        assert!(!url.contains("alice"), "account leaked into the URL: {url}");
+
+        // ...and it really did travel, just in the body.
+        let body = String::from_utf8_lossy(&req.body);
+        assert!(
+            body.contains("placeholder-not-a-real-password"),
+            "password missing from the body: {body}"
+        );
     }
 
     // ── logout ───────────────────────────────────────────────────────────────
@@ -1579,7 +1787,7 @@ mod tests {
     #[tokio::test]
     async fn logout_clears_sid() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
@@ -2328,7 +2536,7 @@ mod tests {
     #[tokio::test]
     async fn default_client_does_not_stash_credentials() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
@@ -2348,7 +2556,7 @@ mod tests {
     #[tokio::test]
     async fn auto_relogin_client_stashes_credentials_on_login() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
@@ -2368,7 +2576,7 @@ mod tests {
     async fn api_119_surfaces_when_auto_relogin_off() {
         // Pre-bug-fix behavior: a default client should still see 119 directly.
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
@@ -2403,9 +2611,9 @@ mod tests {
 
         // Both login calls return the same fixed sid; server doesn't care
         // about sid value, only that the call sequence is right.
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "data": {"sid": "fresh_sid"}
@@ -2456,9 +2664,9 @@ mod tests {
         let server = MockServer::start().await;
 
         // First login: success. Second login (re-login): auth failure (400).
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "data": {"sid": "first"}
@@ -2466,9 +2674,9 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": false,
                 "error": {"code": 400}
@@ -2508,9 +2716,9 @@ mod tests {
         // If both the initial call AND the retry return 119, give up — don't
         // loop forever. The second 119 is what the caller sees.
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "data": {"sid": "s"}
@@ -2544,9 +2752,9 @@ mod tests {
         // Verify we don't re-auth on non-119 errors. The login mock has
         // .expect(1) and the test will fail on drop if we re-login.
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "data": {"sid": "s"}
@@ -2719,9 +2927,9 @@ mod tests {
         // kicks in, retry succeeds, file lands on disk correctly.
         let server = MockServer::start().await;
 
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "data": {"sid": "fresh"}
