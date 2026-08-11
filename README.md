@@ -344,6 +344,7 @@ synology-filestation-fuse --host <NAS_HOST> -u <USERNAME> [OPTIONS] <MOUNTPOINT>
 | `--otp <CODE>` | TOTP code for 2FA (or `SYNO_OTP` env var); prompted interactively if omitted and 2FA is enabled | *(optional)* |
 | `--port <PORT>` | API port | `5001` |
 | `--https` | Use HTTPS | `true` |
+| `--password-stdin` | Read the password from the first line of stdin. Prefer this in scripts: `--password` puts the password in argv, where any local account can read it with `ps`. | `false` |
 | `--insecure` | Accept any TLS certificate (self-signed, expired, wrong hostname). Needed for a stock DSM certificate; the connection is then encrypted but **not** authenticated. Env: `SYNO_INSECURE` | `false` |
 | `--cache-ttl <SECS>` | Metadata cache TTL in seconds *(Linux only)* | `30` |
 | `--read-cache-mb <MiB>` | Read cache size in MiB *(Linux only)* | `256` |
