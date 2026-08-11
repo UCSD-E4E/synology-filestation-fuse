@@ -7,7 +7,7 @@ use dav_server::fs::*;
 use futures_util::stream;
 use tracing::debug;
 
-use crate::spill::SpillBuffer;
+use crate::spill::{payload_for, upload_payload, SpillBuffer};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::SynoFileInfo;
@@ -244,29 +244,20 @@ impl DavFile for SynoDavFile {
             let client = self.client.clone();
             let path = self.nas_path.clone();
             let overwrite = !self.is_new;
-            // A buffer that outgrew memory is already on disk; hand the core the
-            // file so it uploads in slices instead of materializing the whole
-            // thing. Small writes still go out in one shot, as before.
-            let spilled = match buf.spilled_path() {
-                Ok(Some(p)) => Some(p.to_path_buf()),
-                Ok(None) => None,
+            let payload = match payload_for(&mut buf) {
+                Ok(p) => p,
                 Err(_) => return Box::pin(async { Err(FsError::GeneralFailure) }),
             };
+            debug!("flush: uploading {} ({} bytes)", path, payload.len());
             Box::pin(async move {
+                // The buffer rides along so it outlives the upload: a spilled
+                // buffer deletes its temp file on drop, and that file is the
+                // payload being sent.
+                let _buf = buf;
                 let (parent, filename) = split_path(&path);
-                match spilled {
-                    Some(local) => client
-                        .upload_from_path(&local, parent, filename, overwrite)
-                        .await
-                        .map_err(syno_err),
-                    None => {
-                        let data = buf.as_bytes().map_err(|_| FsError::GeneralFailure)?;
-                        client
-                            .upload(parent, filename, data, overwrite)
-                            .await
-                            .map_err(syno_err)
-                    }
-                }
+                upload_payload(&client, parent, filename, payload, overwrite)
+                    .await
+                    .map_err(syno_err)
             })
         } else {
             Box::pin(async { Ok(()) })
