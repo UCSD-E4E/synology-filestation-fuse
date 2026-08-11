@@ -108,6 +108,10 @@ pub struct RenameData {
 #[allow(dead_code)]
 pub struct UploadData {
     pub blks: Option<serde_json::Value>,
+    /// Slice-upload state: the server's partial-file handle, echoed back as
+    /// `X-TMP-FILE` on the next slice. Absent on one-shot uploads.
+    #[serde(default)]
+    pub tmpfile: Option<String>,
 }
 
 /// An entry in the inode cache

@@ -172,6 +172,18 @@ impl<T: ?Sized> TransportEntry<T> {
     }
 }
 
+/// Bytes per slice on the chunked upload path — the same 10 MiB DSM's own File
+/// Station uploader uses (`chunksize` in `FileUploader.js`).
+///
+/// DSM only slices above `MAX_POST_FILESIZE` (4 GiB − 4096), because its
+/// concern is the POST limit. Ours is memory: `http_upload` holds the whole
+/// file in a `Vec<u8>`, so we slice anything that exceeds one slice.
+pub const DEFAULT_SLICE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Upload progress sink: `(bytes_done, bytes_total)`, called once per slice.
+/// Borrowed rather than boxed so callers can pass a plain closure reference.
+pub type ProgressSink<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
+
 pub struct SynologyClient {
     http: Client,
     base_url: String,
@@ -197,6 +209,10 @@ pub struct SynologyClient {
     /// Injected streaming read backends, tried in order by `download_to_path`
     /// before falling back to the buffering HTTP download.
     stream_read_transports: Vec<TransportEntry<dyn StreamReadTransport>>,
+    /// Bytes per slice for the chunked upload path. A file larger than this is
+    /// uploaded slice-by-slice so it is never held in memory whole; anything
+    /// smaller takes the one-shot path. Default [`DEFAULT_SLICE_SIZE`].
+    slice_size: usize,
 }
 
 impl std::fmt::Debug for SynologyClient {
@@ -267,6 +283,7 @@ impl SynologyClient {
             write_transports: Vec::new(),
             stream_write_transports: Vec::new(),
             stream_read_transports: Vec::new(),
+            slice_size: DEFAULT_SLICE_SIZE,
         }
     }
 
@@ -306,6 +323,15 @@ impl SynologyClient {
     pub fn with_stream_read_transport(mut self, transport: Arc<dyn StreamReadTransport>) -> Self {
         self.stream_read_transports
             .push(TransportEntry::new(transport));
+        self
+    }
+
+    /// Override the slice size used by the chunked upload path (default
+    /// [`DEFAULT_SLICE_SIZE`]). A file larger than this is uploaded slice by
+    /// slice; anything smaller takes the one-shot path. Mostly useful for tests
+    /// and for tuning against a slow link.
+    pub fn with_slice_size(mut self, bytes: usize) -> Self {
+        self.slice_size = bytes.max(1);
         self
     }
 
@@ -919,7 +945,7 @@ impl SynologyClient {
                 }
             }
         }
-        self.http_upload(folder_path, filename, data, overwrite)
+        self.http_upload(folder_path, filename, data, overwrite, None)
             .await
     }
 
@@ -936,6 +962,22 @@ impl SynologyClient {
         folder_path: &str,
         filename: &str,
         overwrite: bool,
+    ) -> Result<(), SynoFsError> {
+        self.upload_from_path_with_progress(local, folder_path, filename, overwrite, None)
+            .await
+    }
+
+    /// [`upload_from_path`](Self::upload_from_path) with a progress sink called
+    /// once per slice with cumulative bytes. Slice boundaries are internal to
+    /// this crate, so a caller that wants a moving progress bar (the GUI, via
+    /// the FFI) can only learn about them here.
+    pub async fn upload_from_path_with_progress(
+        &self,
+        local: &Path,
+        folder_path: &str,
+        filename: &str,
+        overwrite: bool,
+        progress: Option<ProgressSink<'_>>,
     ) -> Result<(), SynoFsError> {
         if overwrite && !self.stream_write_transports.is_empty() {
             let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
@@ -961,15 +1003,179 @@ impl SynologyClient {
                 }
             }
         }
-        // Fallback: read the file into memory and take the HTTP upload path.
+        // Fallback: HTTP. A file bigger than one slice goes down the chunked
+        // path so it is never resident in memory whole; smaller files keep the
+        // existing one-shot behavior.
+        let len = tokio::fs::metadata(local)
+            .await
+            .map_err(|e| {
+                SynoFsError::Io(format!(
+                    "upload_from_path: stat {} failed: {e}",
+                    local.display()
+                ))
+            })?
+            .len();
+        if len > self.slice_size as u64 {
+            return self
+                .http_slice_upload(local, folder_path, filename, len, overwrite, progress)
+                .await;
+        }
         let data = tokio::fs::read(local).await.map_err(|e| {
             SynoFsError::Io(format!(
                 "upload_from_path: read {} failed: {e}",
                 local.display()
             ))
         })?;
-        self.http_upload(folder_path, filename, data, overwrite)
-            .await
+        self.http_upload(
+            folder_path,
+            filename,
+            data,
+            overwrite,
+            local_mtime_ms(local).await,
+        )
+        .await?;
+        // One-shot: the only boundary we can report is the end of the file.
+        if let Some(p) = progress {
+            p(len, len);
+        }
+        Ok(())
+    }
+
+    /// Chunked ("slice") upload — the path DSM's own File Station uploader uses
+    /// for large files, reimplemented from a capture of it plus its JS source.
+    ///
+    /// Each slice is one POST carrying the same body fields; the chunking rides
+    /// in headers. The server hands back a `tmpfile` handle on the first slice,
+    /// which every later slice echoes as `X-TMP-FILE` to append to the same
+    /// partial file. The final slice sets `X-FILE-CHUNK-END: true` and its
+    /// response is the result — there is no separate finalize call.
+    ///
+    /// Memory is bounded by one slice, in contrast to [`Self::http_upload`],
+    /// which holds the whole file (and clones it per retry attempt).
+    ///
+    /// Deliberately **not** retried per slice: a resent slice would append
+    /// twice, and DSM exposes no way to ask how much of the partial file it
+    /// already holds. A failure surfaces and the caller restarts the file —
+    /// the outer-retry contract the throttle docs already specify.
+    async fn http_slice_upload(
+        &self,
+        local: &Path,
+        folder_path: &str,
+        filename: &str,
+        total: u64,
+        overwrite: bool,
+        progress: Option<ProgressSink<'_>>,
+    ) -> Result<(), SynoFsError> {
+        use tokio::io::AsyncReadExt;
+
+        let url = format!("{}/entry.cgi", self.base_url);
+        let slice_size = self.slice_size;
+        let slices = total.div_ceil(slice_size as u64).max(1);
+        debug!(
+            "slice upload: {}/{} ({} bytes, {} slices of {})",
+            folder_path, filename, total, slices, slice_size
+        );
+
+        if overwrite {
+            self.clear_for_overwrite(folder_path, filename).await;
+        }
+
+        let mtime_ms = local_mtime_ms(local).await;
+
+        let mut file = tokio::fs::File::open(local).await.map_err(|e| {
+            SynoFsError::Io(format!(
+                "slice upload: open {} failed: {e}",
+                local.display()
+            ))
+        })?;
+        let mut buf = vec![0u8; slice_size];
+        let mut tmpfile: Option<String> = None;
+
+        for index in 0..slices {
+            let want = std::cmp::min(slice_size as u64, total - index * slice_size as u64) as usize;
+            file.read_exact(&mut buf[..want]).await.map_err(|e| {
+                SynoFsError::Io(format!("slice upload: read slice {index} failed: {e}"))
+            })?;
+
+            let last = index + 1 == slices;
+            let file_part = multipart::Part::bytes(buf[..want].to_vec())
+                .file_name(filename.to_string())
+                .mime_str("application/octet-stream")
+                .map_err(|e| SynoFsError::Io(e.to_string()))?;
+            let mut form = multipart::Form::new()
+                .text("overwrite", "false")
+                .text("path", folder_path.to_string());
+            if let Some(ms) = &mtime_ms {
+                form = form.text("mtime", ms.clone());
+            }
+            let form = form.part("file", file_part);
+
+            let mut req = self
+                .http
+                .post(&url)
+                .query(&[
+                    ("api", "SYNO.FileStation.Upload"),
+                    ("method", "upload"),
+                    ("version", "2"),
+                ])
+                .query(&[("_sid", self.sid())])
+                .header("X-TYPE-NAME", "SLICEUPLOAD")
+                .header("X-FILE-SIZE", total.to_string())
+                .header("X-FILE-CHUNK-END", if last { "true" } else { "false" });
+            if let Some(t) = &tmpfile {
+                req = req.header("X-TMP-FILE", t.clone());
+            }
+
+            let text = {
+                let _slot = self.acquire_transfer_slot().await;
+                req.multipart(form).send().await?.text().await?
+            };
+            let parsed: SynoResponse<UploadData> = serde_json::from_str(&text)
+                .map_err(|e| SynoFsError::Io(format!("slice upload parse error: {e}")))?;
+            if !parsed.success {
+                let code = parsed.error.map(|e| e.code).unwrap_or(0);
+                return Err(SynoFsError::ApiError(code));
+            }
+
+            if let Some(p) = progress {
+                p(index * slice_size as u64 + want as u64, total);
+            }
+
+            if !last {
+                // Without a handle there is nothing for the next slice to append
+                // to; DSM's own client treats this as fatal rather than retrying.
+                tmpfile = match parsed
+                    .data
+                    .and_then(|d| d.tmpfile)
+                    .filter(|t| !t.is_empty())
+                {
+                    Some(t) => Some(t),
+                    None => {
+                        return Err(SynoFsError::Io(format!(
+                            "slice upload: server returned no tmpfile after slice {index}"
+                        )))
+                    }
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete a file that is in the way of an upload, then wait for it to
+    /// actually disappear. Shared by the one-shot and slice upload paths:
+    /// `overwrite=true` on the multipart API times out on some DSM versions, so
+    /// both always upload with `overwrite=false` onto cleared ground. Delete is
+    /// async on modern DSM, hence the poll — otherwise the upload races it and
+    /// fails 418 AlreadyExists.
+    async fn clear_for_overwrite(&self, folder_path: &str, filename: &str) {
+        let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
+        let _ = self.delete(&full_path).await; // ignore error — file may not exist yet
+        for _ in 0..10u8 {
+            match self.get_info(&full_path).await {
+                Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                Err(_) => break, // gone or inaccessible — safe to upload
+            }
+        }
     }
 
     /// The HTTP FileStation Upload implementation. Used directly when no write
@@ -980,6 +1186,9 @@ impl SynologyClient {
         filename: &str,
         data: Vec<u8>,
         overwrite: bool,
+        // Local modification time in ms, when the caller has a file to take it
+        // from. DSM stores it verbatim; without it the NAS stamps upload time.
+        mtime_ms: Option<String>,
     ) -> Result<(), SynoFsError> {
         let url = format!("{}/entry.cgi", self.base_url);
         debug!(
@@ -989,20 +1198,8 @@ impl SynologyClient {
             data.len()
         );
 
-        // overwrite=true via the multipart API times out on some DSM versions.
-        // Delete the existing file first so we can always upload with overwrite=false.
         if overwrite {
-            let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
-            let _ = self.delete(&full_path).await; // ignore error — file may not exist yet
-
-            // Synology Delete is async on modern DSM: poll get_info until the file is
-            // gone (or inaccessible) before uploading, to avoid 418 AlreadyExists.
-            for _ in 0..10u8 {
-                match self.get_info(&full_path).await {
-                    Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-                    Err(_) => break, // gone or inaccessible — safe to upload
-                }
-            }
+            self.clear_for_overwrite(folder_path, filename).await;
         }
 
         let max_attempts = self.max_transfer_attempts();
@@ -1023,8 +1220,13 @@ impl SynologyClient {
                 .text("method", "upload")
                 .text("path", folder_path.to_string())
                 .text("create_parents", "true")
+                .text("size", data.len().to_string())
                 .text("overwrite", "false")
                 .part("file", file_part);
+            let form = match &mtime_ms {
+                Some(ms) => form.text("mtime", ms.clone()),
+                None => form,
+            };
 
             // Hold a transfer slot only for the request+response read; drop it
             // before any backoff so a retrying upload doesn't hog a permit.
@@ -1188,6 +1390,18 @@ impl SynologyClient {
             Err(SynoFsError::ApiError(code))
         }
     }
+}
+
+/// A local file's modification time in milliseconds since the epoch, as DSM's
+/// upload API expects it. `None` when the filesystem can't report one — the
+/// upload still proceeds, it just lands with the NAS's own timestamp.
+async fn local_mtime_ms(path: &Path) -> Option<String> {
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis().to_string())
 }
 
 #[cfg(test)]
@@ -2863,5 +3077,261 @@ mod tests {
         assert!(matches!(err, SynoFsError::NotFound));
         assert_eq!(backend.call_count(), 1);
         assert!(!dest.exists(), "definitive failure leaves no file");
+    }
+
+    // ── slice upload ─────────────────────────────────────────────────────────
+    //
+    // Mirrors what the DSM 7 File Station web UI does for large files (mined
+    // from a browser capture of a 4.9 GB upload): one POST per slice, with the
+    // chunking carried in request headers rather than the multipart body. Every
+    // slice repeats the same body fields; the server ties them together by tmpfile.
+    //
+    //   X-TYPE-NAME: SLICEUPLOAD
+    //   X-FILE-SIZE: <total bytes>
+    //   X-FILE-CHUNK-END: false   (true on the final slice)
+    //   X-TMP-FILE: <tmpfile>     (echoed from the previous response, slice 2+)
+    //
+    // Confirmed against DSM's own uploader (FileUploader_T9JY.js): the final
+    // data slice carries X-FILE-CHUNK-END: true and its response is the result --
+    // there is no separate finalize request. Slices are tied together by echoing
+    // the response's `tmpfile` back as X-TMP-FILE; a non-final response without
+    // one is fatal. DSM slices only above 4 GiB; we slice above one slice, because
+    // our motive is bounded memory rather than its POST limit.
+
+    /// Write `len` bytes to a scratch file and return its path.
+    fn scratch_file(name: &str, len: usize) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("syno-slice-{}-{name}", std::process::id()));
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    fn header_of(req: &wiremock::Request, name: &str) -> Option<String> {
+        req.headers
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn slice_upload_splits_file_and_marks_final_slice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"blSkip": false, "progress": 1, "tmpfile": "slice.1.0.9224"}
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("split.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 3, "2500 bytes at 1024/slice is 3 slices");
+        for r in &reqs {
+            assert_eq!(header_of(r, "X-TYPE-NAME").as_deref(), Some("SLICEUPLOAD"));
+            assert_eq!(header_of(r, "X-FILE-SIZE").as_deref(), Some("2500"));
+        }
+        let ends: Vec<_> = reqs
+            .iter()
+            .map(|r| header_of(r, "X-FILE-CHUNK-END").unwrap())
+            .collect();
+        assert_eq!(ends, vec!["false", "false", "true"]);
+
+        // Slice 1 opens the upload; every later slice echoes the tmpfile the
+        // server handed back, which is what ties them to one partial file.
+        let tmps: Vec<_> = reqs.iter().map(|r| header_of(r, "X-TMP-FILE")).collect();
+        assert_eq!(
+            tmps,
+            vec![
+                None,
+                Some("slice.1.0.9224".to_string()),
+                Some("slice.1.0.9224".to_string())
+            ]
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_skipped_for_file_that_fits_one_slice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("small.bin", 500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share", "small.bin", false)
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "one-shot upload for a file under one slice");
+        assert!(
+            header_of(&reqs[0], "X-TYPE-NAME").is_none(),
+            "no slice headers on the one-shot path"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_stops_at_the_failing_slice() {
+        // No per-slice retry: a resumed slice could double-append, and the
+        // resume semantics are unverified. Surface the error and let the caller
+        // restart the whole file (the Temporal outer-retry contract).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 1805}
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("fail.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        let err = client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SynoFsError::ApiError(1805)));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "first slice fails, remaining slices are not sent"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_aborts_when_tmpfile_missing() {
+        // DSM's own client treats a non-final response with no tmpfile as fatal:
+        // without it the next slice has nothing to append to.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"blSkip": false, "progress": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("notmp.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        let err = client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SynoFsError::Io(_)));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "no tmpfile to continue with, so no second slice"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_preserves_mtime_and_sends_size() {
+        // Proven against the NAS in a browser capture: File Station sends the
+        // local mtime in ms and the server stores it (the listing came back with
+        // mtime = the value sent, crtime = upload time). Without it every
+        // uploaded file is stamped with the upload time instead.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("mtime.bin", 300);
+        let client = client_for(&server);
+        client
+            .upload_from_path(&local, "/share", "mtime.bin", false)
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&reqs[0].body).to_string();
+        assert!(body.contains("name=\"size\""), "one-shot upload sends size");
+        assert!(
+            body.contains("name=\"mtime\""),
+            "one-shot upload sends mtime"
+        );
+        let sent_ms: u128 = body
+            .split("name=\"mtime\"")
+            .nth(1)
+            .unwrap()
+            .trim_start_matches("\r\n\r\n")
+            .lines()
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let want_ms = std::fs::metadata(&local)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        assert_eq!(
+            sent_ms, want_ms,
+            "mtime is the local file's, in milliseconds"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_reports_progress_per_slice() {
+        // The FFI can't observe slice boundaries itself (they live inside the
+        // core loop), so the GUI's upload bar depends on this callback.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"blSkip": false, "tmpfile": "slice.1.0.9224"}
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("progress.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        client
+            .upload_from_path_with_progress(
+                &local,
+                "/share",
+                "big.bin",
+                false,
+                Some(&move |done, total| sink.lock().unwrap().push((done, total))),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(1024, 2500), (2048, 2500), (2500, 2500)],
+            "cumulative bytes after each slice"
+        );
+        std::fs::remove_file(&local).ok();
     }
 }

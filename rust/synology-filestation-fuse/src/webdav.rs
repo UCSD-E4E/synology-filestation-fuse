@@ -7,6 +7,7 @@ use dav_server::fs::*;
 use futures_util::stream;
 use tracing::debug;
 
+use crate::spill::SpillBuffer;
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::SynoFileInfo;
@@ -171,7 +172,7 @@ struct SynoDavFile {
     info: SynoFileInfo,
     offset: u64,
     /// Buffered write data; `Some` when opened for writing.
-    write_buf: Option<Vec<u8>>,
+    write_buf: Option<SpillBuffer>,
     /// True when the file did not exist on the NAS at open time.
     /// Used to skip the delete-before-upload overwrite path.
     is_new: bool,
@@ -186,19 +187,19 @@ impl DavFile for SynoDavFile {
     fn write_buf(&mut self, buf: Box<dyn Buf + Send>) -> FsFuture<'_, ()> {
         let mut b = buf;
         let chunk = b.copy_to_bytes(b.remaining());
-        match &mut self.write_buf {
-            Some(v) => v.extend_from_slice(&chunk),
-            None => self.write_buf = Some(chunk.to_vec()),
-        }
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let sink = self.write_buf.get_or_insert_with(SpillBuffer::new);
+            sink.write_at(sink.len(), &chunk)
+                .map_err(|_| FsError::GeneralFailure)
+        })
     }
 
     fn write_bytes(&mut self, buf: Bytes) -> FsFuture<'_, ()> {
-        match &mut self.write_buf {
-            Some(v) => v.extend_from_slice(&buf),
-            None => self.write_buf = Some(buf.to_vec()),
-        }
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let sink = self.write_buf.get_or_insert_with(SpillBuffer::new);
+            sink.write_at(sink.len(), &buf)
+                .map_err(|_| FsError::GeneralFailure)
+        })
     }
 
     fn read_bytes(&mut self, count: usize) -> FsFuture<'_, Bytes> {
@@ -235,7 +236,7 @@ impl DavFile for SynoDavFile {
     }
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
-        if let Some(data) = self.write_buf.take() {
+        if let Some(mut buf) = self.write_buf.take() {
             // AppleDouble companion files (._*) are discarded — not stored on the NAS.
             if is_apple_double(&self.nas_path) {
                 return Box::pin(async { Ok(()) });
@@ -243,12 +244,29 @@ impl DavFile for SynoDavFile {
             let client = self.client.clone();
             let path = self.nas_path.clone();
             let overwrite = !self.is_new;
+            // A buffer that outgrew memory is already on disk; hand the core the
+            // file so it uploads in slices instead of materializing the whole
+            // thing. Small writes still go out in one shot, as before.
+            let spilled = match buf.spilled_path() {
+                Ok(Some(p)) => Some(p.to_path_buf()),
+                Ok(None) => None,
+                Err(_) => return Box::pin(async { Err(FsError::GeneralFailure) }),
+            };
             Box::pin(async move {
                 let (parent, filename) = split_path(&path);
-                client
-                    .upload(parent, filename, data, overwrite)
-                    .await
-                    .map_err(syno_err)
+                match spilled {
+                    Some(local) => client
+                        .upload_from_path(&local, parent, filename, overwrite)
+                        .await
+                        .map_err(syno_err),
+                    None => {
+                        let data = buf.as_bytes().map_err(|_| FsError::GeneralFailure)?;
+                        client
+                            .upload(parent, filename, data, overwrite)
+                            .await
+                            .map_err(syno_err)
+                    }
+                }
             })
         } else {
             Box::pin(async { Ok(()) })
@@ -355,7 +373,7 @@ impl DavFileSystem for SynologyDavFs {
                         nas_path: nas,
                         info,
                         offset: 0,
-                        write_buf: Some(Vec::new()),
+                        write_buf: Some(SpillBuffer::new()),
                         is_new: false,
                     });
                     return Ok(file);
@@ -384,7 +402,7 @@ impl DavFileSystem for SynologyDavFs {
                     nas_path: nas,
                     info,
                     offset: 0,
-                    write_buf: Some(Vec::new()),
+                    write_buf: Some(SpillBuffer::new()),
                     is_new,
                 });
                 Ok(file)
