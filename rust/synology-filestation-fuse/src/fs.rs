@@ -27,16 +27,26 @@ fn errno(raw: i32) -> Errno {
     Errno::from_i32(raw)
 }
 
+/// Split a NAS path into `(parent, filename)`. `None` for a path with no
+/// separator, which cannot name a file inside a share.
+///
+/// Previously open-coded at three call sites as `rfind('/')` followed by a
+/// second `rfind('/').unwrap()` — the `unwrap` being safe only because the
+/// preceding match had already proven the separator exists.
+fn split_nas_path(path: &str) -> Option<(&str, &str)> {
+    let idx = path.rfind('/')?;
+    Some((&path[..idx], &path[idx + 1..]))
+}
+
 struct WriteBuffer {
     nas_path: String,
     ino: u64,
     data: SpillBuffer,
     dirty: bool,
     /// True when the file was just created and has not yet been uploaded.
-    /// Allows flush to use overwrite=false, skipping the delete-before-upload round trips.
+    /// Allows the first upload to use overwrite=false, skipping the
+    /// delete-before-upload round trips. Cleared once an upload succeeds.
     new_file: bool,
-    /// In-flight background upload spawned by flush(); waited on in release().
-    upload_handle: Option<tokio::task::JoinHandle<Result<(), SynoFsError>>>,
 }
 
 pub struct SynologyFS {
@@ -153,99 +163,37 @@ impl SynologyFS {
         self.cache.get_path_for_ino(ino)
     }
 
-    /// Spawn a background upload for `fh` if the buffer is dirty.
-    /// Returns immediately; the actual upload runs on the tokio runtime.
-    /// `release` / `destroy` must call `finish_upload` to wait for completion.
-    fn queue_upload(&self, fh: u64) {
-        let mut buffers = self.write_buffers.lock().unwrap();
-        let buf = match buffers.get_mut(&fh) {
-            Some(b) if b.dirty && b.upload_handle.is_none() => b,
-            _ => return,
-        };
-
-        let nas_path = buf.nas_path.clone();
-        let ino = buf.ino;
-        let payload = match payload_for(&mut buf.data) {
-            Ok(p) => p,
-            Err(e) => {
-                error!("queue_upload: cannot read write buffer: {}", e);
-                return;
-            }
-        };
-        let overwrite = !buf.new_file;
-        buf.dirty = false;
-
-        let parent = match nas_path.rfind('/') {
-            Some(i) => nas_path[..i].to_string(),
-            None => return,
-        };
-        let filename = nas_path[nas_path.rfind('/').unwrap() + 1..].to_string();
-
-        debug!(
-            "queue_upload: fh={} parent={:?} filename={:?} size={}",
-            fh,
-            parent,
-            filename,
-            payload.len()
-        );
-
-        let client = self.client.clone();
-        let cache = self.cache.clone();
-        let read_cache = self.read_cache.clone();
-        let path_for_task = nas_path.clone();
-
-        // Spawn the upload; hold the mutex so the handle is stored before release() can run.
-        let handle = self.rt.spawn(async move {
-            let result = upload_payload(&client, &parent, &filename, payload, overwrite).await;
-            cache.invalidate_path(&path_for_task);
-            read_cache.invalidate_ino(ino);
-            result
-        });
-
-        buf.upload_handle = Some(handle);
-    }
-
-    /// Wait for any in-flight upload for `fh`, and synchronously upload any
-    /// remaining dirty data.  Called from `release` and `destroy`.
+    /// Upload `fh`'s buffered data and block until the NAS has it.
+    ///
+    /// This is what `flush` (and therefore `close(2)`) reports on, so it must
+    /// be synchronous: an upload still in flight when we return is an upload
+    /// whose failure nobody will ever hear about.
+    ///
+    /// `dirty` is cleared only *after* the upload succeeds. A failed flush
+    /// therefore leaves the data buffered for `release` to retry, matching what
+    /// the WinFsp backend already does — previously the flag was cleared before
+    /// the upload even started, so a failure silently discarded the write.
     fn finish_upload(&self, fh: u64) -> Result<(), SynoFsError> {
-        // Extract both the handle and dirty state without holding the lock while blocking.
-        let (handle, dirty, nas_path, ino, payload, overwrite) = {
+        // Snapshot under the lock; never hold it across the upload. For a
+        // spilled buffer the payload is just the temp path, and that file stays
+        // alive because the buffer itself stays in `write_buffers` until
+        // `release` removes it — after this call has returned.
+        let (nas_path, ino, payload, overwrite) = {
             let mut buffers = self.write_buffers.lock().unwrap();
             let buf = match buffers.get_mut(&fh) {
-                Some(b) => b,
-                None => return Ok(()),
+                Some(b) if b.dirty => b,
+                // Unknown handle, or nothing written since the last successful
+                // upload: there is genuinely nothing to do.
+                _ => return Ok(()),
             };
-            let handle = buf.upload_handle.take();
-            if !buf.dirty {
-                // Nothing new to upload — just wait for any in-flight task.
-                drop(buffers);
-                return if let Some(h) = handle {
-                    self.block(h)
-                        .map_err(|_| SynoFsError::Io("upload task panicked".into()))?
-                } else {
-                    Ok(())
-                };
-            }
-            let path = buf.nas_path.clone();
-            let ino = buf.ino;
             let payload = payload_for(&mut buf.data).map_err(|e| SynoFsError::Io(e.to_string()))?;
-            let overwrite = !buf.new_file;
-            buf.dirty = false;
-            (handle, true, path, ino, payload, overwrite)
+            (buf.nas_path.clone(), buf.ino, payload, !buf.new_file)
         };
-        let _ = dirty; // used implicitly — we only reach here when dirty was true
 
-        // Wait for any in-flight upload of older data before uploading the newer data.
-        if let Some(h) = handle {
-            self.block(h)
-                .map_err(|_| SynoFsError::Io("upload task panicked".into()))??;
-        }
-
-        let parent = match nas_path.rfind('/') {
-            Some(i) => &nas_path[..i],
+        let (parent, filename) = match split_nas_path(&nas_path) {
+            Some(v) => v,
             None => return Err(SynoFsError::InvalidArg),
         };
-        let filename = &nas_path[nas_path.rfind('/').unwrap() + 1..];
 
         debug!(
             "finish_upload: fh={} parent={:?} filename={:?} size={}",
@@ -261,8 +209,173 @@ impl SynologyFS {
             payload,
             overwrite,
         ))?;
+
+        // Durable now: stop advertising the buffer as dirty, and record that the
+        // file exists on the NAS so a later flush overwrites instead of racing
+        // an `overwrite=false` create against itself.
+        if let Some(buf) = self.write_buffers.lock().unwrap().get_mut(&fh) {
+            buf.dirty = false;
+            buf.new_file = false;
+        }
         self.cache.invalidate_path(&nas_path);
         self.read_cache.invalidate_ino(ino);
+        Ok(())
+    }
+
+    /// Assemble a byte range for `read`, block by block, out of the read cache.
+    ///
+    /// Split out of the `read` callback so the assembly rules are testable
+    /// without a live mount; `read` keeps the prefetch and the reply.
+    fn read_range(
+        &self,
+        ino: u64,
+        path: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, SynoFsError> {
+        let block_size = self.read_cache.block_size;
+        let first_block = offset / block_size;
+        let last_block = (offset + size - 1) / block_size;
+
+        let mut result: Vec<u8> = Vec::with_capacity(size as usize);
+
+        for block_idx in first_block..=last_block {
+            let block_start = block_idx * block_size;
+
+            let block = if let Some(cached) = self.read_cache.get(ino, block_idx) {
+                if cached.is_empty() {
+                    debug!("read: EOF sentinel hit ino={} block={}", ino, block_idx);
+                    break;
+                }
+                cached
+            } else if self.read_cache.claim_inflight(ino, block_idx) {
+                // We won the race — download synchronously.
+                debug!("read cache miss: ino={} block={}", ino, block_idx);
+                match self.block(self.client.download(path, block_start, block_size)) {
+                    Ok(b) if !b.is_empty() => {
+                        self.read_cache.insert(ino, block_idx, b.clone());
+                        b
+                    }
+                    Ok(empty) => {
+                        // EOF — cache empty sentinel so any waiters know too.
+                        self.read_cache.insert(ino, block_idx, empty);
+                        break;
+                    }
+                    Err(e) => {
+                        self.read_cache.cancel_inflight(ino, block_idx);
+                        error!("read {}: {}", path, e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                // Another task is downloading this block — wait for it.
+                debug!("read waiting for inflight: ino={} block={}", ino, block_idx);
+                match self.read_cache.wait_for_block(ino, block_idx) {
+                    Some(b) if b.is_empty() => break, // EOF sentinel
+                    Some(b) => b,
+                    // Other task had a real network error.
+                    None => return Err(SynoFsError::Io("block download failed".into())),
+                }
+            };
+
+            // Slice the portion of this block that overlaps [offset, offset+size)
+            let local_start = offset.saturating_sub(block_start) as usize;
+            let local_end = (offset + size)
+                .saturating_sub(block_start)
+                .min(block_size)
+                .min(block.len() as u64) as usize;
+
+            if local_start < local_end {
+                result.extend_from_slice(&block[local_start..local_end]);
+            }
+
+            // A block shorter than the block size is the last one with data:
+            // the server had nothing beyond it to give. Stop here. Continuing
+            // would append the *next* block's bytes directly behind this one,
+            // handing the caller a buffer whose tail comes from a different file
+            // offset than it claims — silent corruption rather than a short read.
+            if (block.len() as u64) < block_size {
+                debug!(
+                    "read: short block ino={} idx={} len={} < {}; stopping",
+                    ino,
+                    block_idx,
+                    block.len(),
+                    block_size
+                );
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Resize `path` to `new_size`, zero-extending or truncating.
+    ///
+    /// FileStation has no truncate call, so this is read-modify-write. Split out
+    /// of `setattr` so the failure behaviour is testable: a download that fails
+    /// must abort the whole operation, because the alternative — treating an
+    /// unreadable file as an empty one — uploads `new_size` zero bytes over
+    /// perfectly good data.
+    fn truncate_file(
+        &self,
+        ino: u64,
+        path: &str,
+        new_size: u64,
+    ) -> Result<SynoFileInfo, SynoFsError> {
+        // Shrinking to nothing needs no prior content, and this is the common
+        // case (O_TRUNC, `> file`). Skip the round trip entirely rather than
+        // downloading a file we are about to discard.
+        let data = if new_size == 0 {
+            Vec::new()
+        } else {
+            let current = self.block(self.client.download(path, 0, 0))?;
+            let mut data = current.to_vec();
+            data.resize(new_size as usize, 0);
+            data
+        };
+
+        let (parent, filename) = match split_nas_path(path) {
+            Some(v) => v,
+            None => return Err(SynoFsError::InvalidArg),
+        };
+        self.block(self.client.upload(parent, filename, data, true))?;
+
+        self.read_cache.invalidate_ino(ino);
+        self.cache.invalidate_path(path);
+        self.block(self.client.get_info(path))
+    }
+
+    /// Move a file between directories: download, upload to the new location,
+    /// then delete the source. FileStation's Rename API cannot move across
+    /// directories, so this is the only route.
+    ///
+    /// Split out of `rename` so the download sizing is testable — it must ask
+    /// for the *whole* file rather than a length taken from cached metadata.
+    fn move_across_dirs(
+        &self,
+        old_path: &str,
+        new_parent: &str,
+        new_name: &str,
+    ) -> Result<(), SynoFsError> {
+        // `length = 0` means "the whole file". Sizing this request from the
+        // inode cache instead would silently truncate the file whenever that
+        // cached size is stale-low — and this path deletes the source
+        // afterwards, so the missing bytes are simply gone.
+        let data = self.block(self.client.download(old_path, 0, 0))?;
+
+        self.block(
+            self.client
+                .upload(new_parent, new_name, data.to_vec(), true),
+        )?;
+
+        // Only the source deletion is best-effort: the copy is already safe on
+        // the NAS, so a failure here leaves a duplicate rather than losing data.
+        if let Err(e) = self.block(self.client.delete(old_path)) {
+            warn!(
+                "rename: uploaded {}/{} but failed to delete {}: {}",
+                new_parent, new_name, old_path, e
+            );
+        }
         Ok(())
     }
 
@@ -532,70 +645,25 @@ impl Filesystem for SynologyFS {
 
         let size = size as u64;
         let block_size = self.read_cache.block_size;
-        let first_block = offset / block_size;
         let last_block = (offset + size - 1) / block_size;
 
         debug!(
             "read: ino={} path={} offset={} size={} blocks=[{}..={}]",
-            ino, path, offset, size, first_block, last_block
+            ino,
+            path,
+            offset,
+            size,
+            offset / block_size,
+            last_block
         );
 
-        let mut result: Vec<u8> = Vec::with_capacity(size as usize);
-
-        for block_idx in first_block..=last_block {
-            let block_start = block_idx * block_size;
-
-            let block = if let Some(cached) = self.read_cache.get(ino, block_idx) {
-                if cached.is_empty() {
-                    debug!("read: EOF sentinel hit ino={} block={}", ino, block_idx);
-                    break;
-                }
-                cached
-            } else if self.read_cache.claim_inflight(ino, block_idx) {
-                // We won the race — download synchronously.
-                debug!("read cache miss: ino={} block={}", ino, block_idx);
-                match self.block(self.client.download(&path, block_start, block_size)) {
-                    Ok(b) if !b.is_empty() => {
-                        self.read_cache.insert(ino, block_idx, b.clone());
-                        b
-                    }
-                    Ok(empty) => {
-                        // EOF — cache empty sentinel so any waiters know too.
-                        self.read_cache.insert(ino, block_idx, empty);
-                        break;
-                    }
-                    Err(e) => {
-                        self.read_cache.cancel_inflight(ino, block_idx);
-                        error!("read {}: {}", path, e);
-                        reply.error(errno(e.to_errno()));
-                        return;
-                    }
-                }
-            } else {
-                // Another task is downloading this block — wait for it.
-                debug!("read waiting for inflight: ino={} block={}", ino, block_idx);
-                match self.read_cache.wait_for_block(ino, block_idx) {
-                    Some(b) if b.is_empty() => break, // EOF sentinel
-                    Some(b) => b,
-                    None => {
-                        // Other task had a real network error.
-                        reply.error(Errno::EIO);
-                        return;
-                    }
-                }
-            };
-
-            // Slice the portion of this block that overlaps [offset, offset+size)
-            let local_start = offset.saturating_sub(block_start) as usize;
-            let local_end = (offset + size)
-                .saturating_sub(block_start)
-                .min(block_size)
-                .min(block.len() as u64) as usize;
-
-            if local_start < local_end {
-                result.extend_from_slice(&block[local_start..local_end]);
+        let result = match self.read_range(ino, &path, offset, size) {
+            Ok(r) => r,
+            Err(e) => {
+                reply.error(errno(e.to_errno()));
+                return;
             }
-        }
+        };
 
         // Background prefetch of the next 16 blocks to keep VLC's read-ahead buffer full.
         for prefetch_idx in (last_block + 1)..=(last_block + 16) {
@@ -711,7 +779,6 @@ impl Filesystem for SynologyFS {
                 data: SpillBuffer::new(),
                 dirty: false,
                 new_file: false,
-                upload_handle: None,
             },
         );
         // FOPEN_KEEP_CACHE: don't invalidate the kernel page cache between opens.
@@ -740,28 +807,9 @@ impl Filesystem for SynologyFS {
             data.len()
         );
 
-        // If a background upload is in flight for this fh (started by a prior flush),
-        // wait for it before modifying the buffer — we must not hold the mutex while blocking.
-        let handle = {
-            let mut buffers = self.write_buffers.lock().unwrap();
-            buffers.get_mut(&fh).and_then(|b| b.upload_handle.take())
-        };
-        if let Some(h) = handle {
-            if let Err(e) = self
-                .block(h)
-                .map_err(|_| SynoFsError::Io("upload task panicked".into()))
-                .and_then(|r| r)
-            {
-                error!("write: prior upload failed: {}", e);
-                reply.error(errno(e.to_errno()));
-                return;
-            }
-            // The file now exists on the NAS; clear new_file so the next upload uses overwrite=true.
-            if let Some(buf) = self.write_buffers.lock().unwrap().get_mut(&fh) {
-                buf.new_file = false;
-            }
-        }
-
+        // No background upload can be in flight: flush() uploads synchronously,
+        // so by the time a write is dispatched any earlier flush has completed
+        // and already cleared `new_file`.
         let mut buffers = self.write_buffers.lock().unwrap();
         let buf = match buffers.get_mut(&fh) {
             Some(b) => b,
@@ -796,9 +844,17 @@ impl Filesystem for SynologyFS {
     ) {
         let fh = fh.0;
         debug!("flush: fh={}", fh);
-        // Kick off the upload in the background; release() will wait for completion.
-        self.queue_upload(fh);
-        reply.ok();
+        // The kernel returns *this* reply from close(2), and discards whatever
+        // release() reports. So the upload has to happen here, synchronously,
+        // and its error has to come back here — otherwise a failed upload is
+        // reported to the application as a successful close.
+        match self.finish_upload(fh) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                error!("flush fh={}: {}", fh, e);
+                reply.error(errno(e.to_errno()));
+            }
+        }
     }
 
     fn release(
@@ -877,7 +933,6 @@ impl Filesystem for SynologyFS {
                 data: SpillBuffer::new(),
                 dirty: false,
                 new_file: true,
-                upload_handle: None,
             },
         );
 
@@ -1080,45 +1135,17 @@ impl Filesystem for SynologyFS {
             return;
         }
 
-        // Cross-directory file move: download, upload, delete
-        // Get the file size first
-        let file_size = self
-            .cache
-            .get_by_ino(self.cache.get_or_alloc_ino(&old_path))
-            .and_then(|e| e.info.additional.as_ref()?.size)
-            .unwrap_or(0);
-
-        let data = match self.block(self.client.download(&old_path, 0, file_size)) {
-            Ok(b) => b,
-            Err(e) => {
-                reply.error(errno(e.to_errno()));
-                return;
+        // Cross-directory file move: download, upload, delete.
+        match self.move_across_dirs(&old_path, &new_parent_path, new_name_str) {
+            Ok(()) => {
+                self.cache.invalidate_path(&old_path);
+                reply.ok();
             }
-        };
-
-        match self.block(
-            self.client
-                .upload(&new_parent_path, new_name_str, data.to_vec(), true),
-        ) {
-            Ok(()) => {}
             Err(e) => {
+                error!("rename {} -> {}: {}", old_path, new_path, e);
                 reply.error(errno(e.to_errno()));
-                return;
             }
         }
-
-        match self.block(self.client.delete(&old_path)) {
-            Ok(()) => {}
-            Err(e) => {
-                warn!(
-                    "rename: uploaded {} but failed to delete {}: {}",
-                    new_path, old_path, e
-                );
-            }
-        }
-
-        self.cache.invalidate_path(&old_path);
-        reply.ok();
     }
 
     fn setattr(
@@ -1154,35 +1181,16 @@ impl Filesystem for SynologyFS {
                 ino, path, new_size
             );
 
-            let new_size = new_size as usize;
-
-            // Download current content
-            let current = match self.block(self.client.download(&path, 0, 0)) {
-                Ok(b) => b.to_vec(),
-                Err(_) => Vec::new(),
-            };
-
-            let mut data = current;
-            data.resize(new_size, 0);
-
-            let parent = path.rfind('/').map(|i| &path[..i]).unwrap_or("/");
-            let filename = &path[path.rfind('/').unwrap_or(0) + 1..];
-
-            match self.block(self.client.upload(parent, filename, data, true)) {
-                Ok(()) => {
-                    self.read_cache.invalidate_ino(ino);
-                    self.cache.invalidate_path(&path);
-                    // Re-fetch attr
-                    match self.block(self.client.get_info(&path)) {
-                        Ok(info) => {
-                            let attr = self.syno_to_attr(ino, &info);
-                            self.cache.insert(ino, info);
-                            reply.attr(&TTL, &attr);
-                        }
-                        Err(e) => reply.error(errno(e.to_errno())),
-                    }
+            match self.truncate_file(ino, &path, new_size) {
+                Ok(info) => {
+                    let attr = self.syno_to_attr(ino, &info);
+                    self.cache.insert(ino, info);
+                    reply.attr(&TTL, &attr);
                 }
-                Err(e) => reply.error(errno(e.to_errno())),
+                Err(e) => {
+                    error!("setattr truncate {}: {}", path, e);
+                    reply.error(errno(e.to_errno()));
+                }
             }
         } else {
             // For other attribute changes (permissions, timestamps), return current attrs
@@ -1209,5 +1217,444 @@ impl Filesystem for SynologyFS {
             255,             // namelen
             4096,            // frsize
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap as Map;
+    use synology_filestation_core::types::SynoAdditional;
+    use wiremock::matchers::{method as http_method, path as http_path, query_param};
+    use wiremock::{Mock, MockServer, Request as WmRequest, Respond, ResponseTemplate};
+
+    /// Small blocks keep the fixtures readable; the assembly rules under test
+    /// don't depend on the real 256 KiB size.
+    const BLOCK: u64 = 1024;
+
+    fn client_for(server: &MockServer) -> SynologyClient {
+        let uri = server.uri();
+        let (host, port) = uri
+            .trim_start_matches("http://")
+            .rsplit_once(':')
+            .expect("mock server uri has a port");
+        SynologyClient::new(host, port.parse().unwrap(), false)
+    }
+
+    /// Field order matters: `rt` is declared last so it is dropped last, after
+    /// the mock server has had a runtime to shut itself down on.
+    struct Fixture {
+        fs: SynologyFS,
+        server: MockServer,
+        rt: tokio::runtime::Runtime,
+    }
+
+    fn fixture() -> Fixture {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let server = rt.block_on(MockServer::start());
+        let fs = SynologyFS::new(
+            Arc::new(client_for(&server)),
+            Arc::new(InodeCache::new(30)),
+            Arc::new(ReadCache::new(BLOCK, 64)),
+            rt.handle().clone(),
+            1000,
+            1000,
+        );
+        Fixture { fs, server, rt }
+    }
+
+    /// Serves file bytes the way DSM's Download API does: honours `Range`, and
+    /// answers 416 past EOF. `short` caps how many bytes a given range *start*
+    /// may return, which is how a test reproduces a truncated response — a
+    /// successful HTTP 200 carrying fewer bytes than the range asked for.
+    struct RangeFile {
+        body: Vec<u8>,
+        short: Map<u64, usize>,
+    }
+
+    impl Respond for RangeFile {
+        fn respond(&self, req: &WmRequest) -> ResponseTemplate {
+            if self.body.is_empty() {
+                return ResponseTemplate::new(200).set_body_bytes(Vec::new());
+            }
+            let (start, end) = match req.headers.get("range").and_then(|v| v.to_str().ok()) {
+                Some(r) => {
+                    let (s, e) = r
+                        .trim_start_matches("bytes=")
+                        .split_once('-')
+                        .expect("range header is bytes=S-E");
+                    (
+                        s.parse::<u64>().unwrap(),
+                        e.parse::<u64>().unwrap_or(u64::MAX),
+                    )
+                }
+                None => (0, self.body.len() as u64 - 1),
+            };
+            if start as usize >= self.body.len() {
+                return ResponseTemplate::new(416);
+            }
+            let end = (end as usize).min(self.body.len() - 1);
+            let mut slice = self.body[start as usize..=end].to_vec();
+            if let Some(&cap) = self.short.get(&start) {
+                slice.truncate(cap);
+            }
+            ResponseTemplate::new(206).set_body_bytes(slice)
+        }
+    }
+
+    fn mount_download(f: &Fixture, body: Vec<u8>, short: Map<u64, usize>) {
+        f.rt.block_on(
+            Mock::given(http_method("GET"))
+                .and(http_path("/webapi/entry.cgi"))
+                .and(query_param("method", "download"))
+                .respond_with(RangeFile { body, short })
+                .mount(&f.server),
+        );
+    }
+
+    fn mount_upload_ok(f: &Fixture) {
+        f.rt.block_on(
+            Mock::given(http_method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"success": true, "data": {"blks": null}}),
+                    ),
+                )
+                .mount(&f.server),
+        );
+    }
+
+    fn mount_delete_ok(f: &Fixture) {
+        f.rt.block_on(
+            Mock::given(http_method("GET"))
+                .and(query_param("method", "delete"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+                )
+                .mount(&f.server),
+        );
+    }
+
+    /// `clear_for_overwrite` polls getinfo until the file is gone; answering
+    /// "no such file" lets the upload proceed on the first poll.
+    fn mount_getinfo_gone(f: &Fixture) {
+        f.rt.block_on(
+            Mock::given(http_method("GET"))
+                .and(query_param("method", "getinfo"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"success": false, "error": {"code": 414}}),
+                    ),
+                )
+                .mount(&f.server),
+        );
+    }
+
+    fn ramp(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn posted_bodies(f: &Fixture) -> Vec<Vec<u8>> {
+        f.rt.block_on(f.server.received_requests())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| r.body)
+            .collect()
+    }
+
+    fn seed_dirty_buffer(f: &Fixture, nas_path: &str, data: &[u8]) -> u64 {
+        let ino = f.fs.cache.get_or_alloc_ino(nas_path);
+        let mut buf = SpillBuffer::new();
+        buf.write_at(0, data).unwrap();
+        let fh = 1u64;
+        f.fs.write_buffers.lock().unwrap().insert(
+            fh,
+            WriteBuffer {
+                nas_path: nas_path.to_string(),
+                ino,
+                data: buf,
+                dirty: true,
+                new_file: true,
+            },
+        );
+        fh
+    }
+
+    // ── T1.4: block assembly ──────────────────────────────────────────────────
+
+    /// Regression: the assembly loop only stopped on a *fully empty* block, so a
+    /// block that came back short was appended and then the next block's bytes
+    /// were appended directly behind it. The caller received a contiguous-looking
+    /// buffer whose tail actually came from a different file offset — silent
+    /// corruption. A short block must end the read.
+    #[test]
+    fn a_short_block_ends_the_read_instead_of_fabricating_contiguity() {
+        let f = fixture();
+        let body = ramp(4096);
+        // Block 0 is truncated to 300 bytes. This is *not* EOF: the file really
+        // is 4096 bytes, and block 1 would happily serve its full 1024.
+        mount_download(&f, body.clone(), Map::from([(0u64, 300usize)]));
+
+        let out = f.fs.read_range(7, "/share/f.bin", 0, 2 * BLOCK).unwrap();
+
+        assert_eq!(
+            out.as_slice(),
+            &body[..300],
+            "a short block must end the read, not be back-filled with block 1's bytes"
+        );
+    }
+
+    /// The stop-on-short rule must not break the ordinary case it resembles:
+    /// a final partial block at genuine EOF still contributes its bytes.
+    #[test]
+    fn a_genuinely_short_final_block_still_returns_the_whole_tail() {
+        let f = fixture();
+        let body = ramp(1500); // one full block + a 476-byte tail
+        mount_download(&f, body.clone(), Map::new());
+
+        let out = f.fs.read_range(8, "/share/f.bin", 0, 4 * BLOCK).unwrap();
+
+        assert_eq!(out, body, "the short tail block is EOF, not corruption");
+    }
+
+    /// Reads that start part-way into a block must still line up.
+    #[test]
+    fn a_mid_block_offset_read_returns_the_right_slice() {
+        let f = fixture();
+        let body = ramp(4096);
+        mount_download(&f, body.clone(), Map::new());
+
+        let out = f.fs.read_range(11, "/share/f.bin", 1500, 1000).unwrap();
+
+        assert_eq!(out.as_slice(), &body[1500..2500]);
+    }
+
+    // ── T1.2: truncate ────────────────────────────────────────────────────────
+
+    /// Regression: a failed download was mapped to `Vec::new()`, so truncate
+    /// then uploaded `new_size` zero bytes over a perfectly good file. One read
+    /// timeout during `truncate -s N` destroyed the contents. It must abort.
+    #[test]
+    fn truncate_aborts_rather_than_zeroing_the_file_when_the_download_fails() {
+        let f = fixture();
+        f.rt.block_on(
+            Mock::given(http_method("GET"))
+                .and(query_param("method", "download"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&f.server),
+        );
+        // If truncate ever reaches the upload after a failed read, this catches it.
+        f.rt.block_on(
+            Mock::given(http_method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"success": true, "data": {"blks": null}}),
+                    ),
+                )
+                .expect(0)
+                .mount(&f.server),
+        );
+
+        let err =
+            f.fs.truncate_file(9, "/share/big.bin", 100)
+                .expect_err("an unreadable file must not be silently replaced with zeros");
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+        // The `expect(0)` on the upload mock is asserted when the server drops.
+    }
+
+    /// Truncating to zero needs no prior content, and it is the common case
+    /// (`O_TRUNC`, `> file`). Downloading a file we are about to discard is pure
+    /// waste — and on a large file it is the whole file, in memory.
+    #[test]
+    fn truncate_to_zero_does_not_download_the_file_first() {
+        let f = fixture();
+        f.rt.block_on(
+            Mock::given(http_method("GET"))
+                .and(query_param("method", "download"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&f.server),
+        );
+        mount_delete_ok(&f);
+        mount_getinfo_gone(&f);
+        mount_upload_ok(&f);
+
+        // The trailing get_info re-read fails against these mocks (getinfo is
+        // wired to "gone" for the overwrite poll), which is irrelevant here: the
+        // assertion is the `expect(0)` on the download mock.
+        let _ = f.fs.truncate_file(10, "/share/f.bin", 0);
+    }
+
+    /// Truncation still has to do its actual job.
+    #[test]
+    fn truncate_uploads_the_resized_content() {
+        let f = fixture();
+        let body = ramp(4096);
+        mount_download(&f, body.clone(), Map::new());
+        mount_delete_ok(&f);
+        mount_getinfo_gone(&f);
+        mount_upload_ok(&f);
+
+        let _ = f.fs.truncate_file(12, "/share/f.bin", 100);
+
+        let posted = posted_bodies(&f);
+        assert_eq!(posted.len(), 1, "exactly one upload");
+        assert!(
+            posted[0].windows(100).any(|w| w == &body[..100]),
+            "the upload must carry the first 100 bytes of the original file"
+        );
+    }
+
+    // ── T1.3: cross-directory move ────────────────────────────────────────────
+
+    /// Regression: the move sized its download from the inode cache, then
+    /// deleted the source. A stale-low cached size therefore truncated the file
+    /// permanently. The download must ask for the whole file.
+    #[test]
+    fn cross_directory_move_copies_the_whole_file_not_the_cached_size() {
+        let f = fixture();
+        let body = ramp(4096);
+        mount_download(&f, body.clone(), Map::new());
+        mount_delete_ok(&f);
+        mount_getinfo_gone(&f);
+        mount_upload_ok(&f);
+
+        // Stale metadata claiming the file is 10 bytes long.
+        let ino = f.fs.cache.get_or_alloc_ino("/a/f.bin");
+        f.fs.cache.insert(
+            ino,
+            SynoFileInfo {
+                name: "f.bin".into(),
+                path: "/a/f.bin".into(),
+                isdir: false,
+                additional: Some(SynoAdditional {
+                    size: Some(10),
+                    owner: None,
+                    time: None,
+                    perm: None,
+                }),
+                code: None,
+            },
+        );
+
+        f.fs.move_across_dirs("/a/f.bin", "/b", "f.bin").unwrap();
+
+        let posted = posted_bodies(&f);
+        assert_eq!(posted.len(), 1, "exactly one upload");
+        assert!(
+            posted[0].windows(body.len()).any(|w| w == body.as_slice()),
+            "the moved file must carry all {} bytes, not the {} the cache claimed",
+            body.len(),
+            10
+        );
+    }
+
+    // ── T1.1: flush ───────────────────────────────────────────────────────────
+
+    /// Regression: `flush` spawned the upload and replied OK immediately, and
+    /// the kernel discards whatever `release` later reports — so a failed upload
+    /// reached the application as a successful `close(2)`. The call `flush`
+    /// delegates to must surface the failure.
+    #[test]
+    fn flush_reports_an_upload_failure_instead_of_swallowing_it() {
+        let f = fixture();
+        f.rt.block_on(
+            Mock::given(http_method("POST"))
+                .respond_with(ResponseTemplate::new(400))
+                .mount(&f.server),
+        );
+
+        let fh = seed_dirty_buffer(&f, "/share/new.txt", b"payload");
+        let err =
+            f.fs.finish_upload(fh)
+                .expect_err("a failed upload must not look like a successful close");
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+    }
+
+    /// `flush` must not return until the bytes are actually on the NAS — a
+    /// merely-queued upload is one whose failure nobody can report.
+    #[test]
+    fn flush_completes_the_upload_before_returning() {
+        let f = fixture();
+        mount_upload_ok(&f);
+
+        let fh = seed_dirty_buffer(&f, "/share/new.txt", b"payload");
+        f.fs.finish_upload(fh).unwrap();
+
+        assert_eq!(
+            posted_bodies(&f).len(),
+            1,
+            "the upload must have completed by the time flush returns, not merely been queued"
+        );
+    }
+
+    /// A failed flush must leave the data buffered so `release` can retry it.
+    /// Previously `dirty` was cleared *before* the upload was even started, so a
+    /// failure silently discarded the write.
+    #[test]
+    fn a_failed_flush_keeps_the_data_pending_for_a_retry() {
+        let f = fixture();
+        f.rt.block_on(
+            Mock::given(http_method("POST"))
+                .respond_with(ResponseTemplate::new(400))
+                .mount(&f.server),
+        );
+
+        let fh = seed_dirty_buffer(&f, "/share/new.txt", b"payload");
+        assert!(f.fs.finish_upload(fh).is_err());
+
+        assert!(
+            f.fs.write_buffers.lock().unwrap().get(&fh).unwrap().dirty,
+            "a failed upload must leave the buffer dirty so release() retries it"
+        );
+    }
+
+    /// A successful flush clears `new_file`, so a second flush of the same
+    /// handle overwrites rather than racing an `overwrite=false` create against
+    /// the file it just created.
+    #[test]
+    fn a_successful_flush_marks_the_file_as_existing() {
+        let f = fixture();
+        mount_upload_ok(&f);
+
+        let fh = seed_dirty_buffer(&f, "/share/new.txt", b"payload");
+        f.fs.finish_upload(fh).unwrap();
+
+        let buffers = f.fs.write_buffers.lock().unwrap();
+        let buf = buffers.get(&fh).unwrap();
+        assert!(!buf.dirty, "a successful upload clears dirty");
+        assert!(!buf.new_file, "the file now exists on the NAS");
+    }
+
+    #[test]
+    fn flush_of_a_clean_buffer_is_a_no_op() {
+        let f = fixture();
+        f.rt.block_on(
+            Mock::given(http_method("POST"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&f.server),
+        );
+
+        let fh = seed_dirty_buffer(&f, "/share/new.txt", b"payload");
+        f.fs.write_buffers
+            .lock()
+            .unwrap()
+            .get_mut(&fh)
+            .unwrap()
+            .dirty = false;
+
+        f.fs.finish_upload(fh).unwrap();
+    }
+
+    #[test]
+    fn split_nas_path_splits_on_the_last_separator() {
+        assert_eq!(
+            split_nas_path("/share/dir/f.txt"),
+            Some(("/share/dir", "f.txt"))
+        );
+        assert_eq!(split_nas_path("/f.txt"), Some(("", "f.txt")));
+        assert_eq!(split_nas_path("f.txt"), None);
     }
 }
