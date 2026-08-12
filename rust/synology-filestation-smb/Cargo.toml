@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 # Pure-Rust SMB2/3 client (no C deps): SMB3 + signing + AES encryption + NTLMv2,
 # validated against the AD-joined, SMB3-only e4e-nas.
-smb2 = "0.13"
+smb2 = "0.16"
 bytes = "1"
 tokio = { version = "1", features = ["rt", "sync", "macros", "time", "io-util", "fs"] }
 tracing = "0.1"
