@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.3.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.2.1...synology-filestation-core-v0.3.0) (2026-08-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* TLS certificate verification is now on by default. A stock DSM appliance presents a self-signed certificate and will be rejected until it is trusted or verification is explicitly turned off.
+
+### Features
+
+* **core:** stream large uploads in slices instead of buffering whole files ([0220d73](https://github.com/UCSD-E4E/synology-filestation/commit/0220d735ee1a6d95076e25aaa36a626c4ea0550b))
+* **core:** stream large uploads in slices instead of buffering whole files ([e8cce35](https://github.com/UCSD-E4E/synology-filestation/commit/e8cce358a289aab34efe5d71938b6927ae7253ef))
+* verify TLS certificates by default, and keep credentials out of the URL ([6594fda](https://github.com/UCSD-E4E/synology-filestation/commit/6594fdab53978d6f2e3de454d05aa338a848b917))
+
+
+### Bug Fixes
+
+* address review feedback on the slice-upload path ([f525881](https://github.com/UCSD-E4E/synology-filestation/commit/f525881b49e146f5413c655c50f68d39e2ba6e78))
+* **core:** carry the session id in a cookie instead of the request URL ([740e8ff](https://github.com/UCSD-E4E/synology-filestation/commit/740e8ff59c4490627912944cebb3e6f868571ee0))
+* **core:** fetch whole listings and re-clear before each upload retry ([8d6f3e7](https://github.com/UCSD-E4E/synology-filestation/commit/8d6f3e7ecc4940de16ab91d38c9813e75f7d134c))
+* **core:** preserve the underlying cause of a transport error ([0290c91](https://github.com/UCSD-E4E/synology-filestation/commit/0290c91ca18679dcd42f9f9580d26b1ea75011f4))
+* **core:** scrub secrets from error messages and logs ([f25012c](https://github.com/UCSD-E4E/synology-filestation/commit/f25012cfa02b09c19e08023635f3cfc5b962cc05))
+* seven data-loss and corruption defects found in review (tier 1) ([6b044aa](https://github.com/UCSD-E4E/synology-filestation/commit/6b044aad69c4ed0f4ab84807ec6a1cc5ab8cc7ae))
+* stop leaking the session id and passwords into logs ([1ad289a](https://github.com/UCSD-E4E/synology-filestation/commit/1ad289a27a7df52121e59b57c72d67c47dd66a3c))
+
 ## [0.2.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.2.0...synology-filestation-core-v0.2.1) (2026-07-30)
 
 
