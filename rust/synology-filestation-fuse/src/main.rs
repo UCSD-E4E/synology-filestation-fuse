@@ -75,9 +75,37 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     fuse_threads: usize,
 
+    /// Owner reported for every mounted entry; defaults to the mounting user.
+    /// DSM's own uids name accounts on the appliance and are never used
+    /// (Linux/FUSE only)
+    #[arg(long)]
+    uid: Option<u32>,
+
+    /// Group reported for every mounted entry; defaults to the mounting user's
+    /// group (Linux/FUSE only)
+    #[arg(long)]
+    gid: Option<u32>,
+
+    /// Umask for the synthetic permissions the mount reports. The default 0o022
+    /// gives 0755 directories and 0644 files (Linux/FUSE only)
+    #[arg(long, value_parser = parse_umask, default_value = "022")]
+    umask: u16,
+
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
     log_level: String,
+}
+
+/// Parse a umask the way `umask(1)` and every mount helper do: octal, with no
+/// `0o` prefix required. Base 10 would silently turn the near-universal `022`
+/// into 0o026.
+fn parse_umask(raw: &str) -> Result<u16, String> {
+    let value = u16::from_str_radix(raw.trim_start_matches("0o"), 8)
+        .map_err(|_| format!("`{raw}` is not an octal umask"))?;
+    if value > 0o777 {
+        return Err(format!("umask `{raw}` is out of range (max 777)"));
+    }
+    Ok(value)
 }
 
 fn prompt(label: &str) -> anyhow::Result<String> {
@@ -190,6 +218,9 @@ fn main() -> anyhow::Result<()> {
         cache_ttl: args.cache_ttl,
         read_cache_mb: args.read_cache_mb,
         io_threads: args.fuse_threads,
+        uid: args.uid,
+        gid: args.gid,
+        umask: args.umask,
     };
     let handle = spawn_mount(client.clone(), rt.handle().clone(), args.mountpoint, opts)?;
 
@@ -203,4 +234,26 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(client.logout())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_umask;
+
+    /// `--umask 022` must mean 0o022. Parsed as decimal it would be 0o026,
+    /// quietly stripping group/other permissions the user never asked to drop.
+    #[test]
+    fn umask_is_parsed_as_octal() {
+        assert_eq!(parse_umask("022"), Ok(0o022));
+        assert_eq!(parse_umask("077"), Ok(0o077));
+        assert_eq!(parse_umask("0o027"), Ok(0o027));
+        assert_eq!(parse_umask("0"), Ok(0));
+    }
+
+    #[test]
+    fn a_umask_outside_the_permission_bits_is_rejected() {
+        assert!(parse_umask("1777").is_err());
+        assert!(parse_umask("088").is_err(), "8 is not an octal digit");
+        assert!(parse_umask("rwx").is_err());
+    }
 }

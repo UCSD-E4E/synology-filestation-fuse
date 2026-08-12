@@ -348,6 +348,9 @@ synology-filestation-fuse --host <NAS_HOST> -u <USERNAME> [OPTIONS] <MOUNTPOINT>
 | `--insecure` | Accept any TLS certificate (self-signed, expired, wrong hostname). Needed for a stock DSM certificate; the connection is then encrypted but **not** authenticated. Env: `SYNO_INSECURE` | `false` |
 | `--cache-ttl <SECS>` | Metadata cache TTL in seconds *(Linux only)* | `30` |
 | `--read-cache-mb <MiB>` | Read cache size in MiB *(Linux only)* | `256` |
+| `--uid <UID>` | Owner reported for every mounted entry. DSM's own uids name accounts on the appliance, not on this machine, so they are never used *(Linux only)* | *(mounting user)* |
+| `--gid <GID>` | Group reported for every mounted entry *(Linux only)* | *(mounting user's group)* |
+| `--umask <MASK>` | Octal umask for the permissions the mount reports; `022` gives `0755` directories and `0644` files *(Linux only)* | `022` |
 | `--log-level <LEVEL>` | Log level (`error`, `warn`, `info`, `debug`, `trace`) | `info` |
 
 ### Examples

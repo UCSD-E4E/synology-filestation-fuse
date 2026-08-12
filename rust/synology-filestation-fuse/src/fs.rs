@@ -49,25 +49,54 @@ struct WriteBuffer {
     new_file: bool,
 }
 
-/// Translate FileStation metadata into a `FileAttr`, falling back to
-/// `fallback_uid`/`fallback_gid` when the NAS reports no owner.
+/// How the mount presents ownership and permissions to the kernel.
+///
+/// DSM's identifiers describe the *appliance*, not this machine, so they are
+/// deliberately dropped rather than mapped: shares arrive owned by root as
+/// `dr----x--t` (mode 0o1411, sticky) and their contents owned by
+/// directory-service ids like 1161823311 with mode 000. Exporting that verbatim
+/// made glib apply the sticky-directory rule — a file is deletable only by its
+/// own owner or its parent directory's owner — and report
+/// `access::can-delete: FALSE` for everything inside a share, so GNOME Files
+/// hid Delete, Move to Trash and Rename. (The kernel never enforced those bits:
+/// the mount carries no `default_permissions`. The damage was entirely in what
+/// userspace concluded from the metadata.)
+///
+/// So every entry is presented as owned by the mounting user with a synthetic
+/// mode, the way sshfs and rclone do it. What the account may actually do is
+/// still decided by DSM on each call, and surfaces as an error from that call.
+#[derive(Debug, Clone, Copy)]
+pub struct Ownership {
+    /// Owner reported for every entry — the mounting user unless overridden.
+    pub uid: u32,
+    /// Group reported for every entry.
+    pub gid: u32,
+    /// Masked out of the synthetic mode, as a process umask would be.
+    pub umask: u16,
+}
+
+impl Ownership {
+    /// The synthetic mode for an entry: `0o777`/`0o666` less the umask.
+    pub fn perm(&self, isdir: bool) -> u16 {
+        let base = if isdir { 0o777 } else { 0o666 };
+        base & !self.umask
+    }
+}
+
+/// Translate FileStation metadata into a `FileAttr`, presenting it under
+/// `owner` rather than under whatever identifiers DSM reported.
 ///
 /// A free function rather than a method: a spawned transfer replies to the
 /// kernel from the runtime, where there is no `&self` left to borrow — only
-/// the two ids it copied out of the filesystem.
-fn file_attr(fallback_uid: u32, fallback_gid: u32, ino: u64, info: &SynoFileInfo) -> FileAttr {
+/// the `Ownership` it copied out of the filesystem.
+fn file_attr(owner: Ownership, ino: u64, info: &SynoFileInfo) -> FileAttr {
     let kind = if info.isdir {
         FileType::Directory
     } else {
         FileType::RegularFile
     };
     let size = info.additional.as_ref().and_then(|a| a.size).unwrap_or(0);
-    let perm = info
-        .additional
-        .as_ref()
-        .and_then(|a| a.perm.as_ref())
-        .map(|p| p.posix as u16)
-        .unwrap_or(if info.isdir { 0o755 } else { 0o644 });
+    let perm = owner.perm(info.isdir);
 
     let ts_to_system = |ts: i64| {
         if ts >= 0 {
@@ -94,19 +123,6 @@ fn file_attr(fallback_uid: u32, fallback_gid: u32, ino: u64, info: &SynoFileInfo
             (now, now, now, now)
         });
 
-    let uid = info
-        .additional
-        .as_ref()
-        .and_then(|a| a.owner.as_ref())
-        .map(|o| o.uid)
-        .unwrap_or(fallback_uid);
-    let gid = info
-        .additional
-        .as_ref()
-        .and_then(|a| a.owner.as_ref())
-        .map(|o| o.gid)
-        .unwrap_or(fallback_gid);
-
     FileAttr {
         ino: INodeNo(ino),
         size,
@@ -118,8 +134,8 @@ fn file_attr(fallback_uid: u32, fallback_gid: u32, ino: u64, info: &SynoFileInfo
         kind,
         perm,
         nlink: if info.isdir { 2 } else { 1 },
-        uid,
-        gid,
+        uid: owner.uid,
+        gid: owner.gid,
         rdev: 0,
         blksize: 4096,
         flags: 0,
@@ -315,8 +331,7 @@ pub struct SynologyFS {
     /// longer implicitly serialised by the event loop.
     transfer_limit: Arc<tokio::sync::Semaphore>,
     next_fh: AtomicU64,
-    uid: u32,
-    gid: u32,
+    owner: Ownership,
 }
 
 impl SynologyFS {
@@ -325,8 +340,7 @@ impl SynologyFS {
         cache: Arc<InodeCache>,
         read_cache: Arc<ReadCache>,
         rt: tokio::runtime::Handle,
-        uid: u32,
-        gid: u32,
+        owner: Ownership,
     ) -> Self {
         Self {
             client,
@@ -336,8 +350,7 @@ impl SynologyFS {
             write_buffers: Arc::new(Mutex::new(HashMap::new())),
             transfer_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
             next_fh: AtomicU64::new(1),
-            uid,
-            gid,
+            owner,
         }
     }
 
@@ -360,7 +373,7 @@ impl SynologyFS {
     }
 
     fn syno_to_attr(&self, ino: u64, info: &SynoFileInfo) -> FileAttr {
-        file_attr(self.uid, self.gid, ino, info)
+        file_attr(self.owner, ino, info)
     }
 
     fn get_path_for_ino(&self, ino: u64) -> Option<String> {
@@ -572,10 +585,10 @@ impl SynologyFS {
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
             kind: FileType::Directory,
-            perm: 0o755,
+            perm: self.owner.perm(true),
             nlink: 2,
-            uid: self.uid,
-            gid: self.gid,
+            uid: self.owner.uid,
+            gid: self.owner.gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -1371,11 +1384,11 @@ impl Filesystem for SynologyFS {
             // Read-modify-write over the whole file, so it too runs on the
             // runtime and replies from there.
             let cache = self.cache.clone();
-            let (uid, gid) = (self.uid, self.gid);
+            let owner = self.owner;
             let failed_path = path.clone();
             self.start_truncate(ino, path, new_size, move |r| match r {
                 Ok(info) => {
-                    let attr = file_attr(uid, gid, ino, &info);
+                    let attr = file_attr(owner, ino, &info);
                     cache.insert(ino, info);
                     reply.attr(&TTL, &attr);
                 }
@@ -1416,7 +1429,7 @@ impl Filesystem for SynologyFS {
 mod tests {
     use super::*;
     use std::collections::HashMap as Map;
-    use synology_filestation_core::types::SynoAdditional;
+    use synology_filestation_core::types::{SynoAdditional, SynoOwner, SynoPerm};
     use wiremock::matchers::{method as http_method, path as http_path, query_param};
     use wiremock::{Mock, MockServer, Request as WmRequest, Respond, ResponseTemplate};
 
@@ -1449,8 +1462,11 @@ mod tests {
             Arc::new(InodeCache::new(30)),
             Arc::new(ReadCache::new(BLOCK, 64)),
             rt.handle().clone(),
-            1000,
-            1000,
+            Ownership {
+                uid: 1000,
+                gid: 1000,
+                umask: 0o022,
+            },
         );
         Fixture { fs, server, rt }
     }
@@ -2123,5 +2139,115 @@ mod tests {
         );
         assert_eq!(split_nas_path("/f.txt"), Some(("", "f.txt")));
         assert_eq!(split_nas_path("f.txt"), None);
+    }
+
+    // ── T1.4: ownership and mode presented to the kernel ──────────────────────
+
+    /// The identity a mount presents by default: the local user, umask 0o022.
+    fn mounting_user() -> Ownership {
+        Ownership {
+            uid: 1000,
+            gid: 100,
+            umask: 0o022,
+        }
+    }
+
+    /// A `SynoFileInfo` carrying whatever DSM said about owner and POSIX mode.
+    fn info_with(isdir: bool, owner: Option<(u32, u32)>, posix: Option<u32>) -> SynoFileInfo {
+        SynoFileInfo {
+            name: "entry".into(),
+            path: "/share/entry".into(),
+            isdir,
+            additional: Some(SynoAdditional {
+                size: Some(0),
+                owner: owner.map(|(uid, gid)| SynoOwner {
+                    uid,
+                    gid,
+                    user: "dsm-user".into(),
+                    group: "dsm-group".into(),
+                }),
+                time: None,
+                perm: posix.map(|posix| SynoPerm { posix }),
+            }),
+            code: None,
+        }
+    }
+
+    /// Regression: DSM's uid/gid space has nothing to do with the local one —
+    /// shares come back owned by root and their contents by directory-service
+    /// ids like 1161823311. Exporting those verbatim left every entry owned by
+    /// a stranger, which is half of what made GIO report
+    /// `access::can-delete: FALSE` for anything inside a share.
+    #[test]
+    fn nas_owner_is_never_exported_to_the_kernel() {
+        let attr = file_attr(
+            mounting_user(),
+            42,
+            &info_with(false, Some((1161823311, 1161822721)), None),
+        );
+
+        assert_eq!(attr.uid, 1000, "entries must be owned by the mounting user");
+        assert_eq!(
+            attr.gid, 100,
+            "entries must carry the mounting user's group"
+        );
+    }
+
+    /// Regression: every DSM share is reported as `dr----x--t` — mode 0o1411,
+    /// sticky bit set, owned by root. Passing that through made glib apply the
+    /// sticky-directory rule (deletable only by the owner of the file or of its
+    /// parent), so GNOME Files hid Delete, Move to Trash and Rename on
+    /// everything inside a share. The sticky bit must never reach the kernel.
+    #[test]
+    fn nas_posix_mode_is_never_exported_to_the_kernel() {
+        let share = file_attr(
+            mounting_user(),
+            42,
+            &info_with(true, Some((0, 0)), Some(0o1411)),
+        );
+
+        assert_eq!(
+            share.perm & 0o1000,
+            0,
+            "the sticky bit must not survive into the mount"
+        );
+        assert_eq!(share.perm, 0o755, "directories get a synthetic 0o755");
+
+        // A share's contents come back as mode 000 owned by a directory-service
+        // id; that must not make them unusable locally either.
+        let child = file_attr(
+            mounting_user(),
+            43,
+            &info_with(false, Some((1161823311, 1161822721)), Some(0o000)),
+        );
+        assert_eq!(child.perm, 0o644, "files get a synthetic 0o644");
+    }
+
+    /// The synthetic mode is `0o777`/`0o666` less the umask, so a private mount
+    /// is still expressible.
+    #[test]
+    fn umask_narrows_the_synthetic_mode() {
+        let default = mounting_user();
+        assert_eq!(default.perm(true), 0o755, "0o022 is the usual umask");
+        assert_eq!(default.perm(false), 0o644);
+
+        let private = Ownership {
+            umask: 0o077,
+            ..default
+        };
+        assert_eq!(private.perm(true), 0o700);
+        assert_eq!(private.perm(false), 0o600);
+    }
+
+    /// The virtual root is the one entry with no NAS metadata behind it; it
+    /// must still follow the same ownership rules as everything else.
+    #[test]
+    fn virtual_root_is_owned_by_the_mounting_user() {
+        let f = fixture();
+        let attr = f.fs.virtual_root_attr();
+
+        assert_eq!(attr.uid, 1000);
+        assert_eq!(attr.gid, 1000);
+        assert_eq!(attr.perm, 0o755);
     }
 }
