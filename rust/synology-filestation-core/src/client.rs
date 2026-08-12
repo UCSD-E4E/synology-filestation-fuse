@@ -258,7 +258,9 @@ impl Default for UploadDeadline {
 
 impl UploadDeadline {
     fn for_bytes(&self, bytes: u64) -> Duration {
-        self.grace + Duration::from_secs(bytes / self.floor_bps.max(1))
+        // Rounded up: truncating division would hand out slightly *less* than
+        // the floor rate promises, which is the wrong direction for a timeout.
+        self.grace + Duration::from_secs(bytes.div_ceil(self.floor_bps.max(1)))
     }
 }
 
@@ -313,7 +315,11 @@ async fn md5_of_file(path: &Path) -> Result<String, SynoFsError> {
             }
             hasher.update(&buf[..n]);
         }
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
     })
     .await
     .map_err(|e| SynoFsError::Io(format!("md5: hashing task failed: {e}")))?
@@ -1644,11 +1650,16 @@ impl SynologyClient {
     ///   would rather spend elsewhere). It is the only check that catches a
     ///   doubled slice if DSM trims the partial back to `X-FILE-SIZE`.
     ///
-    /// A check that cannot *run* — no size in the listing, `SYNO.FileStation.MD5`
-    /// missing or refused — is logged and the upload accepted: the write itself
-    /// succeeded and there is no evidence against it. Only positive evidence of
-    /// a mismatch fails the upload, and then the file is removed rather than
-    /// left for someone to find later.
+    /// What happens when a check cannot run depends on who could not answer.
+    /// A missing size, or DSM replying that it cannot hash (`SYNO.FileStation.MD5`
+    /// absent or refused), is a verdict we can do nothing about: logged, and the
+    /// upload accepted, since the write succeeded and nothing contradicts it.
+    /// Failing to *reach* the hash after a risky resend is not — that returns an
+    /// error rather than claiming a verified write, while leaving the file in
+    /// place for the caller's retry to overwrite.
+    ///
+    /// Only positive evidence of a mismatch deletes: a file we know is wrong is
+    /// worse than no file, but a file we merely cannot vouch for is not.
     async fn verify_upload(
         &self,
         full_path: &str,
@@ -1681,9 +1692,23 @@ impl SynologyClient {
 
         let remote = match self.md5(full_path).await {
             Ok(m) => m,
-            Err(e) => {
-                warn!("upload verify: MD5 of {full_path} unavailable ({e}), accepting as-is");
+            // DSM answering (no such API, no permission) is a verdict: it
+            // cannot hash for us, and no amount of retrying changes that. The
+            // write succeeded and nothing contradicts it, so accept it.
+            Err(e @ SynoFsError::ApiError(_)) => {
+                warn!("upload verify: {full_path} cannot be hashed by the NAS ({e}), accepting");
                 return Ok(());
+            }
+            // Not reaching the check at all is different. A resend may have
+            // doubled a slice and we have no way to tell, so this is not a
+            // verified write — but there is no evidence against the file
+            // either, so it stays: the caller's retry re-uploads over it, and
+            // deleting a probably-good upload is the worse mistake.
+            Err(e) => {
+                let msg =
+                    format!("upload of {full_path} could not be verified after a resend: {e}");
+                error!("{msg}");
+                return Err(SynoFsError::Io(msg));
             }
         };
         let local_md5 = md5_of_file(local).await?;
@@ -5060,10 +5085,11 @@ mod tests {
 
     #[tokio::test]
     async fn slice_upload_accepts_a_result_it_cannot_verify() {
-        // MD5 is a DSM feature that can be missing or refused. The upload
-        // itself succeeded and there is no evidence of harm, so an unverifiable
-        // result is accepted with a warning rather than turned into a failure —
-        // the documented residual risk of resending a slice.
+        // DSM answering "no such API" is a verdict, not a hiccup: the appliance
+        // simply cannot hash for us. The upload itself succeeded and there is no
+        // evidence of harm, so that answer is accepted with a warning rather
+        // than turned into a failure — the documented residual risk of
+        // resending a slice. Contrast the unreachable case below.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/webapi/entry.cgi"))
@@ -5087,7 +5113,7 @@ mod tests {
             .and(path("/webapi/entry.cgi"))
             .and(query_param("api", "SYNO.FileStation.MD5"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": false, "error": {"code": 119}
+                "success": false, "error": {"code": 102}
             })))
             .mount(&server)
             .await;
@@ -5237,6 +5263,61 @@ mod tests {
             .iter()
             .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
         assert!(!deleted, "a good upload is never deleted");
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_will_not_vouch_when_the_hash_check_cannot_run() {
+        // A hash check we could not *reach* is different from one DSM refused:
+        // it leaves us with a resend that may have doubled a slice and no way
+        // to tell. Report the failure rather than claim a verified write — but
+        // do not delete, because there is no evidence the file is bad and
+        // destroying a probably-good upload is the worse mistake. The caller's
+        // retry re-uploads over it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 2500).await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("api", "SYNO.FileStation.MD5"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("unreachable.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        let err = client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+
+        let deleted = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
+        assert!(
+            !deleted,
+            "an unverified file is kept; only a proven bad one goes"
+        );
         std::fs::remove_file(&local).ok();
     }
 }
