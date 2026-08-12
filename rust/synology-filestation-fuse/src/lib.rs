@@ -615,7 +615,8 @@ mod tests {
         let cfg = session_config(false, &MountOptions::default());
         assert!(
             cfg.n_threads.unwrap_or(1) > 1,
-            "a single event-loop thread lets one slow upload wedge the mount, got {:?}",
+            "a single event-loop thread lets any one slow callback wedge the \
+             mount, got {:?}",
             cfg.n_threads
         );
     }
