@@ -23,6 +23,7 @@ use synology_filestation_core::error::SynoFsError;
 mod cache;
 #[cfg(target_os = "linux")]
 mod fs;
+mod spill;
 
 #[cfg(target_os = "macos")]
 mod webdav;

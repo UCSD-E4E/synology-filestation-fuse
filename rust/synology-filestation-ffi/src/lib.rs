@@ -606,8 +606,8 @@ pub unsafe extern "C" fn syno_download_to(
     })
 }
 
-/// Upload `local` into the remote directory `remote_dir`. Progress is coarse
-/// (0 → total) because the core upload is single-shot.
+/// Upload `local` into the remote directory `remote_dir`. Progress is reported
+/// per slice for files large enough to be sliced, else 0 → total.
 ///
 /// # Safety
 /// `client` must be live; `local`/`remote_dir` must be non-null.
@@ -635,15 +635,8 @@ pub unsafe extern "C" fn syno_upload(
             None => return set_err(err, SynoStatus::NullArg, 0, "client must not be null"),
         };
 
-        // The core Upload API is single-shot (takes a full `Vec<u8>`), so the
-        // whole file is buffered in memory — the same documented "write
-        // buffering" limitation the CLI and PyO3 binding share. There is no
-        // streaming path to prefer here; a streaming upload would have to land
-        // in the core crate first.
-        let data = match std::fs::read(&local) {
-            Ok(d) => d,
-            Err(e) => return set_err(err, SynoStatus::Io, 0, &format!("read {local}: {e}")),
-        };
+        // Streams from disk: large files go out in slices, so memory stays
+        // bounded and progress can move per slice instead of jumping 0 → 100%.
         let filename = match std::path::Path::new(&local)
             .file_name()
             .and_then(|n| n.to_str())
@@ -651,14 +644,28 @@ pub unsafe extern "C" fn syno_upload(
             Some(n) => n.to_string(),
             None => return set_err(err, SynoStatus::InvalidArg, 0, "local path has no filename"),
         };
-        let total = data.len() as u64;
+        let total = match std::fs::metadata(&local) {
+            Ok(m) => m.len(),
+            Err(e) => return set_err(err, SynoStatus::Io, 0, &format!("stat {local}: {e}")),
+        };
         report(progress, user_data, 0, total);
 
+        // `user_data` travels as a usize for the same reason the log sink does:
+        // it is an opaque token we never deref, and that keeps the closure Send.
+        let ud = user_data as usize;
+        let sink = move |done: u64, total: u64| report(progress, ud as *mut c_void, done, total);
+        let local_path = std::path::PathBuf::from(&local);
         let inner = c.inner.clone();
         let result = c.runtime.block_on(async {
             inner
                 .with_relogin_retry(|| {
-                    inner.upload(&remote_dir, &filename, data.clone(), overwrite)
+                    inner.upload_from_path_with_progress(
+                        &local_path,
+                        &remote_dir,
+                        &filename,
+                        overwrite,
+                        Some(&sink),
+                    )
                 })
                 .await
         });

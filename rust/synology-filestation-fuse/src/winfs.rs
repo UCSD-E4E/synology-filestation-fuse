@@ -9,6 +9,7 @@ use winfsp::filesystem::{
 };
 use winfsp::FspError;
 
+use crate::spill::{payload_for, upload_payload, SpillBuffer};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::SynoFileInfo;
@@ -113,7 +114,7 @@ fn now_filetime() -> u64 {
 
 /// Shared write buffer type — an Arc so multiple FileContexts for the same
 /// pending path can all point at the same buffer.
-type SharedBuf = Arc<Mutex<Option<Vec<u8>>>>;
+type SharedBuf = Arc<Mutex<Option<SpillBuffer>>>;
 
 /// Entry stored for each file that has been `create()`d but not yet uploaded.
 /// Keeping FileInfo here lets `open()` return plausible metadata without an
@@ -192,7 +193,7 @@ impl SynoFileContext {
         let write_buf = if is_dir {
             Arc::new(Mutex::new(None))
         } else {
-            Arc::new(Mutex::new(Some(Vec::new())))
+            Arc::new(Mutex::new(Some(SpillBuffer::new())))
         };
         Self {
             nas_path,
@@ -312,17 +313,39 @@ impl FileSystemContext for SynologyWinFs {
     fn close(&self, context: Self::FileContext) {
         // Last-chance upload: if flush() was never called (or was bypassed),
         // upload any remaining buffered data before dropping the context.
-        let data_opt = context.write_buf.lock().unwrap().take();
-        if let Some(data) = data_opt {
-            tracing::debug!(
-                "close: last-chance upload {} ({} bytes)",
-                context.nas_path,
-                data.len()
-            );
-            let (parent, name) = split_path(&context.nas_path);
-            let _ = self
-                .runtime
-                .block_on(self.client.upload(parent, name, data, !context.is_new));
+        // The buffer is held in `taken` across the upload: dropping a spilled
+        // buffer deletes its temp file, which is exactly what we are uploading.
+        let mut taken = context.write_buf.lock().unwrap().take();
+        if let Some(buf) = taken.as_mut() {
+            match payload_for(buf) {
+                Ok(payload) => {
+                    tracing::debug!(
+                        "close: last-chance upload {} ({} bytes)",
+                        context.nas_path,
+                        payload.len()
+                    );
+                    let (parent, name) = split_path(&context.nas_path);
+                    if let Err(e) = self.runtime.block_on(upload_payload(
+                        &self.client,
+                        parent,
+                        name,
+                        payload,
+                        !context.is_new,
+                    )) {
+                        // Nothing left to retry with — the handle is closing.
+                        tracing::error!(
+                            "close: last-chance upload of {} failed: {e}",
+                            context.nas_path
+                        );
+                    }
+                }
+                // This path exists to stop data loss when flush() never ran, so
+                // failing to even read the buffer must not pass silently.
+                Err(e) => tracing::error!(
+                    "close: cannot read write buffer for {}, data not uploaded: {e}",
+                    context.nas_path
+                ),
+            }
         }
         tracing::debug!("close: removing pending {}", context.nas_path);
         self.pending_files
@@ -403,14 +426,12 @@ impl FileSystemContext for SynologyWinFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
         let mut wb = context.write_buf.lock().unwrap();
-        let buf = wb.get_or_insert_with(Vec::new);
-        let end = offset as usize + buffer.len();
-        if buf.len() < end {
-            buf.resize(end, 0);
-        }
-        buf[offset as usize..end].copy_from_slice(buffer);
+        let buf = wb.get_or_insert_with(SpillBuffer::new);
+        // Spills to a temp file past its threshold, so a large copy through the
+        // mount no longer pins the whole file in memory.
+        buf.write_at(offset, buffer).map_err(FspError::from)?;
         *file_info = context.file_info.clone();
-        file_info.file_size = buf.len() as u64;
+        file_info.file_size = buf.len();
         file_info.allocation_size = (file_info.file_size + 511) & !511;
         Ok(buffer.len() as u32)
     }
@@ -421,16 +442,31 @@ impl FileSystemContext for SynologyWinFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         if let Some(ctx) = context {
-            // Clone the data before attempting the upload so that if the upload
-            // fails, the data stays in write_buf for close() to retry.
-            let data_opt = ctx.write_buf.lock().unwrap().as_ref().map(|v| v.clone());
-            if let Some(data) = data_opt {
-                tracing::debug!("flush: uploading {} ({} bytes)", ctx.nas_path, data.len());
+            // Snapshot the buffer without consuming it, so a failed upload
+            // leaves the data in write_buf for close() to retry. For a spilled
+            // buffer the snapshot is just the temp path — no copy, and the
+            // upload streams it in slices.
+            let payload = {
+                let mut wb = ctx.write_buf.lock().unwrap();
+                match wb.as_mut() {
+                    Some(buf) => Some(payload_for(buf).map_err(FspError::from)?),
+                    None => None,
+                }
+            };
+            if let Some(payload) = payload {
+                tracing::debug!(
+                    "flush: uploading {} ({} bytes)",
+                    ctx.nas_path,
+                    payload.len()
+                );
                 let (parent, name) = split_path(&ctx.nas_path);
-                match self
-                    .runtime
-                    .block_on(self.client.upload(parent, name, data, !ctx.is_new))
-                {
+                match self.runtime.block_on(upload_payload(
+                    &self.client,
+                    parent,
+                    name,
+                    payload,
+                    !ctx.is_new,
+                )) {
                     Ok(()) => {
                         // Upload succeeded — consume the buffer, but keep the pending
                         // entry alive so that a subsequent get_security_by_name() for
@@ -466,8 +502,8 @@ impl FileSystemContext for SynologyWinFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let mut wb = context.write_buf.lock().unwrap();
-        let buf = wb.get_or_insert_with(Vec::new);
-        buf.resize(new_size as usize, 0);
+        let buf = wb.get_or_insert_with(SpillBuffer::new);
+        buf.set_len(new_size).map_err(FspError::from)?;
         *file_info = context.file_info.clone();
         file_info.file_size = new_size;
         file_info.allocation_size = (new_size + 511) & !511;
@@ -562,20 +598,26 @@ impl FileSystemContext for SynologyWinFs {
         // If the file has buffered data not yet uploaded (either because this
         // is the original create() handle or a secondary handle that shares
         // the same Arc<Mutex<...>>), upload directly under the new name.
-        let data_opt = context.write_buf.lock().unwrap().take();
-        if let Some(data) = data_opt {
+        // Held across the upload for the same reason as in close(): dropping a
+        // spilled buffer would delete the temp file being uploaded.
+        let mut taken = context.write_buf.lock().unwrap().take();
+        if let Some(buf) = taken.as_mut() {
+            let payload = payload_for(buf).map_err(FspError::from)?;
             tracing::debug!(
                 "rename: uploading pending {} -> {}/{} ({} bytes)",
                 from,
                 upload_parent,
                 to_name,
-                data.len()
+                payload.len()
             );
             self.runtime
-                .block_on(
-                    self.client
-                        .upload(upload_parent, to_name, data, !context.is_new),
-                )
+                .block_on(upload_payload(
+                    &self.client,
+                    upload_parent,
+                    to_name,
+                    payload,
+                    !context.is_new,
+                ))
                 .map_err(syno_to_fsp)?;
             self.pending_files.write().unwrap().remove(from);
             return Ok(());

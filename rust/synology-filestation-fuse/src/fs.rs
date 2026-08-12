@@ -13,6 +13,7 @@ use fuser::{
 use tracing::{debug, error, info, warn};
 
 use crate::cache::{InodeCache, ReadCache};
+use crate::spill::{payload_for, upload_payload, SpillBuffer};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
@@ -29,7 +30,7 @@ fn errno(raw: i32) -> Errno {
 struct WriteBuffer {
     nas_path: String,
     ino: u64,
-    data: Vec<u8>,
+    data: SpillBuffer,
     dirty: bool,
     /// True when the file was just created and has not yet been uploaded.
     /// Allows flush to use overwrite=false, skipping the delete-before-upload round trips.
@@ -164,7 +165,13 @@ impl SynologyFS {
 
         let nas_path = buf.nas_path.clone();
         let ino = buf.ino;
-        let data = buf.data.clone();
+        let payload = match payload_for(&mut buf.data) {
+            Ok(p) => p,
+            Err(e) => {
+                error!("queue_upload: cannot read write buffer: {}", e);
+                return;
+            }
+        };
         let overwrite = !buf.new_file;
         buf.dirty = false;
 
@@ -179,7 +186,7 @@ impl SynologyFS {
             fh,
             parent,
             filename,
-            data.len()
+            payload.len()
         );
 
         let client = self.client.clone();
@@ -189,7 +196,7 @@ impl SynologyFS {
 
         // Spawn the upload; hold the mutex so the handle is stored before release() can run.
         let handle = self.rt.spawn(async move {
-            let result = client.upload(&parent, &filename, data, overwrite).await;
+            let result = upload_payload(&client, &parent, &filename, payload, overwrite).await;
             cache.invalidate_path(&path_for_task);
             read_cache.invalidate_ino(ino);
             result
@@ -202,7 +209,7 @@ impl SynologyFS {
     /// remaining dirty data.  Called from `release` and `destroy`.
     fn finish_upload(&self, fh: u64) -> Result<(), SynoFsError> {
         // Extract both the handle and dirty state without holding the lock while blocking.
-        let (handle, dirty, nas_path, ino, data, overwrite) = {
+        let (handle, dirty, nas_path, ino, payload, overwrite) = {
             let mut buffers = self.write_buffers.lock().unwrap();
             let buf = match buffers.get_mut(&fh) {
                 Some(b) => b,
@@ -221,10 +228,10 @@ impl SynologyFS {
             }
             let path = buf.nas_path.clone();
             let ino = buf.ino;
-            let data = buf.data.clone();
+            let payload = payload_for(&mut buf.data).map_err(|e| SynoFsError::Io(e.to_string()))?;
             let overwrite = !buf.new_file;
             buf.dirty = false;
-            (handle, true, path, ino, data, overwrite)
+            (handle, true, path, ino, payload, overwrite)
         };
         let _ = dirty; // used implicitly — we only reach here when dirty was true
 
@@ -245,9 +252,15 @@ impl SynologyFS {
             fh,
             parent,
             filename,
-            data.len()
+            payload.len()
         );
-        self.block(self.client.upload(parent, filename, data, overwrite))?;
+        self.block(upload_payload(
+            &self.client,
+            parent,
+            filename,
+            payload,
+            overwrite,
+        ))?;
         self.cache.invalidate_path(&nas_path);
         self.read_cache.invalidate_ino(ino);
         Ok(())
@@ -695,7 +708,7 @@ impl Filesystem for SynologyFS {
             WriteBuffer {
                 nas_path: path,
                 ino,
-                data: Vec::new(),
+                data: SpillBuffer::new(),
                 dirty: false,
                 new_file: false,
                 upload_handle: None,
@@ -761,12 +774,14 @@ impl Filesystem for SynologyFS {
         // If writing at an offset beyond current buffer, we need the existing file content first.
         // This is handled by seeding the buffer in create/open if needed.
         // For simplicity: if offset > current len, seed from API on first write.
-        let offset = offset as usize;
-        let end = offset + data.len();
-        if end > buf.data.len() {
-            buf.data.resize(end, 0);
+        // The buffer spills to a temp file once it outgrows SpillBuffer's
+        // threshold, so a large copy no longer pins the whole file in RAM (and
+        // no longer stalls every other FUSE callback behind that allocation).
+        if let Err(e) = buf.data.write_at(offset, data) {
+            error!("write: buffering failed: {}", e);
+            reply.error(Errno::EIO);
+            return;
         }
-        buf.data[offset..end].copy_from_slice(data);
         buf.dirty = true;
         reply.written(data.len() as u32);
     }
@@ -859,7 +874,7 @@ impl Filesystem for SynologyFS {
             WriteBuffer {
                 nas_path: new_path,
                 ino,
-                data: Vec::new(),
+                data: SpillBuffer::new(),
                 dirty: false,
                 new_file: true,
                 upload_handle: None,
