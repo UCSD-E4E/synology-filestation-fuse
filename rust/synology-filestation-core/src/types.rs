@@ -123,6 +123,21 @@ pub struct UploadData {
     pub tmpfile: Option<String>,
 }
 
+/// `SYNO.FileStation.MD5` start response — the handle for the hashing task.
+#[derive(Debug, Deserialize)]
+pub struct Md5StartData {
+    pub taskid: String,
+}
+
+/// `SYNO.FileStation.MD5` status response. `md5` is absent until `finished`.
+#[derive(Debug, Deserialize)]
+pub struct Md5StatusData {
+    #[serde(default)]
+    pub finished: bool,
+    #[serde(default)]
+    pub md5: Option<String>,
+}
+
 /// An entry in the inode cache
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]

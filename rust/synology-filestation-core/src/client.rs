@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
 use crate::transport::{
@@ -12,8 +12,8 @@ use crate::transport::{
     WriteTransport,
 };
 use crate::types::{
-    AuthData, CreateFolderData, GetInfoData, ListData, ListShareData, RenameData, SynoFileInfo,
-    SynoResponse, UploadData, ADDITIONAL_FIELDS, SHARE_ADDITIONAL_FIELDS,
+    AuthData, CreateFolderData, GetInfoData, ListData, ListShareData, Md5StartData, Md5StatusData,
+    RenameData, SynoFileInfo, SynoResponse, UploadData, ADDITIONAL_FIELDS, SHARE_ADDITIONAL_FIELDS,
 };
 
 /// Synology API error code returned when the SID has expired or is otherwise
@@ -222,8 +222,117 @@ const LIST_MAX_PAGES: usize = 10_000;
 /// Borrowed rather than boxed so callers can pass a plain closure reference.
 pub type ProgressSink<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
 
+/// How long a metadata or download request may take to produce response headers
+/// (and, on the response body, how long it may go without delivering a chunk).
+/// Uploads deliberately do not use it — see [`build_http_transfer`].
+const METADATA_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline policy for a single upload request: `grace + bytes / floor_bps`.
+///
+/// An upload cannot use a flat timeout — the payload spans four orders of
+/// magnitude (a text file to a 10 MiB slice) and the link spans three (LAN to
+/// a congested VPN). A rate floor scales the allowance with the bytes actually
+/// in flight, so a big slice on a slow link gets the minutes it needs while a
+/// genuinely wedged connection still fails instead of parking a FUSE callback
+/// forever.
+#[derive(Clone, Copy, Debug)]
+struct UploadDeadline {
+    /// Flat allowance on top of the transfer time, covering connect, TLS
+    /// handshake and DSM writing the slice out before it answers.
+    grace: Duration,
+    /// Slowest upload throughput we still treat as progress rather than a
+    /// stall. Set well below any usable link: the point is to catch a dead
+    /// connection, not to enforce a service level.
+    floor_bps: u64,
+}
+
+impl Default for UploadDeadline {
+    fn default() -> Self {
+        Self {
+            grace: Duration::from_secs(60),
+            // 32 KiB/s — a 10 MiB slice gets ~6 minutes.
+            floor_bps: 32 * 1024,
+        }
+    }
+}
+
+impl UploadDeadline {
+    fn for_bytes(&self, bytes: u64) -> Duration {
+        // Rounded up: truncating division would hand out slightly *less* than
+        // the floor rate promises, which is the wrong direction for a timeout.
+        self.grace + Duration::from_secs(bytes.div_ceil(self.floor_bps.max(1)))
+    }
+}
+
+/// How long to let a just-written file settle before a size disagreement is
+/// treated as corruption rather than a listing that has not caught up.
+const VERIFY_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// How often the `SYNO.FileStation.MD5` task is polled — the same 1 s File
+/// Station's own properties dialog uses.
+const MD5_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Ceiling on waiting for a hash. DSM reads the whole file to produce one, so
+/// this is generous; it exists so a task that never finishes cannot park a FUSE
+/// `flush` indefinitely.
+const MD5_MAX_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// Why one slice of a chunked upload failed, and what that implies for
+/// resending it.
+enum SliceError {
+    /// The server gave a definitive answer. Resending cannot change it.
+    Fatal(SynoFsError),
+    /// Worth another attempt. `may_have_landed` says whether the server might
+    /// already hold these bytes — if it does, a resend appends them twice and
+    /// the finished file has to be verified. `hard` doubles the backoff (DSM
+    /// asking for a pause).
+    Retryable {
+        err: SynoFsError,
+        may_have_landed: bool,
+        hard: bool,
+    },
+}
+
+/// MD5 of a local file, streamed in 1 MiB reads so a multi-GB upload is not
+/// re-buffered to hash it. Runs on the blocking pool: hashing 6 GB is seconds
+/// of solid CPU, which is not something to do on a runtime worker.
+async fn md5_of_file(path: &Path) -> Result<String, SynoFsError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use md5::{Digest, Md5};
+        use std::io::Read;
+
+        let mut f = std::fs::File::open(&path)
+            .map_err(|e| SynoFsError::Io(format!("md5: open {} failed: {e}", path.display())))?;
+        let mut hasher = Md5::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let n = f.read(&mut buf).map_err(|e| {
+                SynoFsError::Io(format!("md5: read {} failed: {e}", path.display()))
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
+    })
+    .await
+    .map_err(|e| SynoFsError::Io(format!("md5: hashing task failed: {e}")))?
+}
+
 pub struct SynologyClient {
     http: Client,
+    /// Client for upload request bodies. Same connection policy as `http` minus
+    /// the read timeout, which would otherwise cap how long a body may take to
+    /// push — see [`build_http_transfer`].
+    http_transfer: Client,
+    /// How long a single upload request may take, derived from its size.
+    upload_deadline: UploadDeadline,
     base_url: String,
     sid: RwLock<Option<String>>,
     /// Optional request throttle protecting the NAS from bulk-transfer
@@ -300,6 +409,8 @@ impl SynologyClient {
         let base_url = format!("{}://{}:{}/webapi", scheme, host, port);
         Self {
             http: build_http(false),
+            http_transfer: build_http_transfer(false),
+            upload_deadline: UploadDeadline::default(),
             base_url,
             sid: RwLock::new(None),
             auto_relogin: false,
@@ -329,7 +440,23 @@ impl SynologyClient {
     /// Prefer installing the NAS's certificate in the system trust store.
     pub fn with_insecure_tls(mut self) -> Self {
         self.http = build_http(true);
+        self.http_transfer = build_http_transfer(true);
         self.insecure_tls = true;
+        self
+    }
+
+    /// Shrink the metadata read timeout so a test can prove uploads are not
+    /// governed by it without waiting out the real 30 s.
+    #[cfg(test)]
+    fn with_read_timeout_for_test(mut self, d: Duration) -> Self {
+        self.http = build_client(self.insecure_tls, Some(d));
+        self
+    }
+
+    /// Shrink the per-upload deadline so a test can watch it fire.
+    #[cfg(test)]
+    fn with_upload_deadline_for_test(mut self, grace: Duration, floor_bps: u64) -> Self {
+        self.upload_deadline = UploadDeadline { grace, floor_bps };
         self
     }
 
@@ -340,12 +467,33 @@ impl SynologyClient {
     }
 }
 
-/// Build the shared HTTP client. `accept_invalid_certs` is the only knob that
-/// varies; everything else is the timeout/keepalive policy the whole crate
-/// depends on, so it lives in one place rather than being repeated per
-/// constructor.
+/// Build the metadata/download HTTP client — everything except upload request
+/// bodies, which get [`build_http_transfer`] instead.
 fn build_http(accept_invalid_certs: bool) -> Client {
-    Client::builder()
+    build_client(accept_invalid_certs, Some(METADATA_READ_TIMEOUT))
+}
+
+/// Build the client used for upload request bodies: the same connection policy,
+/// but with **no** `read_timeout`.
+///
+/// reqwest's read timeout is not the idle timer the name suggests. It is a
+/// `sleep` armed when the request is created and polled alongside the pending
+/// request, so it caps the whole span from "request started" to "response
+/// headers arrived" — the time spent writing the request body included. On a
+/// 30 s cap, any upload whose body takes longer than 30 s to push fails with
+/// `operation timed out`, which on a slow link is every large file: 10 MiB
+/// needs more than 30 s below ~350 KB/s. Uploads are bounded per request by
+/// [`UploadDeadline`] instead, which knows how many bytes are in flight.
+fn build_http_transfer(accept_invalid_certs: bool) -> Client {
+    build_client(accept_invalid_certs, None)
+}
+
+/// Build an HTTP client. `accept_invalid_certs` and `read_timeout` are the only
+/// knobs that vary; everything else is the timeout/keepalive policy the whole
+/// crate depends on, so it lives in one place rather than being repeated per
+/// constructor.
+fn build_client(accept_invalid_certs: bool, read_timeout: Option<Duration>) -> Client {
+    let builder = Client::builder()
         .danger_accept_invalid_certs(accept_invalid_certs)
         // Drop idle connections after 4 s so we don't reuse connections the NAS
         // has already closed on its side (~7 s keep-alive on most DSM versions).
@@ -356,16 +504,17 @@ fn build_http(accept_invalid_certs: bool) -> Client {
         // Send TCP keepalive probes so stalled mid-transfer connections are
         // detected in seconds rather than waiting for the full OS TCP timeout
         // (~75 s on macOS, ETIMEDOUT / os error 60).
-        .tcp_keepalive(Duration::from_secs(10))
-        // Bound how long we'll wait for data on a request. Without this, a
-        // silently-dead connection (e.g. routes changed when a VPN comes up
-        // mid-session) hangs the FUSE callback indefinitely — the user sees
-        // their file manager freeze with no error. read_timeout fires when
-        // no bytes have arrived for the duration, so it doesn't cap
-        // legitimately long large-file uploads.
-        .read_timeout(Duration::from_secs(30))
-        .build()
-        .expect("failed to build HTTP client")
+        .tcp_keepalive(Duration::from_secs(10));
+    // Bound how long we'll wait for a response. Without this, a silently-dead
+    // connection (e.g. routes changed when a VPN comes up mid-session) hangs
+    // the FUSE callback indefinitely — the user sees their file manager freeze
+    // with no error. Requests that carry a large body opt out (see
+    // `build_http_transfer`) because this cap covers the body write too.
+    let builder = match read_timeout {
+        Some(d) => builder.read_timeout(d),
+        None => builder,
+    };
+    builder.build().expect("failed to build HTTP client")
 }
 
 impl SynologyClient {
@@ -1260,10 +1409,13 @@ impl SynologyClient {
     /// Memory is bounded by one slice, in contrast to [`Self::http_upload`],
     /// which holds the whole file (and clones it per retry attempt).
     ///
-    /// Deliberately **not** retried per slice: a resent slice would append
-    /// twice, and DSM exposes no way to ask how much of the partial file it
-    /// already holds. A failure surfaces and the caller restarts the file —
-    /// the outer-retry contract the throttle docs already specify.
+    /// A failed slice is resent (bounded by [`Self::max_transfer_attempts`])
+    /// rather than costing the whole file. DSM has no resume — it appends each
+    /// slice blindly and never reports how much of the partial it holds — so a
+    /// resend after the body may already have arrived can append the same bytes
+    /// twice. That is why every completed upload is checked against what landed
+    /// (see [`Self::verify_upload`]); a slice we cannot vouch for is never
+    /// reported as a successful write.
     async fn http_slice_upload(
         &self,
         local: &Path,
@@ -1297,50 +1449,59 @@ impl SynologyClient {
         })?;
         let mut buf = vec![0u8; slice_size];
         let mut tmpfile: Option<String> = None;
+        // Set when a resend might have appended a slice the server already
+        // held. Only then is the finished file worth hashing.
+        let mut unverified_resend = false;
+        let max_attempts = self.max_transfer_attempts();
 
         for index in 0..slices {
             let want = std::cmp::min(slice_size as u64, total - index * slice_size as u64) as usize;
             file.read_exact(&mut buf[..want]).await.map_err(|e| {
                 SynoFsError::Io(format!("slice upload: read slice {index} failed: {e}"))
             })?;
-
             let last = index + 1 == slices;
-            let file_part = multipart::Part::bytes(buf[..want].to_vec())
-                .file_name(filename.to_string())
-                .mime_str("application/octet-stream")
-                .map_err(|e| SynoFsError::Io(e.to_string()))?;
-            let mut form = multipart::Form::new()
-                .text("overwrite", "false")
-                .text("create_parents", "true")
-                .text("path", folder_path.to_string());
-            if let Some(ms) = &mtime_ms {
-                form = form.text("mtime", ms.clone());
-            }
-            let form = form.part("file", file_part);
 
-            let mut req = self
-                .attach_session(self.http.post(&url).query(&[
-                    ("api", "SYNO.FileStation.Upload"),
-                    ("method", "upload"),
-                    ("version", "2"),
-                ]))
-                .header("X-TYPE-NAME", "SLICEUPLOAD")
-                .header("X-FILE-SIZE", total.to_string())
-                .header("X-FILE-CHUNK-END", if last { "true" } else { "false" });
-            if let Some(t) = &tmpfile {
-                req = req.header("X-TMP-FILE", t.clone());
-            }
-
-            let text = {
-                let _slot = self.acquire_transfer_slot().await;
-                req.multipart(form).send().await?.text().await?
+            let mut attempt = 0u32;
+            let parsed = loop {
+                let outcome = self
+                    .send_slice(
+                        &url,
+                        folder_path,
+                        filename,
+                        &buf[..want],
+                        total,
+                        last,
+                        tmpfile.as_deref(),
+                        mtime_ms.as_deref(),
+                    )
+                    .await;
+                match outcome {
+                    Ok(parsed) => break parsed,
+                    Err(SliceError::Fatal(e)) => return Err(e),
+                    Err(SliceError::Retryable {
+                        err,
+                        may_have_landed,
+                        hard,
+                    }) => {
+                        attempt += 1;
+                        if attempt >= max_attempts {
+                            return Err(err);
+                        }
+                        // Resending the *first* slice cannot double anything:
+                        // with no tmpfile handle it opens a fresh partial file,
+                        // and the abandoned one is the server's to reap. From
+                        // the second slice on, the server may already hold what
+                        // we are about to send again.
+                        if may_have_landed && tmpfile.is_some() {
+                            unverified_resend = true;
+                        }
+                        warn!(
+                            "slice upload: slice {index} attempt {attempt} failed, resending: {err}"
+                        );
+                        self.backoff_before_retry(attempt - 1, hard).await;
+                    }
+                }
             };
-            let parsed: SynoResponse<UploadData> = serde_json::from_str(&text)
-                .map_err(|e| SynoFsError::Io(format!("slice upload parse error: {e}")))?;
-            if !parsed.success {
-                let code = parsed.error.map(|e| e.code).unwrap_or(0);
-                return Err(SynoFsError::ApiError(code));
-            }
 
             if let Some(p) = progress {
                 p(index * slice_size as u64 + want as u64, total);
@@ -1363,7 +1524,298 @@ impl SynologyClient {
                 };
             }
         }
+
+        let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
+        self.verify_upload(&full_path, local, total, unverified_resend)
+            .await
+    }
+
+    /// Send one slice and classify what came back.
+    ///
+    /// The classification that matters is `may_have_landed`: whether the server
+    /// could already hold these bytes. Only a failure in the connect/TLS phase
+    /// proves it does not.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_slice(
+        &self,
+        url: &str,
+        folder_path: &str,
+        filename: &str,
+        chunk: &[u8],
+        total: u64,
+        last: bool,
+        tmpfile: Option<&str>,
+        mtime_ms: Option<&str>,
+    ) -> Result<SynoResponse<UploadData>, SliceError> {
+        let file_part = multipart::Part::bytes(chunk.to_vec())
+            .file_name(filename.to_string())
+            .mime_str("application/octet-stream")
+            .map_err(|e| SliceError::Fatal(SynoFsError::Io(e.to_string())))?;
+        let mut form = multipart::Form::new()
+            .text("overwrite", "false")
+            .text("create_parents", "true")
+            .text("path", folder_path.to_string());
+        if let Some(ms) = mtime_ms {
+            form = form.text("mtime", ms.to_string());
+        }
+        let form = form.part("file", file_part);
+
+        let mut req = self
+            .attach_session(self.http_transfer.post(url).query(&[
+                ("api", "SYNO.FileStation.Upload"),
+                ("method", "upload"),
+                ("version", "2"),
+            ]))
+            // Sized to this slice, not to the file: each slice is its own
+            // request, so a 6 GB upload is a long series of ~6-minute deadlines
+            // rather than one open-ended wait.
+            .timeout(self.upload_deadline.for_bytes(chunk.len() as u64))
+            .header("X-TYPE-NAME", "SLICEUPLOAD")
+            .header("X-FILE-SIZE", total.to_string())
+            .header("X-FILE-CHUNK-END", if last { "true" } else { "false" });
+        if let Some(t) = tmpfile {
+            req = req.header("X-TMP-FILE", t.to_string());
+        }
+
+        let text = {
+            let _slot = self.acquire_transfer_slot().await;
+            let resp = match req.multipart(form).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // A connect/TLS failure is the one case where the body
+                    // provably never left this machine. A timeout, a reset
+                    // mid-body or a lost response all leave the question open.
+                    let may_have_landed = !e.is_connect();
+                    return Err(SliceError::Retryable {
+                        err: SynoFsError::from(e),
+                        may_have_landed,
+                        hard: false,
+                    });
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let err = SynoFsError::Io(format!("slice upload HTTP {status}"));
+                return Err(if http_status_is_transient(status) {
+                    SliceError::Retryable {
+                        err,
+                        may_have_landed: true,
+                        hard: false,
+                    }
+                } else {
+                    SliceError::Fatal(err)
+                });
+            }
+            match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    return Err(SliceError::Retryable {
+                        err: SynoFsError::from(e),
+                        may_have_landed: true,
+                        hard: false,
+                    })
+                }
+            }
+        };
+
+        let parsed: SynoResponse<UploadData> = serde_json::from_str(&text).map_err(|e| {
+            SliceError::Fatal(SynoFsError::Io(format!("slice upload parse error: {e}")))
+        })?;
+        if !parsed.success {
+            let code = parsed.error.map(|e| e.code).unwrap_or(0);
+            // 402 is the appliance asking for a pause, not a verdict on the
+            // request — back off harder and try the slice again.
+            return Err(if dsm_code_to_category(code) == ErrorCategory::Busy {
+                SliceError::Retryable {
+                    err: SynoFsError::ApiError(code),
+                    may_have_landed: true,
+                    hard: true,
+                }
+            } else {
+                SliceError::Fatal(SynoFsError::ApiError(code))
+            });
+        }
+        Ok(parsed)
+    }
+
+    /// Check that what landed on the NAS is what we sent, and refuse to report
+    /// success otherwise.
+    ///
+    /// Two levels, because they cost very different amounts:
+    ///
+    /// * **Size** — one metadata call, run after every sliced upload. A doubled
+    ///   slice the server kept shows up here immediately.
+    /// * **MD5** — only when a resend could have doubled a slice, because it
+    ///   makes DSM read the whole file back (minutes, and disk the appliance
+    ///   would rather spend elsewhere). It is the only check that catches a
+    ///   doubled slice if DSM trims the partial back to `X-FILE-SIZE`.
+    ///
+    /// What happens when a check cannot run depends on who could not answer.
+    /// A missing size, or DSM replying that it cannot hash (`SYNO.FileStation.MD5`
+    /// absent or refused), is a verdict we can do nothing about: logged, and the
+    /// upload accepted, since the write succeeded and nothing contradicts it.
+    /// Failing to *reach* the hash after a risky resend is not — that returns an
+    /// error rather than claiming a verified write, while leaving the file in
+    /// place for the caller's retry to overwrite.
+    ///
+    /// Only positive evidence of a mismatch deletes: a file we know is wrong is
+    /// worse than no file, but a file we merely cannot vouch for is not.
+    async fn verify_upload(
+        &self,
+        full_path: &str,
+        local: &Path,
+        total: u64,
+        hash_it: bool,
+    ) -> Result<(), SynoFsError> {
+        if let Some(size) = self.landed_size(full_path).await {
+            if size != total {
+                // The listing can lag a write DSM has just accepted — the same
+                // lag `clear_for_overwrite` polls through. Confirm before
+                // acting: a false positive here deletes a good upload.
+                tokio::time::sleep(VERIFY_SETTLE_DELAY).await;
+                if let Some(size) = self.landed_size(full_path).await {
+                    if size != total {
+                        return self
+                            .reject_upload(
+                                full_path,
+                                format!("landed as {size} bytes, expected {total}"),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
+        if !hash_it {
+            return Ok(());
+        }
+
+        let remote = match self.md5(full_path).await {
+            Ok(m) => m,
+            // DSM answering (no such API, no permission) is a verdict: it
+            // cannot hash for us, and no amount of retrying changes that. The
+            // write succeeded and nothing contradicts it, so accept it.
+            Err(e @ SynoFsError::ApiError(_)) => {
+                warn!("upload verify: {full_path} cannot be hashed by the NAS ({e}), accepting");
+                return Ok(());
+            }
+            // Not reaching the check at all is different. A resend may have
+            // doubled a slice and we have no way to tell, so this is not a
+            // verified write — but there is no evidence against the file
+            // either, so it stays: the caller's retry re-uploads over it, and
+            // deleting a probably-good upload is the worse mistake.
+            Err(e) => {
+                let msg =
+                    format!("upload of {full_path} could not be verified after a resend: {e}");
+                error!("{msg}");
+                return Err(SynoFsError::Io(msg));
+            }
+        };
+        let local_md5 = md5_of_file(local).await?;
+        if !remote.eq_ignore_ascii_case(&local_md5) {
+            return self
+                .reject_upload(full_path, format!("md5 {remote} != {local_md5}"))
+                .await;
+        }
+        debug!("upload verify: {full_path} matches after a resend");
         Ok(())
+    }
+
+    /// The size the NAS reports for `full_path`, or `None` when it cannot say —
+    /// an unreadable listing is not evidence against an upload, so the caller
+    /// treats it as "unverified" rather than "wrong".
+    async fn landed_size(&self, full_path: &str) -> Option<u64> {
+        match self.get_info(full_path).await {
+            Ok(info) => match info.additional.and_then(|a| a.size) {
+                Some(size) => Some(size),
+                None => {
+                    warn!("upload verify: no size reported for {full_path}, accepting as-is");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("upload verify: getinfo {full_path} failed ({e}), accepting as-is");
+                None
+            }
+        }
+    }
+
+    /// Remove a file whose contents we cannot vouch for, then report why.
+    async fn reject_upload(&self, full_path: &str, why: String) -> Result<(), SynoFsError> {
+        let msg = format!("upload verification failed for {full_path}: {why}");
+        error!("{msg}");
+        if let Err(e) = self.delete(full_path).await {
+            warn!("could not remove unverified upload {full_path}: {e}");
+        }
+        Err(SynoFsError::Io(msg))
+    }
+
+    /// Have DSM hash a file it holds, via `SYNO.FileStation.MD5`.
+    ///
+    /// Two steps, as File Station's own properties dialog does it: `start`
+    /// hands back a task id, `status` is polled (it polls at 1 s) until
+    /// `finished`. Bounded by [`MD5_MAX_WAIT`] so a task that never finishes
+    /// cannot park the caller — for the FUSE backend, that caller is a `flush`.
+    pub async fn md5(&self, path: &str) -> Result<String, SynoFsError> {
+        let url = format!("{}/entry.cgi", self.base_url);
+        let text = self
+            .get_text_retried(
+                &url,
+                &[
+                    ("api", "SYNO.FileStation.MD5"),
+                    ("version", "2"),
+                    ("method", "start"),
+                    ("file_path", path),
+                ],
+            )
+            .await?;
+        let parsed: SynoResponse<Md5StartData> = serde_json::from_str(&text)
+            .map_err(|e| SynoFsError::Io(format!("md5 start parse error: {e}")))?;
+        if !parsed.success {
+            return Err(SynoFsError::ApiError(
+                parsed.error.map(|e| e.code).unwrap_or(0),
+            ));
+        }
+        let taskid = parsed
+            .data
+            .map(|d| d.taskid)
+            .ok_or_else(|| SynoFsError::Io("md5 start returned no taskid".into()))?;
+
+        let deadline = Instant::now() + MD5_MAX_WAIT;
+        loop {
+            let text = self
+                .get_text_retried(
+                    &url,
+                    &[
+                        ("api", "SYNO.FileStation.MD5"),
+                        ("version", "2"),
+                        ("method", "status"),
+                        ("taskid", &taskid),
+                    ],
+                )
+                .await?;
+            let parsed: SynoResponse<Md5StatusData> = serde_json::from_str(&text)
+                .map_err(|e| SynoFsError::Io(format!("md5 status parse error: {e}")))?;
+            if !parsed.success {
+                return Err(SynoFsError::ApiError(
+                    parsed.error.map(|e| e.code).unwrap_or(0),
+                ));
+            }
+            if let Some(data) = parsed.data {
+                if data.finished {
+                    return data.md5.filter(|m| !m.is_empty()).ok_or_else(|| {
+                        SynoFsError::Io("md5 task finished without a digest".into())
+                    });
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(SynoFsError::Io(format!(
+                    "md5 of {path} did not finish within {}s",
+                    MD5_MAX_WAIT.as_secs()
+                )));
+            }
+            tokio::time::sleep(MD5_POLL_INTERVAL).await;
+        }
     }
 
     /// Delete a file that is in the way of an upload, then wait for it to
@@ -1449,7 +1901,8 @@ impl SynologyClient {
             let text = {
                 let _slot = self.acquire_transfer_slot().await;
                 match self
-                    .attach_session(self.http.post(&url))
+                    .attach_session(self.http_transfer.post(&url))
+                    .timeout(self.upload_deadline.for_bytes(data.len() as u64))
                     .multipart(form)
                     .send()
                     .await
@@ -3947,7 +4400,9 @@ mod tests {
             .await
             .unwrap();
 
-        let reqs = server.received_requests().await.unwrap();
+        // POSTs only: a completed sliced upload also GETs the file back to
+        // check what landed.
+        let reqs = slice_posts(&server).await;
         assert_eq!(reqs.len(), 3, "2500 bytes at 1024/slice is 3 slices");
         for r in &reqs {
             assert_eq!(header_of(r, "X-TYPE-NAME").as_deref(), Some("SLICEUPLOAD"));
@@ -4002,9 +4457,9 @@ mod tests {
 
     #[tokio::test]
     async fn slice_upload_stops_at_the_failing_slice() {
-        // No per-slice retry: a resumed slice could double-append, and the
-        // resume semantics are unverified. Surface the error and let the caller
-        // restart the whole file (the Temporal outer-retry contract).
+        // A DSM error code is a verdict, not a blip: the slice is not resent,
+        // and the remaining slices are not sent either. (Transport failures are
+        // resent — see `slice_upload_resends_a_failed_slice_on_the_same_tmpfile`.)
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/webapi/entry.cgi"))
@@ -4172,7 +4627,7 @@ mod tests {
             .await
             .unwrap();
 
-        for req in server.received_requests().await.unwrap() {
+        for req in slice_posts(&server).await {
             let body = String::from_utf8_lossy(&req.body).to_string();
             assert!(
                 body.contains("name=\"create_parents\""),
@@ -4185,6 +4640,684 @@ mod tests {
                 "the slice path uses the X-FILE-SIZE header, not a size field"
             );
         }
+        std::fs::remove_file(&local).ok();
+    }
+
+    // ── upload deadlines ─────────────────────────────────────────────────────
+    //
+    // reqwest's `read_timeout` is not the idle timer its name suggests: it is
+    // armed when the request is created and polled alongside the pending
+    // request, so it caps the whole span from "request started" to "response
+    // headers arrived" — including writing the request body. A 30 s cap
+    // therefore aborts any upload whose body takes longer than 30 s to push,
+    // which on a slow link is every large file; the caller sees "operation
+    // timed out" (EIO on the FUSE mount) with nothing actually wrong. Uploads
+    // get their own client with no read timeout, bounded per request by a
+    // size-derived deadline instead.
+
+    #[tokio::test]
+    async fn one_shot_upload_outlives_the_metadata_read_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(400))
+                    .set_body_json(serde_json::json!({"success": true, "data": {}})),
+            )
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("slow-oneshot.bin", 500);
+        let client = client_for(&server)
+            .with_slice_size(1024)
+            .with_read_timeout_for_test(Duration::from_millis(100));
+        client
+            .upload_from_path(&local, "/share", "slow.bin", false)
+            .await
+            .expect("a slow upload is not a dead one");
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_outlives_the_metadata_read_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(400))
+                    .set_body_json(serde_json::json!({
+                        "success": true,
+                        "data": {"blSkip": false, "tmpfile": "slice.1.0.9224"}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("slow-slice.bin", 2500);
+        let client = client_for(&server)
+            .with_slice_size(1024)
+            .with_read_timeout_for_test(Duration::from_millis(100));
+        client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .expect("every slice gets the same reprieve");
+
+        assert_eq!(slice_posts(&server).await.len(), 3);
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_is_still_bounded_by_its_own_deadline() {
+        // Dropping the read timeout must not mean "hang forever": a server that
+        // takes the body and then goes silent still has to fail, or the FUSE
+        // callback that called flush never returns.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({"success": true, "data": {}})),
+            )
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("hung.bin", 500);
+        let client = client_for(&server)
+            .with_slice_size(1024)
+            .with_upload_deadline_for_test(Duration::from_millis(150), u64::MAX);
+        let started = std::time::Instant::now();
+        let err = client
+            .upload_from_path(&local, "/share", "hung.bin", false)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the deadline fired, not the mock's own delay: {err}"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[test]
+    fn upload_deadline_scales_with_the_payload() {
+        let policy = UploadDeadline::default();
+        // A 10 MiB slice on a link crawling at the assumed floor still fits.
+        let slice = policy.for_bytes(DEFAULT_SLICE_SIZE as u64);
+        assert!(
+            slice >= Duration::from_secs(5 * 60),
+            "10 MiB at the floor rate needs minutes, got {slice:?}"
+        );
+        // A bigger payload gets proportionally longer, rather than one fixed cap
+        // that is either too tight for slow links or useless on fast ones.
+        assert!(policy.for_bytes(DEFAULT_SLICE_SIZE as u64 * 4) > slice);
+        // An empty body still gets the grace period, never a zero deadline.
+        assert_eq!(policy.for_bytes(0), policy.grace);
+    }
+
+    // ── slice upload: retry, and the verification that makes it safe ──────────
+    //
+    // DSM offers no resume. The server appends each slice to its tmpfile and
+    // never reports how many bytes it holds — `FileUploader_T9JY.js` computes
+    // every offset client-side and, on any error, gives up on the whole file.
+    // So a resent slice is exact only when the request never reached the
+    // server; if the body went out and the answer was lost, resending may
+    // append the same 10 MiB twice.
+    //
+    // We resend anyway, because the alternative is discarding a multi-GB
+    // upload over one blip, and we make it safe by checking what actually
+    // landed: the size always, plus a server-side MD5 (SYNO.FileStation.MD5
+    // v2 — the API File Station's own properties dialog calls) whenever a
+    // resend could have doubled a slice. A retry on the *first* slice can't
+    // double anything: without a tmpfile handle the resend opens a fresh
+    // partial, so it skips the hash.
+
+    /// md5 of `scratch_file(_, 2500)`'s byte pattern, from `md5sum` rather than
+    /// from our own hasher, so the test can disagree with the implementation.
+    const SCRATCH_2500_MD5: &str = "babbd9d63dca99cb8d4cc054ba70829d";
+
+    fn slice_ok() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "data": {"blSkip": false, "tmpfile": "slice.1.0.9224"}
+        }))
+    }
+
+    /// Answer `getinfo` for the uploaded file with `size` bytes.
+    async fn mount_getinfo_size(server: &MockServer, size: u64) {
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{
+                    "name": "big.bin",
+                    "path": "/share/big.bin",
+                    "isdir": false,
+                    "additional": {"size": size, "owner": null, "time": null, "perm": null}
+                }]}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Answer the two-step MD5 task API with `digest`.
+    async fn mount_md5(server: &MockServer, digest: &str) {
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("api", "SYNO.FileStation.MD5"))
+            .and(query_param("method", "start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"taskid": "md5-1"}
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("api", "SYNO.FileStation.MD5"))
+            .and(query_param("method", "status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"finished": true, "md5": digest}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Upload POSTs only — the verification traffic is GETs.
+    async fn slice_posts(server: &MockServer) -> Vec<wiremock::Request> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .collect()
+    }
+
+    async fn md5_calls(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.url
+                    .query()
+                    .is_some_and(|q| q.contains("SYNO.FileStation.MD5"))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn slice_upload_resends_a_failed_slice_on_the_same_tmpfile() {
+        let server = MockServer::start().await;
+        // Slice 1 goes out, slice 2 gets a 503, then everything succeeds.
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 2500).await;
+        mount_md5(&server, SCRATCH_2500_MD5).await;
+
+        let local = scratch_file("retry.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .expect("a blip on one slice does not cost the file");
+
+        let posts = slice_posts(&server).await;
+        assert_eq!(posts.len(), 4, "3 slices plus one resend");
+        // The resend continues the same partial file rather than starting over.
+        let tmps: Vec<_> = posts.iter().map(|r| header_of(r, "X-TMP-FILE")).collect();
+        assert_eq!(tmps[1], tmps[2], "the resend targets the same tmpfile");
+        assert_eq!(
+            header_of(&posts[3], "X-FILE-CHUNK-END").as_deref(),
+            Some("true"),
+            "the upload still terminates on the final slice"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_hashes_the_result_after_a_resend_that_could_have_doubled() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 2500).await;
+        mount_md5(&server, SCRATCH_2500_MD5).await;
+
+        let local = scratch_file("hashed.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap();
+
+        assert!(
+            md5_calls(&server).await >= 2,
+            "a risky resend is verified by start + status"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_skips_the_hash_when_nothing_could_have_doubled() {
+        // The happy path pays for one getinfo, never for a NAS-side hash of a
+        // multi-GB file.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 2500).await;
+        mount_md5(&server, SCRATCH_2500_MD5).await;
+
+        let local = scratch_file("clean.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap();
+
+        assert_eq!(md5_calls(&server).await, 0, "no resend, no hash");
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn resending_the_first_slice_needs_no_hash() {
+        // Slice 1 has no tmpfile to append to, so its resend opens a fresh
+        // partial file. Nothing can be doubled, and the orphaned partial is the
+        // server's to reap.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 2500).await;
+        mount_md5(&server, SCRATCH_2500_MD5).await;
+
+        let local = scratch_file("firstfail.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap();
+
+        let posts = slice_posts(&server).await;
+        assert_eq!(posts.len(), 4, "3 slices plus the first slice's resend");
+        assert!(
+            header_of(&posts[1], "X-TMP-FILE").is_none(),
+            "the resend of slice 1 opens a new partial rather than continuing one"
+        );
+        assert_eq!(md5_calls(&server).await, 0, "nothing could have doubled");
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_fails_when_the_landed_size_is_wrong() {
+        // The cheap half of the safety net: a doubled slice that DSM kept makes
+        // the file too big, and no hash is needed to see it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 3524).await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "delete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("wrongsize.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        let err = client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+
+        let deleted = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
+        assert!(deleted, "a file we cannot vouch for is not left behind");
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_fails_when_the_server_hash_disagrees() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        // Right size, wrong content — exactly what a doubled slice looks like
+        // if DSM trims the partial back to X-FILE-SIZE.
+        mount_getinfo_size(&server, 2500).await;
+        mount_md5(&server, "00000000000000000000000000000000").await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "delete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("badhash.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        let err = client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+
+        let deleted = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
+        assert!(
+            deleted,
+            "the corrupt file is removed, not reported as success"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_accepts_a_result_it_cannot_verify() {
+        // DSM answering "no such API" is a verdict, not a hiccup: the appliance
+        // simply cannot hash for us. The upload itself succeeded and there is no
+        // evidence of harm, so that answer is accepted with a warning rather
+        // than turned into a failure — the documented residual risk of
+        // resending a slice. Contrast the unreachable case below.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 2500).await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("api", "SYNO.FileStation.MD5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 102}
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("noverify.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .expect("an unverifiable upload is not a failed one");
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_gives_up_after_the_attempt_bound() {
+        // Bounded, per the outer-retry contract: this client never spins on a
+        // slice forever.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("hopeless.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        let err = client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+        assert_eq!(
+            slice_posts(&server).await.len(),
+            3,
+            "one slice, three attempts, then the error surfaces"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    // ── SYNO.FileStation.MD5 ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn md5_polls_the_task_until_it_finishes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"taskid": "md5-7"}
+            })))
+            .mount(&server)
+            .await;
+        // DSM reads the file to answer, so the first status call says "not yet".
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"finished": false}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"finished": true, "md5": "d41d8cd98f00b204e9800998ecf8427e"}
+            })))
+            .mount(&server)
+            .await;
+
+        let digest = client_for(&server).md5("/share/big.bin").await.unwrap();
+        assert_eq!(digest, "d41d8cd98f00b204e9800998ecf8427e");
+
+        let taskids: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| {
+                r.url
+                    .query_pairs()
+                    .find(|(k, _)| k == "taskid")
+                    .map(|(_, v)| v.to_string())
+            })
+            .collect();
+        assert_eq!(
+            taskids,
+            vec!["md5-7", "md5-7"],
+            "both polls carry the task id start handed back"
+        );
+    }
+
+    #[tokio::test]
+    async fn md5_surfaces_an_api_error_rather_than_polling_forever() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 400}
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server).md5("/share/big.bin").await.unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(400)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn slice_upload_tolerates_a_size_that_settles() {
+        // The listing can lag a write DSM has just accepted — the same lag
+        // `clear_for_overwrite` polls through. A disagreement is confirmed
+        // before it costs the file, because the alternative is deleting a
+        // perfectly good upload.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{
+                    "name": "big.bin", "path": "/share/big.bin", "isdir": false,
+                    "additional": {"size": 1024, "owner": null, "time": null, "perm": null}
+                }]}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 2500).await;
+
+        let local = scratch_file("settles.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .expect("a listing that catches up is not a corrupt upload");
+
+        let deleted = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
+        assert!(!deleted, "a good upload is never deleted");
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_will_not_vouch_when_the_hash_check_cannot_run() {
+        // A hash check we could not *reach* is different from one DSM refused:
+        // it leaves us with a resend that may have doubled a slice and no way
+        // to tell. Report the failure rather than claim a verified write — but
+        // do not delete, because there is no evidence the file is bad and
+        // destroying a probably-good upload is the worse mistake. The caller's
+        // retry re-uploads over it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 2500).await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("api", "SYNO.FileStation.MD5"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("unreachable.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        let err = client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+
+        let deleted = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
+        assert!(
+            !deleted,
+            "an unverified file is kept; only a proven bad one goes"
+        );
         std::fs::remove_file(&local).ok();
     }
 }
