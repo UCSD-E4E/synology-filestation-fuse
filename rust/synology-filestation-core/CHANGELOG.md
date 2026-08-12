@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.3.0...synology-filestation-core-v0.3.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* **core:** stop the read timeout from killing large uploads ([da35f24](https://github.com/UCSD-E4E/synology-filestation/commit/da35f24c0475760e1612f6d11b2a2b5ffd4042db))
+* **core:** stop the read timeout from killing large uploads ([fd8c4ab](https://github.com/UCSD-E4E/synology-filestation/commit/fd8c4ab6d16d15ee72c2fe4a5c2ddb173270505d))
+* **core:** tighten upload verification after review ([2750f15](https://github.com/UCSD-E4E/synology-filestation/commit/2750f15d30668a16ae1df9b60d3041cd93a25a3a))
+
 ## [0.3.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.2.1...synology-filestation-core-v0.3.0) (2026-08-12)
 
 

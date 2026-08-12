@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.3.0...synology-filestation-fuse-v0.3.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* **fuse:** present mounted entries under local ownership, not DSM's ([c2f809c](https://github.com/UCSD-E4E/synology-filestation/commit/c2f809c15c05a89797c83b7fd377f1966e159159))
+* **fuse:** present mounted entries under local ownership, not DSM's ([2ccefd3](https://github.com/UCSD-E4E/synology-filestation/commit/2ccefd3c87205626b16c2b13e116e5f323c7c91f))
+* **fuse:** run file transfers off the FUSE event loop ([cadf83b](https://github.com/UCSD-E4E/synology-filestation/commit/cadf83b05af02fe1bd073944d43c31012464ec05))
+* **fuse:** run file transfers off the FUSE event loop ([8a1472b](https://github.com/UCSD-E4E/synology-filestation/commit/8a1472bc4578f42361140adde9648f785b7d93d5))
+
 ## [0.3.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.2.1...synology-filestation-fuse-v0.3.0) (2026-08-12)
 
 
