@@ -180,6 +180,19 @@ impl<T: ?Sized> TransportEntry<T> {
 /// file in a `Vec<u8>`, so we slice anything that exceeds one slice.
 pub const DEFAULT_SLICE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Entries requested per `list` / `list_share` page.
+///
+/// DSM caps what one response may carry, so a directory larger than this needs
+/// several requests. Kept modest rather than maximal: a page is parsed whole, so
+/// this trades one extra round trip on very large directories for a bounded
+/// per-response allocation.
+pub const LIST_PAGE_SIZE: usize = 1000;
+
+/// Ceiling on pages fetched for a single listing, so a server that reports an
+/// unreachable `total` (or keeps handing back full pages) cannot spin us
+/// forever. At [`LIST_PAGE_SIZE`] this covers 10M entries in one directory.
+const LIST_MAX_PAGES: usize = 10_000;
+
 /// Upload progress sink: `(bytes_done, bytes_total)`, called once per slice.
 /// Borrowed rather than boxed so callers can pass a plain closure reference.
 pub type ProgressSink<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
@@ -584,67 +597,102 @@ impl SynologyClient {
         Ok(())
     }
 
+    /// Fetch a `SYNO.FileStation.List` listing in full, following pagination.
+    ///
+    /// A single request only ever returns one page, so asking once and keeping
+    /// whatever came back silently truncates any directory bigger than the
+    /// limit — and a filesystem that omits files is worse than one that errors.
+    /// This keeps requesting at increasing offsets until the server says it is
+    /// done, which it signals either by reporting a `total` we have reached or
+    /// by handing back a partial (or empty) page.
+    async fn list_paged<T, F>(
+        &self,
+        method: &str,
+        extra_params: &[(&str, &str)],
+        additional: &str,
+        label: &str,
+        unpack: F,
+    ) -> Result<Vec<SynoFileInfo>, SynoFsError>
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn(T) -> (Vec<SynoFileInfo>, Option<u64>),
+    {
+        let url = format!("{}/entry.cgi", self.base_url);
+        let sid = self.sid();
+        let limit = LIST_PAGE_SIZE.to_string();
+        let mut collected: Vec<SynoFileInfo> = Vec::new();
+
+        for _ in 0..LIST_MAX_PAGES {
+            let offset = collected.len().to_string();
+            let mut params: Vec<(&str, &str)> = vec![
+                ("api", "SYNO.FileStation.List"),
+                ("version", "2"),
+                ("method", method),
+            ];
+            params.extend_from_slice(extra_params);
+            params.push(("additional", additional));
+            params.push(("limit", &limit));
+            params.push(("offset", &offset));
+            params.push(("_sid", &sid));
+
+            let text = self.get_text_retried(&url, &params).await?;
+            let resp: SynoResponse<T> = serde_json::from_str(&text)
+                .map_err(|e| SynoFsError::Io(format!("{label} parse error: {e}")))?;
+            if !resp.success {
+                let code = resp.error.map(|e| e.code).unwrap_or(0);
+                return Err(SynoFsError::ApiError(code));
+            }
+
+            let (page, total) = match resp.data {
+                Some(d) => unpack(d),
+                None => (Vec::new(), None),
+            };
+            let page_len = page.len();
+            collected.extend(page);
+
+            let done = page_len == 0
+                || page_len < LIST_PAGE_SIZE
+                || total.is_some_and(|t| collected.len() as u64 >= t);
+            if done {
+                debug!("{label}: {} entries", collected.len());
+                return Ok(collected);
+            }
+        }
+
+        // Only reachable from a server that keeps handing back full pages
+        // without ever satisfying its own `total`. Return what we have rather
+        // than looping, but say so — a short listing must never look normal.
+        warn!(
+            "{label}: stopped at the {LIST_MAX_PAGES}-page cap with {} entries; listing may be incomplete",
+            collected.len()
+        );
+        Ok(collected)
+    }
+
     /// List all FileStation shares the account can see.
     pub async fn list_shares(&self) -> Result<Vec<SynoFileInfo>, SynoFsError> {
-        let url = format!("{}/entry.cgi", self.base_url);
         debug!("list_shares");
-        let text = self
-            .get_text_retried(
-                &url,
-                &[
-                    ("api", "SYNO.FileStation.List"),
-                    ("version", "2"),
-                    ("method", "list_share"),
-                    ("additional", SHARE_ADDITIONAL_FIELDS),
-                    ("limit", "500"),
-                    ("offset", "0"),
-                    ("_sid", &self.sid()),
-                ],
-            )
-            .await?;
-
-        let resp: SynoResponse<ListShareData> = serde_json::from_str(&text)
-            .map_err(|e| SynoFsError::Io(format!("list_shares parse error: {e}")))?;
-
-        if resp.success {
-            let shares = resp.data.map(|d| d.shares).unwrap_or_default();
-            debug!("list_shares: {} shares returned", shares.len());
-            Ok(shares)
-        } else {
-            let code = resp.error.map(|e| e.code).unwrap_or(0);
-            Err(SynoFsError::ApiError(code))
-        }
+        self.list_paged::<ListShareData, _>(
+            "list_share",
+            &[],
+            SHARE_ADDITIONAL_FIELDS,
+            "list_shares",
+            |d| (d.shares, d.total),
+        )
+        .await
     }
 
     /// List the contents of a directory.
     pub async fn list_dir(&self, folder_path: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
-        let url = format!("{}/entry.cgi", self.base_url);
         debug!("list_dir: {}", folder_path);
-        let text = self
-            .get_text_retried(
-                &url,
-                &[
-                    ("api", "SYNO.FileStation.List"),
-                    ("version", "2"),
-                    ("method", "list"),
-                    ("folder_path", folder_path),
-                    ("additional", ADDITIONAL_FIELDS),
-                    ("limit", "5000"),
-                    ("offset", "0"),
-                    ("_sid", &self.sid()),
-                ],
-            )
-            .await?;
-
-        let resp: SynoResponse<ListData> = serde_json::from_str(&text)
-            .map_err(|e| SynoFsError::Io(format!("list_dir parse error: {e}")))?;
-
-        if resp.success {
-            Ok(resp.data.map(|d| d.files).unwrap_or_default())
-        } else {
-            let code = resp.error.map(|e| e.code).unwrap_or(0);
-            Err(SynoFsError::ApiError(code))
-        }
+        self.list_paged::<ListData, _>(
+            "list",
+            &[("folder_path", folder_path)],
+            ADDITIONAL_FIELDS,
+            "list_dir",
+            |d| (d.files, d.total),
+        )
+        .await
     }
 
     /// Get metadata for a single file or directory.
@@ -1199,15 +1247,23 @@ impl SynologyClient {
             data.len()
         );
 
-        if overwrite {
-            self.clear_for_overwrite(folder_path, filename).await;
-        }
-
         let max_attempts = self.max_transfer_attempts();
         let mut last_err = SynoFsError::Io("no attempts".into());
         for attempt in 0..max_attempts {
             if attempt > 0 {
                 debug!("upload retry {} for {}/{}", attempt, folder_path, filename);
+            }
+
+            // Re-clear on *every* attempt, not once up front. Both upload paths
+            // always POST with `overwrite=false` (DSM's multipart overwrite
+            // times out on some versions), so an attempt only succeeds onto
+            // cleared ground. A previous attempt whose response was lost may
+            // well have landed the file — retrying without re-clearing would
+            // then get 418 and report a write that *succeeded* as
+            // AlreadyExists. Re-clearing is also what makes retrying an upload
+            // safe at all.
+            if overwrite {
+                self.clear_for_overwrite(folder_path, filename).await;
             }
 
             let file_part = multipart::Part::bytes(data.clone())
@@ -1231,6 +1287,9 @@ impl SynologyClient {
 
             // Hold a transfer slot only for the request+response read; drop it
             // before any backoff so a retrying upload doesn't hog a permit.
+            // `Ok(text)` = a 2xx body to parse; `Err(e)` = retry this attempt.
+            // A non-transient HTTP status returns immediately: the server gave
+            // a definitive refusal, and resending the same request cannot help.
             let text = {
                 let _slot = self.acquire_transfer_slot().await;
                 match self
@@ -1241,8 +1300,20 @@ impl SynologyClient {
                     .send()
                     .await
                 {
-                    Ok(r) => r.text().await.map_err(SynoFsError::from),
-                    Err(e) => Err(e.into()),
+                    Err(e) => Err(SynoFsError::from(e)),
+                    Ok(r) => {
+                        let status = r.status();
+                        if status.is_success() {
+                            r.text().await.map_err(SynoFsError::from)
+                        } else {
+                            let err = SynoFsError::Io(format!("upload HTTP {}", status));
+                            if http_status_is_transient(status) {
+                                Err(err)
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                    }
                 }
             };
 
@@ -1607,6 +1678,158 @@ mod tests {
         assert!(files.is_empty());
     }
 
+    // ── list pagination ──────────────────────────────────────────────────────
+
+    /// Build a `list`/`list_share` page: `count` synthetic entries plus the
+    /// server-reported `total` for the whole directory.
+    fn page_body(
+        key: &str,
+        prefix: &str,
+        start: usize,
+        count: usize,
+        total: usize,
+    ) -> serde_json::Value {
+        let entries: Vec<serde_json::Value> = (start..start + count)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("f{i}"),
+                    "path": format!("{prefix}/f{i}"),
+                    "isdir": false,
+                    "additional": null
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "success": true,
+            "data": { "total": total, "offset": start, key: entries }
+        })
+    }
+
+    /// Regression: `list_dir` sent a single request with a hardcoded limit and
+    /// `offset=0`, then returned whatever came back. A directory with more
+    /// entries than one page was silently listed short — through FUSE that
+    /// presents as files that simply do not exist. Every page must be fetched.
+    #[tokio::test]
+    async fn list_dir_pages_until_the_server_total_is_reached() {
+        let server = MockServer::start().await;
+        let page = LIST_PAGE_SIZE;
+        let total = page + 37;
+
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list"))
+            .and(query_param("offset", "0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page_body("files", "/share", 0, page, total)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list"))
+            .and(query_param("offset", page.to_string().as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page_body("files", "/share", page, 37, total)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let files = client.list_dir("/share").await.unwrap();
+        assert_eq!(files.len(), total, "every page must be collected");
+        assert_eq!(files[0].name, "f0");
+        assert_eq!(files[total - 1].name, format!("f{}", total - 1));
+    }
+
+    /// Same defect on the share listing, which had an even smaller cap (500).
+    #[tokio::test]
+    async fn list_shares_pages_until_the_server_total_is_reached() {
+        let server = MockServer::start().await;
+        let page = LIST_PAGE_SIZE;
+        let total = page + 5;
+
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list_share"))
+            .and(query_param("offset", "0"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(page_body("shares", "", 0, page, total)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list_share"))
+            .and(query_param("offset", page.to_string().as_str()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(page_body("shares", "", page, 5, total)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let shares = client.list_shares().await.unwrap();
+        assert_eq!(shares.len(), total);
+    }
+
+    /// A directory that fits in one page must still cost exactly one request —
+    /// paging must not add a speculative second round trip to every listing.
+    #[tokio::test]
+    async fn list_dir_stops_after_a_short_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(page_body("files", "/share", 0, 3, 3)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let files = client.list_dir("/share").await.unwrap();
+        assert_eq!(files.len(), 3);
+        // `expect(1)` is asserted when the server drops at end of scope.
+    }
+
+    /// A server that reports a `total` it never delivers (or keeps returning
+    /// full pages forever) must not spin the client indefinitely: paging stops
+    /// as soon as a page comes back empty.
+    #[tokio::test]
+    async fn list_dir_stops_when_a_page_comes_back_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page_body(
+                "files",
+                "/share",
+                0,
+                LIST_PAGE_SIZE,
+                999_999,
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list"))
+            .and(query_param("offset", LIST_PAGE_SIZE.to_string().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"total": 999_999, "files": []}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let files = client.list_dir("/share").await.unwrap();
+        assert_eq!(files.len(), LIST_PAGE_SIZE);
+    }
+
     // ── get_info ─────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1794,6 +2017,87 @@ mod tests {
             .upload("/share", "test.txt", b"new content".to_vec(), true)
             .await
             .unwrap();
+    }
+
+    /// Regression: `clear_for_overwrite` used to run *once*, before the retry
+    /// loop. An overwrite that had to be retried therefore re-POSTed with
+    /// `overwrite=false` onto ground that was no longer clear — if the first
+    /// attempt actually landed on the NAS before the response was lost, DSM
+    /// answered 418 and a write that had *succeeded* was reported as
+    /// AlreadyExists. Each attempt must start from cleared ground.
+    #[tokio::test]
+    async fn overwrite_upload_reclears_the_destination_before_each_retry() {
+        let server = MockServer::start().await;
+
+        // The delete must happen once per upload attempt, not once per call.
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "delete"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": false, "error": {"code": 414}})),
+            )
+            .mount(&server)
+            .await;
+
+        // First attempt: the backend is degraded (the shape that leaves a write
+        // possibly-applied but unacknowledged). Second attempt: fine.
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": true, "data": {"blks": null}})),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client
+            .upload("/share", "test.txt", b"new content".to_vec(), true)
+            .await
+            .expect("a retried overwrite must succeed, not report AlreadyExists");
+        // `expect(2)` on the delete mock is asserted when the server drops.
+    }
+
+    /// The retry above is only safe because each attempt re-clears; it must not
+    /// widen into retrying a *definitive* refusal. A 400 is the server telling
+    /// us the request itself is wrong — resending it cannot help.
+    #[tokio::test]
+    async fn upload_does_not_retry_a_permanent_http_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        let err = client
+            .upload("/share", "test.txt", b"data".to_vec(), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SynoFsError::Io(ref m) if m.contains("400")),
+            "expected a permanent HTTP error, got {err:?}"
+        );
     }
 
     // ── delete ───────────────────────────────────────────────────────────────

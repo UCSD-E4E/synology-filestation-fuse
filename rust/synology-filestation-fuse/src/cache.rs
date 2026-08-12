@@ -2,7 +2,7 @@ use bytes::Bytes;
 use moka::sync::Cache;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use synology_filestation_core::types::{InodeEntry, SynoFileInfo};
 
 #[cfg(test)]
@@ -155,6 +155,12 @@ impl InodeCache {
 /// Size of each cached block in bytes (256 KiB).
 pub const READ_BLOCK_SIZE: u64 = 256 * 1024;
 
+/// How long a reader waits on somebody else's in-flight block before giving up
+/// and reporting failure. Comfortably longer than a slow block download (the
+/// core's own request timeout is 30 s) but finite, so a claim that is never
+/// released cannot wedge a FUSE worker thread for the life of the mount.
+pub const BLOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A cache of file data split into fixed-size blocks.
 ///
 /// Key: `(ino, block_index)` — `block_index = byte_offset / READ_BLOCK_SIZE`.
@@ -221,13 +227,38 @@ impl ReadCache {
     /// Spin-wait (5 ms polls) until the block appears in cache or the
     /// in-flight marker is gone (meaning the download failed).
     /// Returns the cached bytes on success, `None` on failure.
+    ///
+    /// Bounded by [`BLOCK_WAIT_TIMEOUT`]: the owner of an in-flight claim is
+    /// responsible for clearing it, but a task that dies without doing so (a
+    /// panicking prefetch, a runtime shut down mid-download) would otherwise
+    /// strand every waiter here forever — and these waiters are FUSE worker
+    /// threads, so the whole mount stops answering. Giving up returns `None`,
+    /// which the caller already handles as "that download failed".
     pub fn wait_for_block(&self, ino: u64, block_idx: u64) -> Option<Bytes> {
+        self.wait_for_block_until(ino, block_idx, BLOCK_WAIT_TIMEOUT)
+    }
+
+    /// [`wait_for_block`](Self::wait_for_block) with an explicit deadline, so
+    /// the timeout path is testable without stalling the suite.
+    fn wait_for_block_until(&self, ino: u64, block_idx: u64, timeout: Duration) -> Option<Bytes> {
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(data) = self.blocks.get(&(ino, block_idx)) {
                 return Some(data);
             }
             if !self.in_flight.lock().unwrap().contains(&(ino, block_idx)) {
                 // Download finished (or failed) without populating the cache.
+                return self.blocks.get(&(ino, block_idx));
+            }
+            if Instant::now() >= deadline {
+                // The claim owner never published a block and never released the
+                // claim. Drop the stale marker so the next reader re-downloads
+                // instead of inheriting the same dead wait.
+                self.in_flight.lock().unwrap().remove(&(ino, block_idx));
+                tracing::warn!(
+                    "read cache: abandoned in-flight block ino={ino} idx={block_idx} after {:?}",
+                    timeout
+                );
                 return self.blocks.get(&(ino, block_idx));
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -456,6 +487,62 @@ mod tests {
 
         let result = handle.join().unwrap();
         assert_eq!(result, Some(Bytes::new()));
+    }
+
+    /// Regression: the claim owner can die without ever publishing the block or
+    /// releasing the claim (a panicking prefetch task, a runtime torn down
+    /// mid-download). Before this bound, every waiter looped on a 5 ms sleep
+    /// forever — and the waiters are FUSE worker threads, so the mount stopped
+    /// answering entirely. The wait must give up and report failure.
+    #[test]
+    fn wait_for_block_gives_up_on_an_abandoned_claim() {
+        let rc = ReadCache::new(1024, 16);
+        assert!(rc.claim_inflight(1, 0));
+        // Nobody will ever insert() or cancel_inflight() — the owner is gone.
+        let start = Instant::now();
+        let result = rc.wait_for_block_until(1, 0, Duration::from_millis(50));
+        assert!(result.is_none(), "an abandoned claim must not yield data");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "wait must be bounded, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Giving up must also clear the stale marker, otherwise the next reader
+    /// inherits the same dead claim and waits out the timeout all over again
+    /// instead of just downloading the block.
+    #[test]
+    fn abandoning_a_claim_frees_it_for_the_next_reader() {
+        let rc = ReadCache::new(1024, 16);
+        assert!(rc.claim_inflight(2, 7));
+        assert!(rc
+            .wait_for_block_until(2, 7, Duration::from_millis(50))
+            .is_none());
+        assert!(
+            rc.claim_inflight(2, 7),
+            "the abandoned claim must be released so a fresh download can start"
+        );
+    }
+
+    /// The bound must not cut short a download that is merely slow: a block
+    /// published before the deadline is still returned.
+    #[test]
+    fn wait_for_block_still_returns_a_slow_but_successful_download() {
+        let rc = Arc::new(ReadCache::new(1024, 16));
+        assert!(rc.claim_inflight(3, 0));
+
+        let rc2 = rc.clone();
+        let handle =
+            std::thread::spawn(move || rc2.wait_for_block_until(3, 0, Duration::from_secs(30)));
+
+        std::thread::sleep(Duration::from_millis(30));
+        rc.insert(3, 0, Bytes::from_static(b"slow payload"));
+
+        assert_eq!(
+            handle.join().unwrap(),
+            Some(Bytes::from_static(b"slow payload"))
+        );
     }
 
     #[test]
