@@ -19,6 +19,10 @@ use std::sync::Arc;
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 
+/// Default umask for the synthetic mode the Linux backend reports, matching the
+/// 0o755 directories / 0o644 files a process with the usual umask creates.
+pub const DEFAULT_UMASK: u16 = 0o022;
+
 #[cfg(target_os = "linux")]
 mod cache;
 #[cfg(target_os = "linux")]
@@ -49,6 +53,16 @@ pub struct MountOptions {
     /// kernel receive buffer, which is why this is a small number rather than
     /// "as many as possible".
     pub io_threads: usize,
+    /// Owner reported for every entry (Linux only). `None` means the mounting
+    /// user. DSM's own uids are deliberately never used: they name accounts on
+    /// the appliance, not on this machine.
+    pub uid: Option<u32>,
+    /// Group reported for every entry (Linux only). `None` means the mounting
+    /// user's group.
+    pub gid: Option<u32>,
+    /// Masked out of the synthetic mode (Linux only), as a process umask would
+    /// be: the default 0o022 yields 0o755 directories and 0o644 files.
+    pub umask: u16,
 }
 
 impl Default for MountOptions {
@@ -57,6 +71,9 @@ impl Default for MountOptions {
             cache_ttl: 30,
             read_cache_mb: 256,
             io_threads: 0,
+            uid: None,
+            gid: None,
+            umask: DEFAULT_UMASK,
         }
     }
 }
@@ -205,6 +222,13 @@ pub fn spawn_mount(
     let read_cache = Arc::new(ReadCache::new(READ_BLOCK_SIZE, max_blocks.max(1)));
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
+    // DSM's uids and POSIX bits describe the appliance, not this machine, so
+    // the mount presents everything under local identifiers instead.
+    let owner = fs::Ownership {
+        uid: opts.uid.unwrap_or(uid),
+        gid: opts.gid.unwrap_or(gid),
+        umask: opts.umask,
+    };
 
     info!(
         "Read cache: {} MiB ({} blocks × {} MiB)",
@@ -213,7 +237,7 @@ pub fn spawn_mount(
         READ_BLOCK_SIZE / (1024 * 1024)
     );
 
-    let fs = SynologyFS::new(client.clone(), cache, read_cache, rt, uid, gid);
+    let fs = SynologyFS::new(client.clone(), cache, read_cache, rt, owner);
 
     // As a non-root user, allow_other requires `user_allow_other` in
     // /etc/fuse.conf; running as root always permits it.

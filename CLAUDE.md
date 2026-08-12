@@ -225,6 +225,7 @@ MVVM pattern (Avalonia). The GUI calls the Rust core **directly via the FFI cdyl
 - Write buffers are held entirely in memory until file close
 - No symlinks, hard links, or special files
 - Linux: inode numbers are not stable; permissions/timestamps are read-only
+- Linux: ownership and mode are **synthetic** — every entry is reported as owned by the mounting user (`--uid`/`--gid`) with a `--umask`-derived mode, because DSM's uids and POSIX bits describe accounts on the appliance, not on this machine. Exporting them verbatim made GIO report `access::can-delete: FALSE` (see `fs::Ownership`). What the account may actually do is still enforced by DSM per call
 
 ## Release Process
 
