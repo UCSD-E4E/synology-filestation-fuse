@@ -80,6 +80,34 @@ df = pd.read_csv(
 
 Both sync and async fsspec APIs are supported — `fs._cat_file(path)` returns an awaitable; `fs.cat_file(path)` is the auto-generated sync wrapper.
 
+## TLS certificates
+
+The NAS certificate is verified by default. A DSM appliance ships with a
+self-signed certificate, so a stock NAS will be rejected until you either
+install its certificate in the system trust store or opt out explicitly:
+
+```python
+from synology_filestation import Client, TlsError
+
+try:
+    nas = Client.login("nas.example.com", 5001, "alice", "secret")
+except TlsError:
+    # Encrypted, but not authenticated: anything able to intercept the
+    # connection can present its own certificate and read the password.
+    nas = Client.login(
+        "nas.example.com", 5001, "alice", "secret", verify_ssl=False
+    )
+```
+
+`verify_ssl=False` is also accepted by `AsyncClient.login` and as an fsspec
+`storage_options` key. `TlsError` subclasses `TransportError`, so existing
+`except TransportError` handlers keep working.
+
+Before this option existed the client accepted *any* certificate
+unconditionally, which made `https=True` encryption without authentication.
+Upgrading will surface `TlsError` on a self-signed NAS that previously
+connected silently — that is the fix working, not a regression.
+
 ## Throttling & reliability
 
 The FileStation Download API is proxied through `nginx → synoscgi`, a shared

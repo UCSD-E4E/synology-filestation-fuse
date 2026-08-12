@@ -56,6 +56,10 @@ pub enum SynoStatus {
     Panic = 13,
     /// DSM session id expired or unknown (DSM code 119).
     SidNotFound = 14,
+    /// The NAS's TLS certificate could not be verified. Distinct from `Io` so
+    /// the GUI can offer "accept self-signed certificate" rather than showing a
+    /// generic transport error.
+    TlsError = 15,
 }
 
 /// Out-param filled on error. `message` is a heap UTF-8 C string owned by the
@@ -74,6 +78,14 @@ pub struct SynoError {
 fn classify(err: &SynoFsError) -> (SynoStatus, u32) {
     use synology_filestation_core::error::ErrorCategory as C;
     use SynoStatus as S;
+
+    // A rejected TLS certificate gets its own status ahead of everything else:
+    // it is the one transport failure with a specific, actionable remedy (trust
+    // the certificate, or tick "accept self-signed"), and the GUI can only
+    // offer that if it can tell this case apart from a generic I/O error.
+    if err.is_tls_error() {
+        return (S::TlsError, 0);
+    }
 
     // A failed (re)login always presents as LoginFailed, but we preserve the
     // underlying DSM code on `dsm_code` so callers can inspect what failed.
@@ -246,6 +258,10 @@ pub unsafe extern "C" fn syno_connect(
     password: *const c_char,
     otp: *const c_char,
     auto_relogin: bool,
+    // When false, accept any TLS certificate. A DSM appliance ships self-signed,
+    // so the GUI exposes this as a per-connection checkbox — but it makes the
+    // connection encrypted without being authenticated, so it is opt-in.
+    verify_ssl: bool,
     out: *mut *mut SynoClient,
     err: *mut SynoError,
 ) -> i32 {
@@ -271,6 +287,11 @@ pub unsafe extern "C" fn syno_connect(
             SynologyClient::with_auto_relogin(host, port, https)
         } else {
             SynologyClient::new(host, port, https)
+        };
+        let client = if verify_ssl {
+            client
+        } else {
+            client.with_insecure_tls()
         };
 
         // Default-on throttle for the FFI/GUI consumer: cap concurrency and
@@ -914,7 +935,7 @@ mod tests {
     fn connect_then_list_shares() {
         let (_rt, server) = server_with(async {
             let server = MockServer::start().await;
-            Mock::given(method("GET"))
+            Mock::given(method("POST"))
                 .and(path("/webapi/auth.cgi"))
                 .respond_with(login_ok())
                 .mount(&server)
@@ -942,6 +963,7 @@ mod tests {
                 cstr("secret").as_ptr(),
                 ptr::null(),
                 false,
+                true,
                 &mut client,
                 &mut err,
             );
@@ -966,7 +988,7 @@ mod tests {
     fn connect_reports_otp_required() {
         let (_rt, server) = server_with(async {
             let server = MockServer::start().await;
-            Mock::given(method("GET"))
+            Mock::given(method("POST"))
                 .and(path("/webapi/auth.cgi"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "success": false, "error": {"code": 403}
@@ -988,6 +1010,7 @@ mod tests {
                 cstr("secret").as_ptr(),
                 ptr::null(),
                 false,
+                true,
                 &mut client,
                 &mut err,
             );
@@ -1001,7 +1024,7 @@ mod tests {
     fn connect_bad_credentials_is_login_failed() {
         let (_rt, server) = server_with(async {
             let server = MockServer::start().await;
-            Mock::given(method("GET"))
+            Mock::given(method("POST"))
                 .and(path("/webapi/auth.cgi"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "success": false, "error": {"code": 400}
@@ -1023,6 +1046,7 @@ mod tests {
                 cstr("wrong").as_ptr(),
                 ptr::null(),
                 false,
+                true,
                 &mut client,
                 &mut err,
             );
@@ -1036,7 +1060,7 @@ mod tests {
     fn dsm_119_classifies_as_sid_not_found() {
         let (_rt, server) = server_with(async {
             let server = MockServer::start().await;
-            Mock::given(method("GET"))
+            Mock::given(method("POST"))
                 .and(path("/webapi/auth.cgi"))
                 .respond_with(login_ok())
                 .mount(&server)
@@ -1064,6 +1088,7 @@ mod tests {
                 cstr("secret").as_ptr(),
                 ptr::null(),
                 false,
+                true,
                 &mut client,
                 &mut err,
             );

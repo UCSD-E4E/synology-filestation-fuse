@@ -79,6 +79,30 @@ impl SynoFsError {
         }
     }
 
+    /// Whether this looks like a TLS certificate rejection, so a consumer can
+    /// tell the user about the `--insecure` escape hatch instead of printing a
+    /// bare transport error they cannot act on.
+    ///
+    /// A heuristic on the message, because `From<reqwest::Error>` flattens the
+    /// whole transport failure into [`SynoFsError::Io`] and there is no kind to
+    /// match on. It is pinned by a test that runs a real handshake against a
+    /// real self-signed certificate, so it tracks the actual string rustls
+    /// produces rather than a guess at it.
+    pub fn is_tls_error(&self) -> bool {
+        match self {
+            Self::Io(msg) => {
+                let m = msg.to_ascii_lowercase();
+                m.contains("certificate")
+                    || m.contains("tls")
+                    || m.contains("invalid peer")
+                    || m.contains("unknownissuer")
+                    || m.contains("self-signed")
+            }
+            Self::LoginFailed(inner) => inner.is_tls_error(),
+            _ => false,
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub fn to_errno(&self) -> i32 {
         // A failed (re)login is always a permission/auth problem to the kernel,
@@ -126,8 +150,37 @@ impl std::error::Error for SynoFsError {}
 
 impl From<reqwest::Error> for SynoFsError {
     fn from(e: reqwest::Error) -> Self {
-        Self::Io(e.to_string())
+        // reqwest's own Display is just "error sending request for url (…)" —
+        // what actually went wrong (TLS handshake rejected, connection refused,
+        // DNS failure) is one or more levels down the source chain. Flattening
+        // it in is the difference between a user seeing "certificate is not
+        // trusted by the operating system" and seeing nothing they can act on.
+        //
+        // Redacted here, on the way in, rather than at each place the message is
+        // shown: once the string is inside the error it gets logged, wrapped,
+        // returned across the FFI and raised as a Python exception, and only one
+        // of those paths would remember to scrub it. reqwest embeds the full
+        // request URL — query string included — so without this every transport
+        // failure publishes the session id.
+        Self::Io(crate::redact::redact_secrets(&flatten_sources(&e)))
     }
+}
+
+/// Render an error together with its whole `source()` chain, `outer: inner: …`.
+fn flatten_sources(err: &dyn std::error::Error) -> String {
+    let mut msg = err.to_string();
+    let mut src = err.source();
+    while let Some(s) = src {
+        let text = s.to_string();
+        // Skip links that just restate their parent (reqwest wraps some errors
+        // in a same-message shell).
+        if !msg.ends_with(&text) {
+            msg.push_str(": ");
+            msg.push_str(&text);
+        }
+        src = s.source();
+    }
+    msg
 }
 
 impl From<serde_json::Error> for SynoFsError {

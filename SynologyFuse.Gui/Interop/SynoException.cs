@@ -34,3 +34,18 @@ public sealed class OtpRequiredException : SynoException
     {
     }
 }
+
+/// <summary>
+/// Raised when the NAS's TLS certificate could not be verified. Distinct from a
+/// generic <see cref="SynoException"/> because it has a specific remedy: trust
+/// the certificate, or tick "Accept self-signed certificate". A DSM appliance
+/// ships self-signed, so this is the expected first-connect experience for many
+/// users and the message needs to say what to do about it.
+/// </summary>
+public sealed class TlsVerificationException : SynoException
+{
+    internal TlsVerificationException(string message)
+        : base(NativeMethods.SynoStatus.TlsError, 0, message)
+    {
+    }
+}

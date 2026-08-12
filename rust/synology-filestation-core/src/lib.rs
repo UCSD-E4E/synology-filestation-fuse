@@ -7,6 +7,7 @@
 
 pub mod client;
 pub mod error;
+pub mod redact;
 pub mod transport;
 pub mod types;
 

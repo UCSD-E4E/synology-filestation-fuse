@@ -36,6 +36,7 @@ internal static partial class NativeMethods
         NullArg = 12,
         Panic = 13,
         SidNotFound = 14,
+        TlsError = 15,
     }
 
     /// <summary>Blittable mirror of the Rust <c>SynoError</c> struct.</summary>
@@ -62,6 +63,7 @@ internal static partial class NativeMethods
         string host, ushort port, [MarshalAs(UnmanagedType.U1)] bool https,
         string username, string password, string? otp,
         [MarshalAs(UnmanagedType.U1)] bool autoRelogin,
+        [MarshalAs(UnmanagedType.U1)] bool verifySsl,
         out IntPtr outClient, ref NativeError err);
 
     [LibraryImport(Lib)]

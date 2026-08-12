@@ -170,15 +170,24 @@ impl SpillBuffer {
         // name plus create+truncate is how you end up destroying somebody
         // else's file — or, through a symlink they planted, a file of their
         // choosing.
+        //
+        // 0600 for the same reason in the other direction: this file holds the
+        // full contents of whatever the user is writing to the NAS, sitting in
+        // a directory every local account can read. The default umask would
+        // leave it 0644. (umask only clears bits, so requesting 0600 cannot be
+        // widened by it.)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+
         let mut last_err = None;
         for attempt in 0..SPILL_NAME_ATTEMPTS {
             let path = temp_path(self.seq, attempt);
-            match std::fs::OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&path)
-            {
+            match opts.open(&path) {
                 Ok(mut file) => {
                     file.write_all(&existing)?;
                     self.store = Store::Spilled { file, path };
@@ -400,6 +409,25 @@ mod tests {
         assert_ne!(pa, pb, "two live buffers must not share a temp file");
         assert_eq!(std::fs::read(&pa).unwrap(), vec![1u8; 16]);
         assert_eq!(std::fs::read(&pb).unwrap(), vec![2u8; 16]);
+    }
+
+    /// Regression: the spill file was created with the process umask (0644 on a
+    /// typical desktop) in a world-readable temp directory. Every file over the
+    /// spill threshold written through the mount was therefore readable by any
+    /// other local user for the duration of the copy. The existing care around
+    /// not *clobbering* a planted file said nothing about who can read ours.
+    #[cfg(unix)]
+    #[test]
+    fn spilled_temp_file_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut b = SpillBuffer::with_spill_at(4);
+        b.write_at(0, b"confidential payload large enough to spill")
+            .unwrap();
+        let path = b.spilled_path().unwrap().unwrap().to_path_buf();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "spill file must be owner-only, got {mode:04o}");
     }
 
     #[test]

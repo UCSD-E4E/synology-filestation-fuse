@@ -30,6 +30,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _username = s.Username;
         _port = s.Port;
         _useHttps = s.UseHttps;
+        _verifySsl = s.VerifySsl;
         _mountpoint = s.Mountpoint;
         _cacheTtl = s.CacheTtl;
         _readCacheMb = s.ReadCacheMb;
@@ -78,6 +79,11 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 
     [ObservableProperty]
     private bool _useHttps;
+
+    /// <summary>Verify the NAS TLS certificate. Unticking this accepts any
+    /// certificate: encrypted, but not authenticated.</summary>
+    [ObservableProperty]
+    private bool _verifySsl = true;
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(ConnectCommand))]
@@ -308,6 +314,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         Password = Password,
         Port = (ushort)Port,
         UseHttps = UseHttps,
+        VerifySsl = VerifySsl,
         Mountpoint = Mountpoint,
         CacheTtl = (ulong)CacheTtl,
         ReadCacheMb = (ulong)ReadCacheMb,
@@ -320,6 +327,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         Username = Username,
         Port = Port,
         UseHttps = UseHttps,
+        VerifySsl = VerifySsl,
         Mountpoint = Mountpoint,
         CacheTtl = CacheTtl,
         ReadCacheMb = ReadCacheMb,

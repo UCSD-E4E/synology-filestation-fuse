@@ -250,6 +250,15 @@ class TestSyncGetPut:
         # fsspec's high-level `get` calls `_isdir(rpath)` (which calls
         # `info()` → DSM getinfo) before dispatching to `_get_file`. So
         # two server roundtrips: getinfo first, then download.
+        #
+        # Login also settles how the session id travels (cookie vs `_sid`) with
+        # one probe call to list_share, and that lands on entry.cgi before
+        # either of them. Oneshot handlers are consumed in registration order,
+        # so the probe response has to be registered first or it would eat the
+        # getinfo response below.
+        httpserver.expect_oneshot_request("/webapi/entry.cgi").respond_with_json(
+            {"success": True, "data": {"total": 0, "shares": []}}
+        )
         httpserver.expect_oneshot_request("/webapi/entry.cgi").respond_with_json(
             {
                 "success": True,

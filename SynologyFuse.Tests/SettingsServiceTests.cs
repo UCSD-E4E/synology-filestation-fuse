@@ -31,7 +31,42 @@ public class SettingsServiceTests : IDisposable
         Assert.Equal("", s.Username);
         Assert.Equal(5001m, s.Port);
         Assert.True(s.UseHttps);
+        Assert.True(s.VerifySsl);
         Assert.Equal("info", s.LogLevel);
+    }
+
+    /// <summary>
+    /// A settings.json written before certificate verification existed has no
+    /// "VerifySsl" key. It must load as verifying — <c>default(bool)</c> is
+    /// false, which would silently leave upgraded users on the insecure path
+    /// that this option exists to end.
+    /// </summary>
+    [Fact]
+    public void Load_JsonPredatingTheOption_DefaultsToVerifying()
+    {
+        File.WriteAllText(_path, """
+        {
+          "Host": "nas.local",
+          "Username": "alice",
+          "Port": 5001,
+          "UseHttps": true,
+          "Mountpoint": "/mnt/nas",
+          "LogLevel": "info"
+        }
+        """);
+
+        var s = SettingsService.Load(_path);
+
+        Assert.Equal("nas.local", s.Host);
+        Assert.True(s.VerifySsl, "an upgraded settings file must not silently disable verification");
+    }
+
+    [Fact]
+    public void SaveThenLoad_RoundTripsVerifySsl()
+    {
+        SettingsService.Save(new PersistedSettings { Host = "nas.local", VerifySsl = false }, _path);
+
+        Assert.False(SettingsService.Load(_path).VerifySsl);
     }
 
     [Fact]

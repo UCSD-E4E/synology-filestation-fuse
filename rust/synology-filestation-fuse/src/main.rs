@@ -26,6 +26,17 @@ struct Args {
     #[arg(long, default_value_t = true)]
     https: bool,
 
+    /// Accept any TLS certificate, including self-signed, expired, or
+    /// wrong-hostname ones.
+    ///
+    /// A DSM appliance ships with a self-signed certificate, so this is often
+    /// needed — but it means the encrypted connection is not authenticated:
+    /// anything able to intercept it can present its own certificate and read
+    /// your password. Prefer installing the NAS's certificate in the system
+    /// trust store.
+    #[arg(long, env = "SYNO_INSECURE")]
+    insecure: bool,
+
     /// NAS account username
     #[arg(long, short = 'u')]
     username: String,
@@ -34,6 +45,13 @@ struct Args {
     #[arg(long, short = 'p', env = "SYNO_PASSWORD")]
     password: Option<String>,
 
+    /// Read the password from the first line of stdin.
+    ///
+    /// Prefer this in scripts. A password passed as `--password` sits in this
+    /// process's argv, which every other account on the machine can read via
+    /// `ps` (and `/proc/<pid>/cmdline` on Linux) for as long as the mount runs.
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
     /// TOTP code for two-factor authentication (or set SYNO_OTP env var).
     /// If 2FA is enabled and this is not provided, you will be prompted interactively.
     #[arg(long, env = "SYNO_OTP")]
@@ -63,6 +81,34 @@ fn prompt(label: &str) -> anyhow::Result<String> {
     Ok(value.trim().to_string())
 }
 
+/// Whether the password was typed on the command line rather than coming from
+/// the environment. argv is readable by any local account; `SYNO_PASSWORD` is
+/// not, so only the former deserves a warning.
+fn password_came_from_argv() -> bool {
+    std::env::args().any(|a| a == "-p" || a == "--password" || a.starts_with("--password="))
+}
+
+/// Resolve the password from stdin, argv/environment, or an interactive prompt.
+fn resolve_password(args: &Args) -> anyhow::Result<String> {
+    if args.password_stdin {
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+    }
+    match &args.password {
+        Some(p) => {
+            if password_came_from_argv() {
+                tracing::warn!(
+                    "--password puts the password in this process's argv, where every \
+                     other account on this machine can read it with `ps`. Prefer \
+                     SYNO_PASSWORD, --password-stdin, or the interactive prompt."
+                );
+            }
+            Ok(p.clone())
+        }
+        None => Ok(rpassword::prompt_password("Password: ")?),
+    }
+}
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -82,11 +128,19 @@ fn main() -> anyhow::Result<()> {
     );
 
     let client = SynologyClient::new(&args.host, args.port, args.https);
-
-    let password = match args.password {
-        Some(p) => p,
-        None => rpassword::prompt_password("Password: ")?,
+    let client = if args.insecure {
+        if args.https {
+            tracing::warn!(
+                "--insecure: TLS certificate verification is OFF; the connection \
+                 is encrypted but not authenticated"
+            );
+        }
+        client.with_insecure_tls()
+    } else {
+        client
     };
+
+    let password = resolve_password(&args)?;
 
     let otp = args.otp.as_deref();
     let login_result = rt.block_on(client.login(&args.username, &password, otp));
@@ -96,6 +150,19 @@ fn main() -> anyhow::Result<()> {
         Err(ref e) if is_otp_required(e) => {
             let code = prompt("Two-factor authentication code")?;
             rt.block_on(client.login(&args.username, &password, Some(&code)))?;
+        }
+        // A TLS failure here is almost always a self-signed NAS certificate, and
+        // the fix is a flag the user has no reason to know exists. Name it.
+        Err(e) if args.https && !args.insecure && e.is_tls_error() => {
+            return Err(anyhow::anyhow!(
+                "could not verify the TLS certificate for {}:{} ({e}).\n\
+                 \n\
+                 If this NAS uses a self-signed certificate, either install it in \
+                 your system trust store, or re-run with --insecure to accept any \
+                 certificate (encrypted, but not authenticated).",
+                args.host,
+                args.port
+            ));
         }
         Err(e) => return Err(e.into()),
     }

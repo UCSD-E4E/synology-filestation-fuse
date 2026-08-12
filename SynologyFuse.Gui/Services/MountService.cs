@@ -47,7 +47,8 @@ public sealed class MountService : IDisposable
         var client = await Task.Run(() =>
         {
             var c = SynoClient.Connect(
-                config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp);
+                config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
+                autoRelogin: true, verifySsl: config.VerifySsl);
             try
             {
                 c.Mount(mountpoint, config.CacheTtl, config.ReadCacheMb);
@@ -81,7 +82,8 @@ public sealed class MountService : IDisposable
         return Task.Run(() =>
         {
             using var client = SynoClient.Connect(
-                config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp);
+                config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
+                autoRelogin: true, verifySsl: config.VerifySsl);
             // Dispose logs out immediately; reaching here means success.
         });
     }

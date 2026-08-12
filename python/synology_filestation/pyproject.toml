@@ -41,4 +41,7 @@ dev = [
     # fsspec is opt-in for end users (`pip install synology-filestation[fsspec]`)
     # but always installed in dev so the fsspec backend is exercised in CI.
     "fsspec>=2026.7.0",
+    # Issues a throwaway CA + server cert so the TLS tests exercise a real
+    # rejected handshake rather than asserting on the kwarg's presence.
+    "trustme>=1.1",
 ]

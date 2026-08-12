@@ -28,11 +28,23 @@ const SID_NOT_FOUND: u32 = 119;
 /// intentionally not stored: TOTP values are single-use, so re-login after
 /// session expiry would always fail for 2FA-enabled accounts. Auto-relogin is
 /// therefore only meaningful for accounts without 2FA.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(dead_code)]
 struct StoredCreds {
     user: String,
     password: String,
+}
+
+/// Hand-written so the stashed password cannot reach a log through a stray
+/// `{:?}`. A derived Debug would print it in full, and this struct exists
+/// precisely to hold a password for the lifetime of the session.
+impl std::fmt::Debug for StoredCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCreds")
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Tuning for the request throttle that protects the DSM appliance's shared
@@ -87,6 +99,19 @@ impl Default for ThrottleConfig {
     }
 }
 
+/// How the session id is carried on an authenticated request.
+///
+/// DSM accepts it either as a `_sid` query parameter or as an `id` cookie. They
+/// are equivalent to the server and very different everywhere else: a query
+/// parameter is written verbatim into the NAS's own nginx access log, into any
+/// proxy's log in between, and into the `Display` of every `reqwest` transport
+/// error — which this client then logs, returns across the FFI, and raises as a
+/// Python exception. A cookie appears in none of those.
+///
+/// So the cookie is preferred, and the query parameter is the fallback for a
+/// DSM that will not take it.
+const SESSION_AUTH_COOKIE: u8 = 0;
+const SESSION_AUTH_QUERY: u8 = 1;
 #[derive(Debug)]
 struct Throttle {
     sem: Semaphore,
@@ -211,6 +236,14 @@ pub struct SynologyClient {
     /// behavior; opt in via [`SynologyClient::with_auto_relogin`].
     auto_relogin: bool,
     creds: RwLock<Option<StoredCreds>>,
+    /// True when TLS certificate verification has been turned off via
+    /// [`SynologyClient::with_insecure_tls`]. Tracked separately from the
+    /// `reqwest::Client` (which does not expose its own settings) so consumers
+    /// can tell the user which mode they are connecting in.
+    insecure_tls: bool,
+    /// Whether the session id travels as a cookie or as a `_sid` query
+    /// parameter. Settled by a probe immediately after login.
+    session_auth: std::sync::atomic::AtomicU8,
     /// Injected read backends, tried in order before the HTTP Download API.
     /// Empty (the default) = HTTP only, i.e. exactly today's behavior.
     read_transports: Vec<TransportEntry<dyn ReadTransport>>,
@@ -233,6 +266,7 @@ impl std::fmt::Debug for SynologyClient {
         f.debug_struct("SynologyClient")
             .field("base_url", &self.base_url)
             .field("auto_relogin", &self.auto_relogin)
+            .field("insecure_tls", &self.insecure_tls)
             .field("throttled", &self.throttle.is_some())
             .field("read_transports", &self.read_transports.len())
             .field("write_transports", &self.write_transports.len())
@@ -264,34 +298,15 @@ impl SynologyClient {
         install_crypto_provider();
         let scheme = if https { "https" } else { "http" };
         let base_url = format!("{}://{}:{}/webapi", scheme, host, port);
-        let http = Client::builder()
-            .danger_accept_invalid_certs(true) // common for self-signed NAS certs
-            // Drop idle connections after 4 s so we don't reuse connections the NAS
-            // has already closed on its side (~7 s keep-alive on most DSM versions).
-            .pool_idle_timeout(Duration::from_secs(4))
-            // Fail fast if the NAS is unreachable rather than waiting for the OS-level
-            // TCP timeout (~75 s on macOS, ETIMEDOUT / os error 60).
-            .connect_timeout(Duration::from_secs(10))
-            // Send TCP keepalive probes so stalled mid-transfer connections are
-            // detected in seconds rather than waiting for the full OS TCP timeout
-            // (~75 s on macOS, ETIMEDOUT / os error 60).
-            .tcp_keepalive(Duration::from_secs(10))
-            // Bound how long we'll wait for data on a request. Without this, a
-            // silently-dead connection (e.g. routes changed when a VPN comes up
-            // mid-session) hangs the FUSE callback indefinitely — the user sees
-            // their file manager freeze with no error. read_timeout fires when
-            // no bytes have arrived for the duration, so it doesn't cap
-            // legitimately long large-file uploads.
-            .read_timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
         Self {
-            http,
+            http: build_http(false),
             base_url,
             sid: RwLock::new(None),
             auto_relogin: false,
             creds: RwLock::new(None),
             throttle: None,
+            insecure_tls: false,
+            session_auth: std::sync::atomic::AtomicU8::new(SESSION_AUTH_COOKIE),
             read_transports: Vec::new(),
             write_transports: Vec::new(),
             stream_write_transports: Vec::new(),
@@ -300,6 +315,60 @@ impl SynologyClient {
         }
     }
 
+    /// Accept any TLS certificate, including self-signed and expired ones, and
+    /// ignore hostname mismatches.
+    ///
+    /// This turns HTTPS into encryption-without-authentication: anything able to
+    /// intercept the connection can present its own certificate and read the
+    /// password in the login exchange. It exists because a self-signed
+    /// certificate is the out-of-the-box state for a DSM appliance, and is
+    /// surfaced to users as an explicit opt-in (`--insecure` on the CLI, a
+    /// checkbox in the GUI, `verify_ssl=False` in the Python bindings) rather
+    /// than being the silent default it used to be.
+    ///
+    /// Prefer installing the NAS's certificate in the system trust store.
+    pub fn with_insecure_tls(mut self) -> Self {
+        self.http = build_http(true);
+        self.insecure_tls = true;
+        self
+    }
+
+    /// Whether TLS certificate verification has been disabled on this client.
+    /// Consumers use it to tell the user which mode they are connecting in.
+    pub fn insecure_tls(&self) -> bool {
+        self.insecure_tls
+    }
+}
+
+/// Build the shared HTTP client. `accept_invalid_certs` is the only knob that
+/// varies; everything else is the timeout/keepalive policy the whole crate
+/// depends on, so it lives in one place rather than being repeated per
+/// constructor.
+fn build_http(accept_invalid_certs: bool) -> Client {
+    Client::builder()
+        .danger_accept_invalid_certs(accept_invalid_certs)
+        // Drop idle connections after 4 s so we don't reuse connections the NAS
+        // has already closed on its side (~7 s keep-alive on most DSM versions).
+        .pool_idle_timeout(Duration::from_secs(4))
+        // Fail fast if the NAS is unreachable rather than waiting for the OS-level
+        // TCP timeout (~75 s on macOS, ETIMEDOUT / os error 60).
+        .connect_timeout(Duration::from_secs(10))
+        // Send TCP keepalive probes so stalled mid-transfer connections are
+        // detected in seconds rather than waiting for the full OS TCP timeout
+        // (~75 s on macOS, ETIMEDOUT / os error 60).
+        .tcp_keepalive(Duration::from_secs(10))
+        // Bound how long we'll wait for data on a request. Without this, a
+        // silently-dead connection (e.g. routes changed when a VPN comes up
+        // mid-session) hangs the FUSE callback indefinitely — the user sees
+        // their file manager freeze with no error. read_timeout fires when
+        // no bytes have arrived for the duration, so it doesn't cap
+        // legitimately long large-file uploads.
+        .read_timeout(Duration::from_secs(30))
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+impl SynologyClient {
     /// Inject a [`ReadTransport`] backend (e.g. SMB). `download` will prefer it
     /// over the HTTP Download API when its circuit breaker is closed, falling
     /// back to HTTP (and any later backends) on transport failures. Call more
@@ -440,6 +509,83 @@ impl SynologyClient {
         c
     }
 
+    /// Attach the session id to a request in whichever way this DSM accepts.
+    ///
+    /// Every authenticated call goes through here rather than pushing `_sid`
+    /// into its own parameter list, so there is one place that decides how the
+    /// token travels — and one place to audit.
+    fn attach_session(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let sid = self.sid();
+        if sid.is_empty() {
+            return req;
+        }
+        if self.session_auth.load(std::sync::atomic::Ordering::Relaxed) == SESSION_AUTH_COOKIE {
+            req.header(reqwest::header::COOKIE, format!("id={sid}"))
+        } else {
+            req.query(&[("_sid", sid.as_str())])
+        }
+    }
+
+    /// Settle how the session id travels, once, straight after login.
+    ///
+    /// The cookie is a claim about somebody else's server, so it is checked
+    /// rather than assumed: one cheap authenticated request in cookie mode, and
+    /// if DSM answers 119 the client spends the rest of the session on the query
+    /// parameter it used to use.
+    ///
+    /// Running this at login is the whole point of the design. A 119 is
+    /// ambiguous in general — "the cookie was refused" and "the session expired"
+    /// are the same code — but a session issued moments ago has not expired, so
+    /// here the answer is unambiguous. Deciding it from the first ordinary call
+    /// instead would misread an expired session as a rejected cookie and quietly
+    /// start putting the id back into URLs.
+    ///
+    /// Only a definitive 119 triggers the fallback. A transport failure says
+    /// nothing about whether the cookie is accepted — the network is simply
+    /// down, and the next real call reports that on its own.
+    async fn probe_session_transport(&self) {
+        use std::sync::atomic::Ordering;
+
+        self.session_auth
+            .store(SESSION_AUTH_COOKIE, Ordering::Relaxed);
+
+        let url = format!("{}/entry.cgi", self.base_url);
+        let req = self.attach_session(self.http.get(&url).query(&[
+            ("api", "SYNO.FileStation.List"),
+            ("version", "2"),
+            ("method", "list_share"),
+            ("limit", "1"),
+            ("offset", "0"),
+        ]));
+
+        let rejected = match req.send().await {
+            Ok(resp) => match resp.text().await {
+                Ok(body) => serde_json::from_str::<SynoResponse<serde_json::Value>>(&body)
+                    .ok()
+                    .filter(|envelope| !envelope.success)
+                    .and_then(|envelope| envelope.error)
+                    .is_some_and(|e| e.code == SID_NOT_FOUND),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+
+        if rejected {
+            warn!(
+                "this DSM did not accept the session cookie; falling back to the _sid \
+                 query parameter. The session id will appear in the NAS's access log."
+            );
+            self.session_auth
+                .store(SESSION_AUTH_QUERY, Ordering::Relaxed);
+        } else {
+            debug!("session id will travel as a cookie");
+        }
+    }
+
+    /// True when the session id is being kept out of request URLs.
+    pub fn session_in_cookie(&self) -> bool {
+        self.session_auth.load(std::sync::atomic::Ordering::Relaxed) == SESSION_AUTH_COOKIE
+    }
     fn sid(&self) -> String {
         self.sid.read().unwrap().clone().unwrap_or_default()
     }
@@ -457,10 +603,18 @@ impl SynologyClient {
         let mut last_err = SynoFsError::Io("no attempts".into());
         for attempt in 0..3u8 {
             if attempt > 0 {
-                debug!("retry {} for GET {}", attempt, url);
+                debug!(
+                    "retry {} for GET {}",
+                    attempt,
+                    crate::redact::redact_secrets(url)
+                );
                 tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
             }
-            let resp = match self.http.get(url).query(params).send().await {
+            let resp = match self
+                .attach_session(self.http.get(url).query(params))
+                .send()
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = e.into();
@@ -481,6 +635,13 @@ impl SynologyClient {
     ///
     /// `otp_code` is the 6-digit TOTP code required when the account has 2-factor
     /// authentication enabled. Pass `None` if 2FA is not configured.
+    ///
+    /// Sent as a form-encoded **POST**. It used to be a GET with
+    /// `passwd=<plaintext>` in the query string, which put the account password
+    /// into DSM's own nginx access log — and into any proxy's log between here
+    /// and the NAS — on every single login. Request bodies are not logged that
+    /// way. DSM's `auth.cgi` accepts either verb; this is the same exchange, it
+    /// just stops writing the password to disk on the way past.
     pub async fn login(
         &self,
         user: &str,
@@ -502,8 +663,8 @@ impl SynologyClient {
         }
         let resp = self
             .http
-            .get(&url)
-            .query(&params)
+            .post(&url)
+            .form(&params)
             .send()
             .await?
             .json::<SynoResponse<AuthData>>()
@@ -514,8 +675,13 @@ impl SynologyClient {
                 .data
                 .ok_or_else(|| SynoFsError::Io("no auth data".into()))?
                 .sid;
-            debug!("Logged in, SID: {}...", &sid[..8.min(sid.len())]);
+            // Deliberately not logged, not even a prefix: the session id is a
+            // bearer token, and a log line is exactly where it must not be.
+            debug!("Logged in ({} byte session id)", sid.len());
             *self.sid.write().unwrap() = Some(sid);
+            // Settle how the token travels before any real call uses it, while
+            // the session is new enough that a 119 can only mean one thing.
+            self.probe_session_transport().await;
             if self.auto_relogin {
                 *self.creds.write().unwrap() = Some(StoredCreds {
                     user: user.to_string(),
@@ -582,15 +748,12 @@ impl SynologyClient {
     pub async fn logout(&self) -> Result<(), SynoFsError> {
         let url = format!("{}/auth.cgi", self.base_url);
         let _ = self
-            .http
-            .get(&url)
-            .query(&[
+            .attach_session(self.http.get(&url).query(&[
                 ("api", "SYNO.API.Auth"),
                 ("version", "7"),
                 ("method", "logout"),
                 ("session", "FileStation"),
-                ("_sid", &self.sid()),
-            ])
+            ]))
             .send()
             .await;
         *self.sid.write().unwrap() = None;
@@ -618,7 +781,6 @@ impl SynologyClient {
         F: Fn(T) -> (Vec<SynoFileInfo>, Option<u64>),
     {
         let url = format!("{}/entry.cgi", self.base_url);
-        let sid = self.sid();
         let limit = LIST_PAGE_SIZE.to_string();
         let mut collected: Vec<SynoFileInfo> = Vec::new();
 
@@ -633,7 +795,6 @@ impl SynologyClient {
             params.push(("additional", additional));
             params.push(("limit", &limit));
             params.push(("offset", &offset));
-            params.push(("_sid", &sid));
 
             let text = self.get_text_retried(&url, &params).await?;
             let resp: SynoResponse<T> = serde_json::from_str(&text)
@@ -709,7 +870,6 @@ impl SynologyClient {
                     ("method", "getinfo"),
                     ("path", &path_json),
                     ("additional", ADDITIONAL_FIELDS),
-                    ("_sid", &self.sid()),
                 ],
             )
             .await?;
@@ -894,14 +1054,13 @@ impl SynologyClient {
             let outcome: TransferOutcome = {
                 let _slot = self.acquire_transfer_slot().await;
 
-                let mut req = self.http.get(&url).query(&[
+                let mut req = self.attach_session(self.http.get(&url).query(&[
                     ("api", "SYNO.FileStation.Download"),
                     ("version", "2"),
                     ("method", "download"),
                     ("path", &path_json),
                     ("mode", "download"),
-                    ("_sid", &self.sid()),
-                ]);
+                ]));
                 if let Some(ref range) = range_header {
                     req = req.header("Range", range.as_str());
                 }
@@ -1160,14 +1319,11 @@ impl SynologyClient {
             let form = form.part("file", file_part);
 
             let mut req = self
-                .http
-                .post(&url)
-                .query(&[
+                .attach_session(self.http.post(&url).query(&[
                     ("api", "SYNO.FileStation.Upload"),
                     ("method", "upload"),
                     ("version", "2"),
-                ])
-                .query(&[("_sid", self.sid())])
+                ]))
                 .header("X-TYPE-NAME", "SLICEUPLOAD")
                 .header("X-FILE-SIZE", total.to_string())
                 .header("X-FILE-CHUNK-END", if last { "true" } else { "false" });
@@ -1293,9 +1449,7 @@ impl SynologyClient {
             let text = {
                 let _slot = self.acquire_transfer_slot().await;
                 match self
-                    .http
-                    .post(&url)
-                    .query(&[("_sid", self.sid())])
+                    .attach_session(self.http.post(&url))
                     .multipart(form)
                     .send()
                     .await
@@ -1359,7 +1513,6 @@ impl SynologyClient {
                     ("path", &path_json),
                     ("recursive", "true"),
                     ("accurate_progress", "false"),
-                    ("_sid", &self.sid()),
                 ],
             )
             .await?;
@@ -1396,7 +1549,6 @@ impl SynologyClient {
                     ("folder_path", &parent_json),
                     ("name", &name_json),
                     ("additional", ADDITIONAL_FIELDS),
-                    ("_sid", &self.sid()),
                 ],
             )
             .await?;
@@ -1441,7 +1593,6 @@ impl SynologyClient {
                     ("path", &path_json),
                     ("name", &name_json),
                     ("additional", ADDITIONAL_FIELDS),
-                    ("_sid", &self.sid()),
                 ],
             )
             .await?;
@@ -1479,7 +1630,7 @@ async fn local_mtime_ms(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_string_contains, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Build a client pointed at the given mock server.
@@ -1517,19 +1668,340 @@ mod tests {
         );
     }
 
+    // ── secret leakage ───────────────────────────────────────────────────────
+
+    /// Regression: reqwest embeds the full request URL, query string included,
+    /// in the Display of a transport error. Every FileStation call carried the
+    /// session id as `_sid`, so one connection failure published a live bearer
+    /// token into the CLI's stderr, the GUI's log pane and the message of every
+    /// Python exception. Nothing leaving this client may carry it.
+    #[tokio::test]
+    async fn a_transport_error_never_carries_the_session_id() {
+        // Port 1 has nothing listening, so the request fails at connect — the
+        // path that bakes the request URL into the error message.
+        let client = SynologyClient::new("127.0.0.1", 1, false);
+        *client.sid.write().unwrap() = Some("SUPERSECRETSID".to_string());
+
+        let err = client.list_dir("/share").await.unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("entry.cgi"),
+            "precondition: the error should carry the URL, else this proves \
+             nothing: {message}"
+        );
+        assert!(
+            !message.contains("SUPERSECRETSID"),
+            "session id leaked into a transport error: {message}"
+        );
+    }
+
+    /// The stashed password must not be one stray `{:?}` away from a log line.
+    ///
+    /// The literal is deliberately shaped like a placeholder rather than like a
+    /// password: a realistic-looking one here trips secret scanners on every
+    /// pull request, and a security check that cries wolf is one people learn
+    /// to click past.
+    #[test]
+    fn debug_formatting_stored_creds_hides_the_password() {
+        let creds = StoredCreds {
+            user: "alice".into(),
+            password: "placeholder-not-a-real-password".into(),
+        };
+        let rendered = format!("{creds:?}");
+        assert!(
+            !rendered.contains("placeholder-not-a-real-password"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("alice"), "{rendered}");
+    }
+
+    // ── how the session id travels ───────────────────────────────────────────
+
+    /// Mount the share listing the post-login probe asks for.
+    async fn mount_probe_ok(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(query_param("method", "list_share"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"success": true, "data": {"total": 0, "shares": []}}),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    fn empty_list() -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"success": true, "data": {"total": 0, "files": []}}))
+    }
+
+    /// Regression: the session id rode in the query string of every call, which
+    /// puts a live bearer token in the NAS's own access log, in any proxy's log
+    /// in between, and in the text of every transport error. It travels as a
+    /// cookie now, and no request URL may contain it.
+    #[tokio::test]
+    async fn the_session_id_never_appears_in_a_request_url() {
+        let server = MockServer::start().await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": true, "data": {"sid": "SUPERSECRETSID"}}),
+        )
+        .await;
+        mount_probe_ok(&server).await;
+        Mock::given(method("GET"))
+            .and(query_param("method", "list"))
+            .respond_with(empty_list())
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        client.list_dir("/share").await.unwrap();
+        client.logout().await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.len() >= 4, "login + probe + list + logout");
+        for req in &requests {
+            assert!(
+                !req.url.as_str().contains("SUPERSECRETSID"),
+                "session id in a request URL: {}",
+                req.url
+            );
+            assert!(
+                !req.url.as_str().contains("_sid"),
+                "_sid parameter still present: {}",
+                req.url
+            );
+        }
+    }
+
+    /// ...and it does still reach the server, just in a header.
+    #[tokio::test]
+    async fn the_session_id_travels_as_a_cookie() {
+        let server = MockServer::start().await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": true, "data": {"sid": "SUPERSECRETSID"}}),
+        )
+        .await;
+        mount_probe_ok(&server).await;
+
+        let client = client_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        assert!(client.session_in_cookie());
+
+        let requests = server.received_requests().await.unwrap();
+        let probe = requests
+            .iter()
+            .find(|r| r.url.query().is_some_and(|q| q.contains("list_share")))
+            .expect("the probe request");
+        assert_eq!(
+            probe.headers.get("cookie").unwrap().to_str().unwrap(),
+            "id=SUPERSECRETSID"
+        );
+    }
+
+    /// The cookie is a claim about a server we cannot test against here, so it
+    /// is verified rather than assumed. A DSM that answers 119 to the probe
+    /// sends the client back to the query parameter — degraded, but working,
+    /// which is the right way round for an unverifiable assumption.
+    #[tokio::test]
+    async fn a_dsm_that_rejects_the_cookie_falls_back_to_the_query_parameter() {
+        let server = MockServer::start().await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": true, "data": {"sid": "SUPERSECRETSID"}}),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(query_param("method", "list_share"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": false, "error": {"code": 119}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(query_param("method", "list"))
+            .respond_with(empty_list())
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+        assert!(
+            !client.session_in_cookie(),
+            "a 119 to the probe must switch the client to query auth"
+        );
+
+        client.list_dir("/share").await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let list = requests
+            .iter()
+            .rfind(|r| r.url.query().is_some_and(|q| q.contains("method=list&")))
+            .expect("the list request");
+        assert!(
+            list.url.as_str().contains("_sid=SUPERSECRETSID"),
+            "the fallback must still authenticate: {}",
+            list.url
+        );
+    }
+
+    /// A probe that cannot reach the NAS says nothing about whether the cookie
+    /// is accepted — the network is simply down. Downgrading on that would
+    /// permanently degrade a session over an unrelated blip.
+    #[tokio::test]
+    async fn a_probe_that_cannot_reach_the_nas_does_not_downgrade_the_session() {
+        let server = MockServer::start().await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": true, "data": {"sid": "s"}}),
+        )
+        .await;
+        // No probe route: wiremock answers 404 with an empty body — a failure,
+        // but not a 119.
+        let client = client_for(&server);
+        client.login("alice", "secret", None).await.unwrap();
+
+        assert!(
+            client.session_in_cookie(),
+            "only a definitive 119 should downgrade the session"
+        );
+    }
+    // ── TLS verification ─────────────────────────────────────────────────────
+
+    /// A one-shot HTTPS listener presenting a self-signed certificate for
+    /// `localhost` — i.e. exactly the NAS setup that made someone reach for
+    /// `danger_accept_invalid_certs` in the first place. Answers any request
+    /// with a successful login envelope, so the only thing that can fail a test
+    /// against it is the TLS handshake.
+    ///
+    /// Hand-rolled because wiremock speaks plain HTTP; the response is a canned
+    /// HTTP/1.1 message rather than a real server.
+    async fn self_signed_https_server() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        install_crypto_provider();
+
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = issued.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
+
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return; // handshake refused by the client — the point of the test
+                    };
+                    let mut buf = [0u8; 4096];
+                    let _ = tls.read(&mut buf).await;
+                    let body = r#"{"success":true,"data":{"sid":"tls_ok"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// Regression: the client called `danger_accept_invalid_certs(true)`
+    /// unconditionally, so `https` bought encryption against a passive observer
+    /// and nothing else — any machine able to intercept the connection could
+    /// present its own certificate and read the password. Verification is now
+    /// on by default.
+    #[tokio::test]
+    async fn https_rejects_a_self_signed_certificate_by_default() {
+        let port = self_signed_https_server().await;
+        let client = SynologyClient::new("localhost", port, true);
+
+        let err = client
+            .login("alice", "secret", None)
+            .await
+            .expect_err("an unverifiable certificate must not be silently accepted");
+
+        assert!(
+            matches!(err, SynoFsError::Io(_)),
+            "expected a transport/TLS failure, got {err:?}"
+        );
+    }
+
+    /// The escape hatch has to actually work: a self-signed NAS certificate is
+    /// the normal case for this appliance, and `--insecure` is what those users
+    /// are told to pass.
+    #[tokio::test]
+    async fn with_insecure_tls_accepts_a_self_signed_certificate() {
+        let port = self_signed_https_server().await;
+        let client = SynologyClient::new("localhost", port, true).with_insecure_tls();
+
+        client
+            .login("alice", "secret", None)
+            .await
+            .expect("--insecure must accept a self-signed certificate");
+        assert_eq!(client.sid(), "tls_ok");
+    }
+
+    /// The CLI and GUI turn a rejected certificate into "…re-run with
+    /// --insecure", which only works if the error is recognisable as a TLS
+    /// failure. Pin `is_tls_error` against a real handshake so it tracks the
+    /// string rustls actually produces.
+    #[tokio::test]
+    async fn a_rejected_certificate_is_recognisable_as_a_tls_failure() {
+        let port = self_signed_https_server().await;
+        let err = SynologyClient::new("localhost", port, true)
+            .login("alice", "secret", None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.is_tls_error(),
+            "a rejected certificate must be recognisable so the user can be \
+             pointed at --insecure; got: {err}"
+        );
+    }
+
+    /// The flag is inspectable so the CLI/GUI/bindings can report which mode
+    /// they are in, and so a future change cannot silently invert the default.
+    #[test]
+    fn tls_verification_is_on_unless_explicitly_disabled() {
+        let strict = SynologyClient::new("nas.example.invalid", 5001, true);
+        assert!(!strict.insecure_tls());
+        assert!(strict.with_insecure_tls().insecure_tls());
+    }
+
     // ── login ────────────────────────────────────────────────────────────────
+
+    /// Mount an auth.cgi handler and return the login response body it serves.
+    async fn mount_auth(server: &MockServer, body: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(path("/webapi/auth.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
 
     #[tokio::test]
     async fn login_stores_sid_on_success() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/webapi/auth.cgi"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true,
-                "data": {"sid": "abc123def"}
-            })))
-            .mount(&server)
-            .await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": true, "data": {"sid": "abc123def"}}),
+        )
+        .await;
 
         let client = client_for(&server);
         client.login("alice", "secret", None).await.unwrap();
@@ -1539,14 +2011,11 @@ mod tests {
     #[tokio::test]
     async fn login_returns_api_error_on_failure() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/webapi/auth.cgi"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": false,
-                "error": {"code": 400}
-            })))
-            .mount(&server)
-            .await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": false, "error": {"code": 400}}),
+        )
+        .await;
 
         let client = client_for(&server);
         let err = client.login("alice", "wrong", None).await.unwrap_err();
@@ -1554,17 +2023,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_with_otp_includes_otp_param() {
+    async fn login_with_otp_sends_the_otp_code() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/webapi/auth.cgi"))
-            .and(query_param("otp_code", "123456"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true,
-                "data": {"sid": "otp_sid_xyz"}
-            })))
-            .mount(&server)
-            .await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": true, "data": {"sid": "otp_sid_xyz"}}),
+        )
+        .await;
 
         let client = client_for(&server);
         client
@@ -1572,6 +2037,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(client.sid(), "otp_sid_xyz");
+
+        let reqs = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            body.contains("otp_code=123456"),
+            "otp missing from body: {body}"
+        );
+    }
+
+    /// Regression: login was a GET carrying `passwd=<plaintext>` in the query
+    /// string. Query strings are written to DSM's own nginx access log and to
+    /// any proxy in between, so every login left the account password sitting
+    /// in plaintext on disk in at least one place. Credentials belong in the
+    /// request body.
+    #[tokio::test]
+    async fn login_never_puts_credentials_in_the_url() {
+        let server = MockServer::start().await;
+        mount_auth(
+            &server,
+            serde_json::json!({"success": true, "data": {"sid": "s"}}),
+        )
+        .await;
+
+        let client = client_for(&server);
+        client
+            .login("alice", "placeholder-not-a-real-password", Some("998877"))
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let req = &reqs[0];
+        let url = req.url.as_str();
+        assert!(
+            !url.contains("placeholder-not-a-real-password"),
+            "password leaked into the URL: {url}"
+        );
+        assert!(!url.contains("passwd"), "passwd param in the URL: {url}");
+        assert!(!url.contains("998877"), "otp leaked into the URL: {url}");
+        assert!(!url.contains("alice"), "account leaked into the URL: {url}");
+
+        // ...and it really did travel, just in the body.
+        let body = String::from_utf8_lossy(&req.body);
+        assert!(
+            body.contains("placeholder-not-a-real-password"),
+            "password missing from the body: {body}"
+        );
     }
 
     // ── logout ───────────────────────────────────────────────────────────────
@@ -1579,7 +2090,7 @@ mod tests {
     #[tokio::test]
     async fn logout_clears_sid() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
@@ -2328,7 +2839,7 @@ mod tests {
     #[tokio::test]
     async fn default_client_does_not_stash_credentials() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
@@ -2348,7 +2859,7 @@ mod tests {
     #[tokio::test]
     async fn auto_relogin_client_stashes_credentials_on_login() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
@@ -2368,7 +2879,7 @@ mod tests {
     async fn api_119_surfaces_when_auto_relogin_off() {
         // Pre-bug-fix behavior: a default client should still see 119 directly.
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
@@ -2403,9 +2914,9 @@ mod tests {
 
         // Both login calls return the same fixed sid; server doesn't care
         // about sid value, only that the call sequence is right.
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "data": {"sid": "fresh_sid"}
@@ -2456,9 +2967,9 @@ mod tests {
         let server = MockServer::start().await;
 
         // First login: success. Second login (re-login): auth failure (400).
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "data": {"sid": "first"}
@@ -2466,9 +2977,9 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": false,
                 "error": {"code": 400}
@@ -2508,9 +3019,9 @@ mod tests {
         // If both the initial call AND the retry return 119, give up — don't
         // loop forever. The second 119 is what the caller sees.
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "data": {"sid": "s"}
@@ -2544,9 +3055,9 @@ mod tests {
         // Verify we don't re-auth on non-119 errors. The login mock has
         // .expect(1) and the test will fail on drop if we re-login.
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "data": {"sid": "s"}
@@ -2719,9 +3230,9 @@ mod tests {
         // kicks in, retry succeeds, file lands on disk correctly.
         let server = MockServer::start().await;
 
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/webapi/auth.cgi"))
-            .and(query_param("method", "login"))
+            .and(body_string_contains("method=login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "data": {"sid": "fresh"}
