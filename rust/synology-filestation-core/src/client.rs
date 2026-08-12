@@ -277,6 +277,28 @@ const MD5_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// `flush` indefinitely.
 const MD5_MAX_WAIT: Duration = Duration::from_secs(15 * 60);
 
+/// What a restart found before re-sending the file.
+enum Restart {
+    /// The file is already on the NAS at its full size — the response we lost
+    /// was the final slice's.
+    AlreadyLanded,
+    /// The local file is rewound and the way is clear to send it again.
+    Ready,
+}
+
+/// Does this failure mean the server has thrown away the partial file we were
+/// appending to?
+///
+/// DSM has no code for "your tmpfile is gone". A resend against a partial whose
+/// upload session died answers 401 — its catch-all "unknown error of file
+/// operation" — which is what e4e-nas returned after a connection timed out
+/// mid-slice on a 540 MiB upload. Codes that carry a meaning (permission,
+/// quota, no such folder) are answers about the write itself, and re-sending
+/// gigabytes cannot change them.
+fn partial_was_rejected(err: &SynoFsError) -> bool {
+    matches!(err, SynoFsError::ApiError(code) if dsm_code_to_category(*code) == ErrorCategory::Other)
+}
+
 /// Why one slice of a chunked upload failed, and what that implies for
 /// resending it.
 enum SliceError {
@@ -1448,86 +1470,166 @@ impl SynologyClient {
             ))
         })?;
         let mut buf = vec![0u8; slice_size];
-        let mut tmpfile: Option<String> = None;
-        // Set when a resend might have appended a slice the server already
-        // held. Only then is the finished file worth hashing.
-        let mut unverified_resend = false;
         let max_attempts = self.max_transfer_attempts();
+        let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
+        // Each pass builds one partial file on the server. A pass that ends
+        // with the server disowning that partial starts another.
+        let mut restarts = 0u32;
 
-        for index in 0..slices {
-            let want = std::cmp::min(slice_size as u64, total - index * slice_size as u64) as usize;
-            file.read_exact(&mut buf[..want]).await.map_err(|e| {
-                SynoFsError::Io(format!("slice upload: read slice {index} failed: {e}"))
-            })?;
-            let last = index + 1 == slices;
+        let unverified_resend = 'session: loop {
+            let mut tmpfile: Option<String> = None;
+            // Set when a resend might have appended a slice the server already
+            // held. Only then is the finished file worth hashing.
+            let mut unverified_resend = false;
 
-            let mut attempt = 0u32;
-            let parsed = loop {
-                let outcome = self
-                    .send_slice(
-                        &url,
-                        folder_path,
-                        filename,
-                        &buf[..want],
-                        total,
-                        last,
-                        tmpfile.as_deref(),
-                        mtime_ms.as_deref(),
-                    )
-                    .await;
-                match outcome {
-                    Ok(parsed) => break parsed,
-                    Err(SliceError::Fatal(e)) => return Err(e),
-                    Err(SliceError::Retryable {
-                        err,
-                        may_have_landed,
-                        hard,
-                    }) => {
-                        attempt += 1;
-                        if attempt >= max_attempts {
-                            return Err(err);
+            for index in 0..slices {
+                let want =
+                    std::cmp::min(slice_size as u64, total - index * slice_size as u64) as usize;
+                file.read_exact(&mut buf[..want]).await.map_err(|e| {
+                    SynoFsError::Io(format!("slice upload: read slice {index} failed: {e}"))
+                })?;
+                let last = index + 1 == slices;
+
+                let mut attempt = 0u32;
+                let parsed = loop {
+                    let outcome = self
+                        .send_slice(
+                            &url,
+                            folder_path,
+                            filename,
+                            &buf[..want],
+                            total,
+                            last,
+                            tmpfile.as_deref(),
+                            mtime_ms.as_deref(),
+                        )
+                        .await;
+                    match outcome {
+                        Ok(parsed) => break parsed,
+                        Err(SliceError::Fatal(e)) => {
+                            // A verdict about the write (permission, quota, no
+                            // such folder) stands. A catch-all code while we
+                            // were appending to a partial means something else:
+                            // the server no longer has that partial, and the
+                            // only way back is a new one.
+                            if tmpfile.is_none()
+                                || !partial_was_rejected(&e)
+                                || restarts + 1 >= max_attempts
+                            {
+                                return Err(e);
+                            }
+                            restarts += 1;
+                            warn!(
+                                "slice upload: {full_path} partial rejected at slice {index} ({e}); \
+                                 starting the file over (restart {restarts})"
+                            );
+                            match self
+                                .restart_slice_upload(
+                                    &full_path,
+                                    folder_path,
+                                    filename,
+                                    total,
+                                    &mut file,
+                                )
+                                .await?
+                            {
+                                // The lost response was the final slice's: the
+                                // file is already there. It got there through a
+                                // resend, so its contents still get checked.
+                                Restart::AlreadyLanded => break 'session true,
+                                Restart::Ready => continue 'session,
+                            }
                         }
-                        // Resending the *first* slice cannot double anything:
-                        // with no tmpfile handle it opens a fresh partial file,
-                        // and the abandoned one is the server's to reap. From
-                        // the second slice on, the server may already hold what
-                        // we are about to send again.
-                        if may_have_landed && tmpfile.is_some() {
-                            unverified_resend = true;
+                        Err(SliceError::Retryable {
+                            err,
+                            may_have_landed,
+                            hard,
+                        }) => {
+                            attempt += 1;
+                            if attempt >= max_attempts {
+                                return Err(err);
+                            }
+                            // Resending the *first* slice cannot double
+                            // anything: with no tmpfile handle it opens a fresh
+                            // partial file, and the abandoned one is the
+                            // server's to reap. From the second slice on, the
+                            // server may already hold what we are about to send
+                            // again.
+                            if may_have_landed && tmpfile.is_some() {
+                                unverified_resend = true;
+                            }
+                            warn!(
+                                "slice upload: slice {index} attempt {attempt} failed, resending: {err}"
+                            );
+                            self.backoff_before_retry(attempt - 1, hard).await;
                         }
-                        warn!(
-                            "slice upload: slice {index} attempt {attempt} failed, resending: {err}"
-                        );
-                        self.backoff_before_retry(attempt - 1, hard).await;
-                    }
-                }
-            };
-
-            if let Some(p) = progress {
-                p(index * slice_size as u64 + want as u64, total);
-            }
-
-            if !last {
-                // Without a handle there is nothing for the next slice to append
-                // to; DSM's own client treats this as fatal rather than retrying.
-                tmpfile = match parsed
-                    .data
-                    .and_then(|d| d.tmpfile)
-                    .filter(|t| !t.is_empty())
-                {
-                    Some(t) => Some(t),
-                    None => {
-                        return Err(SynoFsError::Io(format!(
-                            "slice upload: server returned no tmpfile after slice {index}"
-                        )))
                     }
                 };
-            }
-        }
 
-        let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
+                if let Some(p) = progress {
+                    p(index * slice_size as u64 + want as u64, total);
+                }
+
+                if !last {
+                    // Without a handle there is nothing for the next slice to
+                    // append to; DSM's own client treats this as fatal rather
+                    // than retrying.
+                    tmpfile = match parsed
+                        .data
+                        .and_then(|d| d.tmpfile)
+                        .filter(|t| !t.is_empty())
+                    {
+                        Some(t) => Some(t),
+                        None => {
+                            return Err(SynoFsError::Io(format!(
+                                "slice upload: server returned no tmpfile after slice {index}"
+                            )))
+                        }
+                    };
+                }
+            }
+
+            break 'session unverified_resend;
+        };
+
         self.verify_upload(&full_path, local, total, unverified_resend)
             .await
+    }
+
+    /// Get ready to send the file again after the server disowned our partial.
+    ///
+    /// Looks before it leaps: the response that went missing may have been the
+    /// *final* slice's, in which case the file is already on the NAS and
+    /// re-sending it would be gigabytes of pointless traffic — and, with
+    /// `overwrite=false`, a collision with our own write. Otherwise whatever we
+    /// left behind is ours and is wrong, so it goes before the retry rewinds
+    /// and starts over.
+    async fn restart_slice_upload(
+        &self,
+        full_path: &str,
+        folder_path: &str,
+        filename: &str,
+        total: u64,
+        file: &mut tokio::fs::File,
+    ) -> Result<Restart, SynoFsError> {
+        // Unlike `landed_size`, a missing file is the expected case here, so it
+        // is not worth a warning.
+        let landed = self
+            .get_info(full_path)
+            .await
+            .ok()
+            .and_then(|info| info.additional.and_then(|a| a.size));
+        if landed == Some(total) {
+            debug!("slice upload: {full_path} landed after all; not sending it again");
+            return Ok(Restart::AlreadyLanded);
+        }
+
+        self.clear_for_overwrite(folder_path, filename).await;
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| {
+            SynoFsError::Io(format!("slice upload: rewind for restart failed: {e}"))
+        })?;
+        Ok(Restart::Ready)
     }
 
     /// Send one slice and classify what came back.
@@ -5317,6 +5419,165 @@ mod tests {
         assert!(
             !deleted,
             "an unverified file is kept; only a proven bad one goes"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    // ── when the server loses the partial ────────────────────────────────────
+    //
+    // Observed against e4e-nas on 2026-08-12: a 540 MiB upload lost its
+    // connection at slice 54 (`Connection timed out (os error 110)` off-campus,
+    // where SMB is firewalled and everything goes over HTTP), the slice was
+    // resent on the same X-TMP-FILE, and DSM answered 401 — "unknown error of
+    // file operation", its way of saying that partial is no longer a thing it
+    // will append to. Treating that as fatal loses the whole file.
+    //
+    // DSM offers exactly one recovery: a fresh partial. So the upload starts
+    // over rather than failing, bounded by the same attempt count. A restart
+    // also clears the doubt from the resend that provoked it — a new tmpfile
+    // cannot contain a doubled slice.
+
+    #[tokio::test]
+    async fn slice_upload_starts_over_when_the_server_rejects_the_partial() {
+        let server = MockServer::start().await;
+        // Slice 1 lands, slice 2's connection dies, and the resend is met with
+        // 401 — the partial is gone.
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 401}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .mount(&server)
+            .await;
+        // Nothing of ours landed before the restart.
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 408}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 2500).await;
+
+        let local = scratch_file("restart.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .expect("a rejected partial costs the transfer, not the file");
+
+        let posts = slice_posts(&server).await;
+        assert_eq!(
+            posts.len(),
+            6,
+            "slice 1, slice 2, its resend, then all 3 slices again"
+        );
+        assert!(
+            header_of(&posts[3], "X-TMP-FILE").is_none(),
+            "the restart opens a fresh partial instead of continuing the dead one"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_does_not_start_over_for_a_verdict_about_the_file() {
+        // A restart is for a partial the server threw away. Permission, quota
+        // and the like are answers about the write itself: re-uploading the
+        // whole file cannot change them, and doing it anyway would hammer the
+        // NAS with gigabytes for nothing.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 1805}
+            })))
+            .mount(&server)
+            .await;
+
+        let local = scratch_file("denied.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        let err = client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::ApiError(1805)), "got {err:?}");
+        assert_eq!(
+            slice_posts(&server).await.len(),
+            2,
+            "no restart, no further slices"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn slice_upload_notices_the_file_landed_before_starting_over() {
+        // The final slice's response can be the thing that gets lost. Starting
+        // over would then re-send the whole file (and, with overwrite=false,
+        // collide with what we already wrote), so a restart looks first.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(slice_ok())
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 401}
+            })))
+            .mount(&server)
+            .await;
+        mount_getinfo_size(&server, 2500).await;
+        mount_md5(&server, SCRATCH_2500_MD5).await;
+
+        let local = scratch_file("landed.bin", 2500);
+        let client = client_for(&server).with_slice_size(1024);
+        client
+            .upload_from_path(&local, "/share", "big.bin", false)
+            .await
+            .expect("the file is on the NAS; that is what success means");
+
+        assert_eq!(
+            slice_posts(&server).await.len(),
+            4,
+            "3 slices plus the resend — the file is not sent a second time"
+        );
+        assert!(
+            md5_calls(&server).await >= 2,
+            "it landed via a resend, so its contents are checked"
         );
         std::fs::remove_file(&local).ok();
     }
