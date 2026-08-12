@@ -155,7 +155,14 @@ impl From<reqwest::Error> for SynoFsError {
         // DNS failure) is one or more levels down the source chain. Flattening
         // it in is the difference between a user seeing "certificate is not
         // trusted by the operating system" and seeing nothing they can act on.
-        Self::Io(flatten_sources(&e))
+        //
+        // Redacted here, on the way in, rather than at each place the message is
+        // shown: once the string is inside the error it gets logged, wrapped,
+        // returned across the FFI and raised as a Python exception, and only one
+        // of those paths would remember to scrub it. reqwest embeds the full
+        // request URL — query string included — so without this every transport
+        // failure publishes the session id.
+        Self::Io(crate::redact::redact_secrets(&flatten_sources(&e)))
     }
 }
 

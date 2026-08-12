@@ -110,7 +110,7 @@ fn local_fs_error(what: &str, e: &std::io::Error) -> SynoFsError {
 }
 
 /// Connection parameters for [`SmbTransport::connect`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SmbConfig {
     /// NAS host, either `host` or `host:port`. If no port is present, [`port`]
     /// is appended.
@@ -127,6 +127,22 @@ pub struct SmbConfig {
     pub domain: String,
     /// Connection/negotiate timeout.
     pub timeout: Duration,
+}
+
+/// Hand-written so the password never reaches a log. This is a public type
+/// with a public `password` field, so a derived `Debug` would put a plaintext
+/// credential one `{:?}` away for every downstream consumer, not just for us.
+impl std::fmt::Debug for SmbConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmbConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl SmbConfig {

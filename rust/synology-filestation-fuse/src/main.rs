@@ -45,6 +45,13 @@ struct Args {
     #[arg(long, short = 'p', env = "SYNO_PASSWORD")]
     password: Option<String>,
 
+    /// Read the password from the first line of stdin.
+    ///
+    /// Prefer this in scripts. A password passed as `--password` sits in this
+    /// process's argv, which every other account on the machine can read via
+    /// `ps` (and `/proc/<pid>/cmdline` on Linux) for as long as the mount runs.
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
     /// TOTP code for two-factor authentication (or set SYNO_OTP env var).
     /// If 2FA is enabled and this is not provided, you will be prompted interactively.
     #[arg(long, env = "SYNO_OTP")]
@@ -74,6 +81,34 @@ fn prompt(label: &str) -> anyhow::Result<String> {
     Ok(value.trim().to_string())
 }
 
+/// Whether the password was typed on the command line rather than coming from
+/// the environment. argv is readable by any local account; `SYNO_PASSWORD` is
+/// not, so only the former deserves a warning.
+fn password_came_from_argv() -> bool {
+    std::env::args().any(|a| a == "-p" || a == "--password" || a.starts_with("--password="))
+}
+
+/// Resolve the password from stdin, argv/environment, or an interactive prompt.
+fn resolve_password(args: &Args) -> anyhow::Result<String> {
+    if args.password_stdin {
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+    }
+    match &args.password {
+        Some(p) => {
+            if password_came_from_argv() {
+                tracing::warn!(
+                    "--password puts the password in this process's argv, where every \
+                     other account on this machine can read it with `ps`. Prefer \
+                     SYNO_PASSWORD, --password-stdin, or the interactive prompt."
+                );
+            }
+            Ok(p.clone())
+        }
+        None => Ok(rpassword::prompt_password("Password: ")?),
+    }
+}
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -105,10 +140,7 @@ fn main() -> anyhow::Result<()> {
         client
     };
 
-    let password = match args.password {
-        Some(p) => p,
-        None => rpassword::prompt_password("Password: ")?,
-    };
+    let password = resolve_password(&args)?;
 
     let otp = args.otp.as_deref();
     let login_result = rt.block_on(client.login(&args.username, &password, otp));
