@@ -39,6 +39,16 @@ pub struct MountOptions {
     pub cache_ttl: u64,
     /// Read cache size in MiB (Linux/FUSE only).
     pub read_cache_mb: u64,
+    /// FUSE event-loop threads (Linux only). `0` means [`default_io_threads`].
+    ///
+    /// Every callback runs to completion on the thread that received it. File
+    /// transfers are the exception — they run on the Tokio runtime and reply
+    /// from there — so this bounds only the callbacks that still block: a read
+    /// that misses the cache, a directory listing, a metadata call, and a write
+    /// to a handle whose own upload is in flight. Each thread costs a ~16 MiB
+    /// kernel receive buffer, which is why this is a small number rather than
+    /// "as many as possible".
+    pub io_threads: usize,
 }
 
 impl Default for MountOptions {
@@ -46,8 +56,22 @@ impl Default for MountOptions {
         Self {
             cache_ttl: 30,
             read_cache_mb: 256,
+            io_threads: 0,
         }
     }
+}
+
+/// How many FUSE event-loop threads to run when the caller doesn't choose.
+///
+/// Never 1. Transfers no longer hold a thread, but a cache-missing read or a
+/// slow listing still occupies one for a NAS round trip, and with a single
+/// thread every other operation on the mount — `readdir` of the mount point
+/// included — queues behind it.
+pub fn default_io_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(4, 8)
 }
 
 /// Returns `true` when a *login* error means the account requires a 2FA / OTP
@@ -115,6 +139,56 @@ fn fuse_conf_allows_other() -> bool {
     })
 }
 
+/// Build the fuser session configuration for a mount.
+///
+/// Split out of [`spawn_mount`] so the threading and mount-option decisions can
+/// be asserted without a live `/dev/fuse`.
+#[cfg(target_os = "linux")]
+fn session_config(allow_other: bool, opts: &MountOptions) -> fuser::Config {
+    use fuser::{Config, MountOption, SessionACL};
+
+    let mut mount_options = vec![
+        MountOption::RW,
+        MountOption::FSName("synology-fuse".to_string()),
+    ];
+    // AutoUnmount requires AllowOther or AllowRoot per libfuse / fuser docs.
+    // Without that, the mount would fail. Skip AutoUnmount when allow_other is
+    // unavailable so the mount still succeeds (the user just has to unmount
+    // manually with `fusermount -u <mountpoint>`).
+    if allow_other {
+        mount_options.push(MountOption::AutoUnmount);
+    }
+
+    let mut config = Config::default();
+    config.mount_options = mount_options;
+    // `allow_other` (kernel-level access for other users) moved off MountOption
+    // in fuser 0.17 — it's now expressed via Config::acl: SessionACL::All.
+    config.acl = if allow_other {
+        SessionACL::All
+    } else {
+        SessionACL::Owner
+    };
+    // fuser defaults to a single event-loop thread, and every callback runs to
+    // completion on the thread that received it. Transfers are spawned onto the
+    // runtime and reply from there, so none of them holds a thread; what still
+    // does is a round trip per cache-missing read, listing or metadata call,
+    // plus a write waiting on its own handle's upload. With one thread any of
+    // those stalls the entire mount, `readdir` of the mount point included —
+    // which is what made a copy into `~/mnt` look like "the home directory
+    // won't load".
+    //
+    // `clone_fd` is left off: it needs Linux 4.5+ and its failure would surface
+    // only after the session thread had already started, killing the mount. The
+    // threads share one /dev/fuse fd instead, exactly as libfuse's own
+    // multi-threaded loop does by default.
+    config.n_threads = Some(if opts.io_threads == 0 {
+        default_io_threads()
+    } else {
+        opts.io_threads
+    });
+    config
+}
+
 #[cfg(target_os = "linux")]
 pub fn spawn_mount(
     client: Arc<SynologyClient>,
@@ -124,7 +198,6 @@ pub fn spawn_mount(
 ) -> Result<MountHandle, SynoFsError> {
     use cache::{InodeCache, ReadCache, READ_BLOCK_SIZE};
     use fs::SynologyFS;
-    use fuser::{Config, MountOption, SessionACL};
     use tracing::info;
 
     let cache = Arc::new(InodeCache::new(opts.cache_ttl));
@@ -142,37 +215,19 @@ pub fn spawn_mount(
 
     let fs = SynologyFS::new(client.clone(), cache, read_cache, rt, uid, gid);
 
-    // `allow_other` (kernel-level access for other users) moved off MountOption
-    // in fuser 0.17 — it's now expressed via Config::acl: SessionACL::All.
-    // As a non-root user this requires `user_allow_other` in /etc/fuse.conf;
-    // running as root always permits it.
+    // As a non-root user, allow_other requires `user_allow_other` in
+    // /etc/fuse.conf; running as root always permits it.
     let allow_other = uid == 0 || fuse_conf_allows_other();
-    let acl = if allow_other {
-        SessionACL::All
-    } else {
+    if !allow_other {
         tracing::warn!(
             "allow_other is not enabled: only the mounting user can access the \
              filesystem. To allow other users, add or uncomment \
              `user_allow_other` in /etc/fuse.conf."
         );
-        SessionACL::Owner
-    };
-
-    let mut mount_options = vec![
-        MountOption::RW,
-        MountOption::FSName("synology-fuse".to_string()),
-    ];
-    // AutoUnmount requires AllowOther or AllowRoot per libfuse / fuser docs.
-    // Without that, the mount would fail. Skip AutoUnmount when allow_other is
-    // unavailable so the mount still succeeds (the user just has to unmount
-    // manually with `fusermount -u <mountpoint>`).
-    if allow_other {
-        mount_options.push(MountOption::AutoUnmount);
     }
 
-    let mut config = Config::default();
-    config.mount_options = mount_options;
-    config.acl = acl;
+    let config = session_config(allow_other, &opts);
+    info!("FUSE event loop: {} threads", config.n_threads.unwrap_or(1));
 
     info!("Mounting shares on {}", mountpoint.display());
     let session = fuser::spawn_mount(fs, &mountpoint, &config).map_err(|e| {
@@ -541,5 +596,69 @@ pub fn spawn_mount(
                 "WinFsp worker exited before mounting".to_string(),
             ))
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// Regression: the session ran fuser's default *single* event-loop thread,
+    /// and `flush` used to upload on that thread. One multi-gigabyte upload
+    /// therefore blocked every other FUSE callback on the mount — `readdir` of
+    /// the mount point included — so the whole filesystem looked hung for as
+    /// long as the copy took. Transfers have since moved to the runtime, but a
+    /// cache-missing read or a listing still holds its thread for a round trip,
+    /// so one thread is still one stall away from the same symptom.
+    #[test]
+    fn the_event_loop_runs_more_than_one_thread() {
+        let cfg = session_config(false, &MountOptions::default());
+        assert!(
+            cfg.n_threads.unwrap_or(1) > 1,
+            "a single event-loop thread lets any one slow callback wedge the \
+             mount, got {:?}",
+            cfg.n_threads
+        );
+    }
+
+    #[test]
+    fn the_thread_count_is_caller_tunable() {
+        let opts = MountOptions {
+            io_threads: 3,
+            ..MountOptions::default()
+        };
+        assert_eq!(session_config(false, &opts).n_threads, Some(3));
+    }
+
+    /// `0` is the "you pick" value the CLI defaults to, so it must land on the
+    /// automatic count rather than asking fuser for zero threads (which fails
+    /// the mount outright).
+    #[test]
+    fn zero_threads_means_automatic() {
+        let opts = MountOptions {
+            io_threads: 0,
+            ..MountOptions::default()
+        };
+        assert_eq!(
+            session_config(false, &opts).n_threads,
+            Some(default_io_threads())
+        );
+        assert!(default_io_threads() > 1);
+    }
+
+    /// AutoUnmount requires allow_other; asking for it without is a mount
+    /// failure, so the existing pairing has to survive the config extraction.
+    #[test]
+    fn auto_unmount_is_only_requested_alongside_allow_other() {
+        use fuser::{MountOption, SessionACL};
+
+        let opts = MountOptions::default();
+        let with = session_config(true, &opts);
+        assert_eq!(with.acl, SessionACL::All);
+        assert!(with.mount_options.contains(&MountOption::AutoUnmount));
+
+        let without = session_config(false, &opts);
+        assert_eq!(without.acl, SessionACL::Owner);
+        assert!(!without.mount_options.contains(&MountOption::AutoUnmount));
     }
 }

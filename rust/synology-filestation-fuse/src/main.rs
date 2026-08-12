@@ -68,6 +68,13 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     read_cache_mb: u64,
 
+    /// FUSE event-loop threads; 0 picks a default from the CPU count.
+    /// Bounds the callbacks that still hold a thread — a read that misses the
+    /// cache, a listing, a metadata call — not file transfers, which run on the
+    /// async runtime (Linux/FUSE only)
+    #[arg(long, default_value_t = 0)]
+    fuse_threads: usize,
+
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -182,6 +189,7 @@ fn main() -> anyhow::Result<()> {
     let opts = MountOptions {
         cache_ttl: args.cache_ttl,
         read_cache_mb: args.read_cache_mb,
+        io_threads: args.fuse_threads,
     };
     let handle = spawn_mount(client.clone(), rt.handle().clone(), args.mountpoint, opts)?;
 
