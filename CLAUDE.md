@@ -156,7 +156,7 @@ The GUI path goes: MountService.cs / SynoClient.cs → P/Invoke (Interop/NativeM
 |------|------|
 | `main.rs`   | CLI binary: parsing (clap), interactive prompts, login, then calls `lib.rs::spawn_mount` and parks on Ctrl-C |
 | `lib.rs`    | Library surface: `spawn_mount`/`MountHandle` (non-blocking, background mount) + `is_otp_required`, shared by the CLI and the FFI crate |
-| `fs.rs`     | Linux FUSE backend; uses `runtime.block_on()` for each FUSE callback |
+| `fs.rs`     | Linux FUSE backend. Metadata callbacks use `runtime.block_on()`; **file transfers do not** — `flush`/`release` (upload), `setattr` (truncate) and cross-directory `rename` hand the transfer to the Tokio runtime via `start_*` and reply to the kernel from there, so no transfer ever occupies an event-loop thread. Transfers are capped at `MAX_CONCURRENT_TRANSFERS` (the event loop used to be that limit by accident) and each open handle has its own buffer lock. The session also runs a multi-threaded event loop (`MountOptions::io_threads`, `--fuse-threads`) for the remaining blocking callbacks |
 | `cache.rs`  | Linux only — `InodeCache` (TTL metadata), `ReadCache` (LRU block cache, 256 KiB blocks, prefetch) |
 | `webdav.rs` | macOS WebDAV backend; directory moves are download→upload→delete |
 | `winfs.rs`  | Windows WinFsp backend; in-memory write buffers flushed atomically on close |

@@ -49,12 +49,271 @@ struct WriteBuffer {
     new_file: bool,
 }
 
+/// Translate FileStation metadata into a `FileAttr`, falling back to
+/// `fallback_uid`/`fallback_gid` when the NAS reports no owner.
+///
+/// A free function rather than a method: a spawned transfer replies to the
+/// kernel from the runtime, where there is no `&self` left to borrow — only
+/// the two ids it copied out of the filesystem.
+fn file_attr(fallback_uid: u32, fallback_gid: u32, ino: u64, info: &SynoFileInfo) -> FileAttr {
+    let kind = if info.isdir {
+        FileType::Directory
+    } else {
+        FileType::RegularFile
+    };
+    let size = info.additional.as_ref().and_then(|a| a.size).unwrap_or(0);
+    let perm = info
+        .additional
+        .as_ref()
+        .and_then(|a| a.perm.as_ref())
+        .map(|p| p.posix as u16)
+        .unwrap_or(if info.isdir { 0o755 } else { 0o644 });
+
+    let ts_to_system = |ts: i64| {
+        if ts >= 0 {
+            UNIX_EPOCH + Duration::from_secs(ts as u64)
+        } else {
+            UNIX_EPOCH
+        }
+    };
+
+    let (atime, mtime, ctime, crtime) = info
+        .additional
+        .as_ref()
+        .and_then(|a| a.time.as_ref())
+        .map(|t| {
+            (
+                ts_to_system(t.atime),
+                ts_to_system(t.mtime),
+                ts_to_system(t.ctime),
+                ts_to_system(t.crtime),
+            )
+        })
+        .unwrap_or_else(|| {
+            let now = SystemTime::now();
+            (now, now, now, now)
+        });
+
+    let uid = info
+        .additional
+        .as_ref()
+        .and_then(|a| a.owner.as_ref())
+        .map(|o| o.uid)
+        .unwrap_or(fallback_uid);
+    let gid = info
+        .additional
+        .as_ref()
+        .and_then(|a| a.owner.as_ref())
+        .map(|o| o.gid)
+        .unwrap_or(fallback_gid);
+
+    FileAttr {
+        ino: INodeNo(ino),
+        size,
+        blocks: size.div_ceil(512),
+        atime,
+        mtime,
+        ctime,
+        crtime,
+        kind,
+        perm,
+        nlink: if info.isdir { 2 } else { 1 },
+        uid,
+        gid,
+        rdev: 0,
+        blksize: 4096,
+        flags: 0,
+    }
+}
+
+/// Open write handles, keyed by file handle. The outer lock guards the map and
+/// is never held across I/O; each buffer has its own lock so a transfer on one
+/// handle never blocks work on another. Shared with spawned transfer tasks,
+/// hence the `Arc`.
+type Buffers = Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<WriteBuffer>>>>>;
+
+/// How many file transfers may be on the wire at once.
+///
+/// The FUSE event loop used to be this limit by accident — one dispatch thread
+/// meant one transfer — which is also precisely why a single upload wedged the
+/// mount. Now that transfers run on the Tokio runtime, nothing else bounds
+/// them, and unbounded parallel FileStation transfers are what saturated
+/// `synoscgi` (the shared per-request CGI backend behind the Download/Upload
+/// APIs) and took the appliance down. Keep the fan-out single-digit: DSM's own
+/// web client uploads one slice at a time.
+const MAX_CONCURRENT_TRANSFERS: usize = 4;
+
+/// Everything a file transfer touches, cloned out of the filesystem so a
+/// spawned task owns it and can outlive the callback that started it.
+///
+/// This is what lets `flush`, `setattr` and `rename` hand a multi-gigabyte
+/// transfer to the runtime and return immediately: the FUSE callback keeps
+/// nothing borrowed, and the kernel reply is sent from the task when the
+/// transfer actually lands.
+#[derive(Clone)]
+struct Transfers {
+    client: Arc<SynologyClient>,
+    cache: Arc<InodeCache>,
+    read_cache: Arc<ReadCache>,
+    buffers: Buffers,
+    limit: Arc<tokio::sync::Semaphore>,
+}
+
+impl Transfers {
+    fn buffer(&self, fh: u64) -> Option<Arc<tokio::sync::Mutex<WriteBuffer>>> {
+        self.buffers.lock().unwrap().get(&fh).cloned()
+    }
+
+    /// Wait for a slot on the wire. Held only for the network call itself, so a
+    /// queued transfer costs a future, not a thread.
+    async fn permit(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.limit
+            .acquire()
+            .await
+            .expect("the transfer semaphore is never closed")
+    }
+
+    /// Upload `fh`'s buffered data and resolve once the NAS has it.
+    ///
+    /// `dirty` is cleared only *after* the upload succeeds, so a failed flush
+    /// leaves the data buffered for `release` to retry rather than silently
+    /// discarding the write.
+    async fn upload(&self, fh: u64) -> Result<(), SynoFsError> {
+        let handle = match self.buffer(fh) {
+            Some(h) => h,
+            // Unknown handle: there is genuinely nothing to do.
+            None => return Ok(()),
+        };
+        // Lock first, permit second — never the other way round. A task holding
+        // a permit while waiting for a buffer lock could be waiting on a task
+        // that is itself queued for a permit; with every permit held by such a
+        // waiter, nothing would ever progress.
+        //
+        // The lock is held for the whole transfer, which is the point: for a
+        // spilled buffer the payload *is* the temp file being streamed, so a
+        // concurrent write would tear the body mid-flight.
+        let mut buf = handle.lock().await;
+        if !buf.dirty {
+            // Nothing written since the last successful upload.
+            return Ok(());
+        }
+        let payload = payload_for(&mut buf.data).map_err(|e| SynoFsError::Io(e.to_string()))?;
+        let (nas_path, ino, overwrite) = (buf.nas_path.clone(), buf.ino, !buf.new_file);
+
+        let (parent, filename) = match split_nas_path(&nas_path) {
+            Some(v) => v,
+            None => return Err(SynoFsError::InvalidArg),
+        };
+
+        debug!(
+            "upload: fh={} parent={:?} filename={:?} size={}",
+            fh,
+            parent,
+            filename,
+            payload.len()
+        );
+        {
+            let _permit = self.permit().await;
+            upload_payload(&self.client, parent, filename, payload, overwrite).await?;
+        }
+
+        // Durable now: stop advertising the buffer as dirty, and record that the
+        // file exists on the NAS so a later flush overwrites instead of racing
+        // an `overwrite=false` create against itself.
+        buf.dirty = false;
+        buf.new_file = false;
+        drop(buf);
+
+        self.cache.invalidate_path(&nas_path);
+        self.read_cache.invalidate_ino(ino);
+        Ok(())
+    }
+
+    /// Resize `path` to `new_size`, zero-extending or truncating.
+    ///
+    /// FileStation has no truncate call, so this is read-modify-write. A
+    /// download that fails must abort the whole operation, because the
+    /// alternative — treating an unreadable file as an empty one — uploads
+    /// `new_size` zero bytes over perfectly good data.
+    async fn truncate(
+        &self,
+        ino: u64,
+        path: &str,
+        new_size: u64,
+    ) -> Result<SynoFileInfo, SynoFsError> {
+        // Shrinking to nothing needs no prior content, and this is the common
+        // case (O_TRUNC, `> file`). Skip the round trip entirely rather than
+        // downloading a file we are about to discard.
+        let data = if new_size == 0 {
+            Vec::new()
+        } else {
+            let permit = self.permit().await;
+            let current = self.client.download(path, 0, 0).await?;
+            drop(permit);
+            let mut data = current.to_vec();
+            data.resize(new_size as usize, 0);
+            data
+        };
+
+        let (parent, filename) = match split_nas_path(path) {
+            Some(v) => v,
+            None => return Err(SynoFsError::InvalidArg),
+        };
+        {
+            let _permit = self.permit().await;
+            self.client.upload(parent, filename, data, true).await?;
+        }
+
+        self.read_cache.invalidate_ino(ino);
+        self.cache.invalidate_path(path);
+        self.client.get_info(path).await
+    }
+
+    /// Move a file between directories: download, upload to the new location,
+    /// then delete the source. FileStation's Rename API cannot move across
+    /// directories, so this is the only route.
+    async fn move_across_dirs(
+        &self,
+        old_path: &str,
+        new_parent: &str,
+        new_name: &str,
+    ) -> Result<(), SynoFsError> {
+        // `length = 0` means "the whole file". Sizing this request from the
+        // inode cache instead would silently truncate the file whenever that
+        // cached size is stale-low — and this path deletes the source
+        // afterwards, so the missing bytes are simply gone.
+        let permit = self.permit().await;
+        let data = self.client.download(old_path, 0, 0).await?;
+        drop(permit);
+
+        {
+            let _permit = self.permit().await;
+            self.client
+                .upload(new_parent, new_name, data.to_vec(), true)
+                .await?;
+        }
+
+        // Only the source deletion is best-effort: the copy is already safe on
+        // the NAS, so a failure here leaves a duplicate rather than losing data.
+        if let Err(e) = self.client.delete(old_path).await {
+            warn!(
+                "rename: uploaded {}/{} but failed to delete {}: {}",
+                new_parent, new_name, old_path, e
+            );
+        }
+        Ok(())
+    }
+}
+
 pub struct SynologyFS {
     client: Arc<SynologyClient>,
     cache: Arc<InodeCache>,
     read_cache: Arc<ReadCache>,
     rt: tokio::runtime::Handle,
-    write_buffers: Mutex<HashMap<u64, WriteBuffer>>,
+    write_buffers: Buffers,
+    /// Bounds how many transfers are on the wire at once, now that they are no
+    /// longer implicitly serialised by the event loop.
+    transfer_limit: Arc<tokio::sync::Semaphore>,
     next_fh: AtomicU64,
     uid: u32,
     gid: u32,
@@ -74,10 +333,22 @@ impl SynologyFS {
             cache,
             read_cache,
             rt,
-            write_buffers: Mutex::new(HashMap::new()),
+            write_buffers: Arc::new(Mutex::new(HashMap::new())),
+            transfer_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
             next_fh: AtomicU64::new(1),
             uid,
             gid,
+        }
+    }
+
+    /// A transfer bundle owning clones of everything a background task needs.
+    fn transfers(&self) -> Transfers {
+        Transfers {
+            client: self.client.clone(),
+            cache: self.cache.clone(),
+            read_cache: self.read_cache.clone(),
+            buffers: self.write_buffers.clone(),
+            limit: self.transfer_limit.clone(),
         }
     }
 
@@ -89,137 +360,93 @@ impl SynologyFS {
     }
 
     fn syno_to_attr(&self, ino: u64, info: &SynoFileInfo) -> FileAttr {
-        let kind = if info.isdir {
-            FileType::Directory
-        } else {
-            FileType::RegularFile
-        };
-        let size = info.additional.as_ref().and_then(|a| a.size).unwrap_or(0);
-        let perm = info
-            .additional
-            .as_ref()
-            .and_then(|a| a.perm.as_ref())
-            .map(|p| p.posix as u16)
-            .unwrap_or(if info.isdir { 0o755 } else { 0o644 });
-
-        let ts_to_system = |ts: i64| {
-            if ts >= 0 {
-                UNIX_EPOCH + Duration::from_secs(ts as u64)
-            } else {
-                UNIX_EPOCH
-            }
-        };
-
-        let (atime, mtime, ctime, crtime) = info
-            .additional
-            .as_ref()
-            .and_then(|a| a.time.as_ref())
-            .map(|t| {
-                (
-                    ts_to_system(t.atime),
-                    ts_to_system(t.mtime),
-                    ts_to_system(t.ctime),
-                    ts_to_system(t.crtime),
-                )
-            })
-            .unwrap_or_else(|| {
-                let now = SystemTime::now();
-                (now, now, now, now)
-            });
-
-        let uid = info
-            .additional
-            .as_ref()
-            .and_then(|a| a.owner.as_ref())
-            .map(|o| o.uid)
-            .unwrap_or(self.uid);
-        let gid = info
-            .additional
-            .as_ref()
-            .and_then(|a| a.owner.as_ref())
-            .map(|o| o.gid)
-            .unwrap_or(self.gid);
-
-        FileAttr {
-            ino: INodeNo(ino),
-            size,
-            blocks: size.div_ceil(512),
-            atime,
-            mtime,
-            ctime,
-            crtime,
-            kind,
-            perm,
-            nlink: if info.isdir { 2 } else { 1 },
-            uid,
-            gid,
-            rdev: 0,
-            blksize: 4096,
-            flags: 0,
-        }
+        file_attr(self.uid, self.gid, ino, info)
     }
 
     fn get_path_for_ino(&self, ino: u64) -> Option<String> {
         self.cache.get_path_for_ino(ino)
     }
 
-    /// Upload `fh`'s buffered data and block until the NAS has it.
+    /// Start `fh`'s upload on the Tokio runtime and hand the outcome to `done`.
     ///
-    /// This is what `flush` (and therefore `close(2)`) reports on, so it must
-    /// be synchronous: an upload still in flight when we return is an upload
-    /// whose failure nobody will ever hear about.
+    /// This is the shape that keeps a transfer off the FUSE event loop.
+    /// `close(2)` still returns the upload's real outcome — `done` sends the
+    /// kernel reply — but it is produced on a runtime thread, so the event-loop
+    /// thread returns to serving the mount the moment the work is queued.
+    /// Uploading inline was what made a large copy look like a hung filesystem.
+    fn start_upload<F>(&self, fh: u64, done: F)
+    where
+        F: FnOnce(Result<(), SynoFsError>) + Send + 'static,
+    {
+        let xfer = self.transfers();
+        self.rt.spawn(async move { done(xfer.upload(fh).await) });
+    }
+
+    /// Same, for the read-modify-write behind `truncate`.
+    fn start_truncate<F>(&self, ino: u64, path: String, new_size: u64, done: F)
+    where
+        F: FnOnce(Result<SynoFileInfo, SynoFsError>) + Send + 'static,
+    {
+        let xfer = self.transfers();
+        self.rt
+            .spawn(async move { done(xfer.truncate(ino, &path, new_size).await) });
+    }
+
+    /// Same, for the download→upload→delete behind a cross-directory rename.
+    fn start_move_across_dirs<F>(
+        &self,
+        old_path: String,
+        new_parent: String,
+        new_name: String,
+        done: F,
+    ) where
+        F: FnOnce(Result<(), SynoFsError>) + Send + 'static,
+    {
+        let xfer = self.transfers();
+        self.rt.spawn(async move {
+            done(
+                xfer.move_across_dirs(&old_path, &new_parent, &new_name)
+                    .await,
+            )
+        });
+    }
+
+    /// Upload `fh`'s buffered data, blocking until it lands.
     ///
-    /// `dirty` is cleared only *after* the upload succeeds. A failed flush
-    /// therefore leaves the data buffered for `release` to retry, matching what
-    /// the WinFsp backend already does — previously the flag was cleared before
-    /// the upload even started, so a failure silently discarded the write.
+    /// Only `destroy` uses this: at unmount there is no event loop left to keep
+    /// responsive, and the runtime is about to go away, so the wait is the
+    /// point. Everything else goes through [`SynologyFS::start_upload`].
     fn finish_upload(&self, fh: u64) -> Result<(), SynoFsError> {
-        // Snapshot under the lock; never hold it across the upload. For a
-        // spilled buffer the payload is just the temp path, and that file stays
-        // alive because the buffer itself stays in `write_buffers` until
-        // `release` removes it — after this call has returned.
-        let (nas_path, ino, payload, overwrite) = {
-            let mut buffers = self.write_buffers.lock().unwrap();
-            let buf = match buffers.get_mut(&fh) {
-                Some(b) if b.dirty => b,
-                // Unknown handle, or nothing written since the last successful
-                // upload: there is genuinely nothing to do.
-                _ => return Ok(()),
-            };
-            let payload = payload_for(&mut buf.data).map_err(|e| SynoFsError::Io(e.to_string()))?;
-            (buf.nas_path.clone(), buf.ino, payload, !buf.new_file)
-        };
+        let xfer = self.transfers();
+        self.block(xfer.upload(fh))
+    }
 
-        let (parent, filename) = match split_nas_path(&nas_path) {
-            Some(v) => v,
-            None => return Err(SynoFsError::InvalidArg),
-        };
-
-        debug!(
-            "finish_upload: fh={} parent={:?} filename={:?} size={}",
-            fh,
-            parent,
-            filename,
-            payload.len()
-        );
-        self.block(upload_payload(
-            &self.client,
-            parent,
-            filename,
-            payload,
-            overwrite,
-        ))?;
-
-        // Durable now: stop advertising the buffer as dirty, and record that the
-        // file exists on the NAS so a later flush overwrites instead of racing
-        // an `overwrite=false` create against itself.
-        if let Some(buf) = self.write_buffers.lock().unwrap().get_mut(&fh) {
-            buf.dirty = false;
-            buf.new_file = false;
-        }
-        self.cache.invalidate_path(&nas_path);
-        self.read_cache.invalidate_ino(ino);
+    /// Buffer `data` at `offset` for the handle `fh`.
+    ///
+    /// Split out of the `write` callback so the locking contract — a write to a
+    /// handle whose upload is in flight waits for it — is testable without a
+    /// live mount. Waiting is correct: the upload may be streaming the very
+    /// spill file this would overwrite. It is also rare, since an application
+    /// has stopped writing by the time `close(2)` triggers the flush.
+    fn write_buffer_at(&self, fh: u64, offset: u64, data: &[u8]) -> Result<(), SynoFsError> {
+        let handle = self
+            .buffer(fh)
+            .ok_or_else(|| SynoFsError::Io(format!("write to unknown file handle {fh}")))?;
+        // A FUSE callback thread is not a runtime thread, so blocking here is
+        // allowed — and it blocks only this handle's writer.
+        let mut buf = handle.blocking_lock();
+        buf.data
+            .write_at(offset, data)
+            .map_err(|e| SynoFsError::Io(e.to_string()))?;
+        buf.dirty = true;
         Ok(())
+    }
+
+    /// The buffer for `fh`, if the handle is still open. The map lock is only
+    /// ever held long enough to clone the `Arc` — never across a transfer —
+    /// so one handle's upload cannot stall lookups of another's.
+    fn buffer(&self, fh: u64) -> Option<Arc<tokio::sync::Mutex<WriteBuffer>>> {
+        self.write_buffers.lock().unwrap().get(&fh).cloned()
     }
 
     /// Assemble a byte range for `read`, block by block, out of the read cache.
@@ -309,74 +536,29 @@ impl SynologyFS {
         Ok(result)
     }
 
-    /// Resize `path` to `new_size`, zero-extending or truncating.
-    ///
-    /// FileStation has no truncate call, so this is read-modify-write. Split out
-    /// of `setattr` so the failure behaviour is testable: a download that fails
-    /// must abort the whole operation, because the alternative — treating an
-    /// unreadable file as an empty one — uploads `new_size` zero bytes over
-    /// perfectly good data.
+    /// Blocking wrappers over the transfer bundle. The callbacks all go through
+    /// `start_*`; these exist so the tests can assert on what a transfer *does*
+    /// (download sizing, failure handling) without a runtime dance.
+    #[cfg(test)]
     fn truncate_file(
         &self,
         ino: u64,
         path: &str,
         new_size: u64,
     ) -> Result<SynoFileInfo, SynoFsError> {
-        // Shrinking to nothing needs no prior content, and this is the common
-        // case (O_TRUNC, `> file`). Skip the round trip entirely rather than
-        // downloading a file we are about to discard.
-        let data = if new_size == 0 {
-            Vec::new()
-        } else {
-            let current = self.block(self.client.download(path, 0, 0))?;
-            let mut data = current.to_vec();
-            data.resize(new_size as usize, 0);
-            data
-        };
-
-        let (parent, filename) = match split_nas_path(path) {
-            Some(v) => v,
-            None => return Err(SynoFsError::InvalidArg),
-        };
-        self.block(self.client.upload(parent, filename, data, true))?;
-
-        self.read_cache.invalidate_ino(ino);
-        self.cache.invalidate_path(path);
-        self.block(self.client.get_info(path))
+        let xfer = self.transfers();
+        self.block(xfer.truncate(ino, path, new_size))
     }
 
-    /// Move a file between directories: download, upload to the new location,
-    /// then delete the source. FileStation's Rename API cannot move across
-    /// directories, so this is the only route.
-    ///
-    /// Split out of `rename` so the download sizing is testable — it must ask
-    /// for the *whole* file rather than a length taken from cached metadata.
+    #[cfg(test)]
     fn move_across_dirs(
         &self,
         old_path: &str,
         new_parent: &str,
         new_name: &str,
     ) -> Result<(), SynoFsError> {
-        // `length = 0` means "the whole file". Sizing this request from the
-        // inode cache instead would silently truncate the file whenever that
-        // cached size is stale-low — and this path deletes the source
-        // afterwards, so the missing bytes are simply gone.
-        let data = self.block(self.client.download(old_path, 0, 0))?;
-
-        self.block(
-            self.client
-                .upload(new_parent, new_name, data.to_vec(), true),
-        )?;
-
-        // Only the source deletion is best-effort: the copy is already safe on
-        // the NAS, so a failure here leaves a duplicate rather than losing data.
-        if let Err(e) = self.block(self.client.delete(old_path)) {
-            warn!(
-                "rename: uploaded {}/{} but failed to delete {}: {}",
-                new_parent, new_name, old_path, e
-            );
-        }
-        Ok(())
+        let xfer = self.transfers();
+        self.block(xfer.move_across_dirs(old_path, new_parent, new_name))
     }
 
     /// Synthetic FileAttr for the virtual root (inode 1).
@@ -421,7 +603,11 @@ impl Filesystem for SynologyFS {
 
     fn destroy(&mut self) {
         debug!("destroy: flushing write buffers and logging out");
-        // Flush any remaining write buffers
+        // Transfers now run on the runtime, which dies with the process — so
+        // unmount has to wait for anything still in flight rather than leave it
+        // to be aborted. Taking each buffer's lock is that wait: an upload holds
+        // it for the whole transfer, and whatever is still dirty afterwards is
+        // work that never started (or failed) and is uploaded here.
         let fhs: Vec<u64> = self.write_buffers.lock().unwrap().keys().cloned().collect();
         for fh in fhs {
             if let Err(e) = self.finish_upload(fh) {
@@ -773,13 +959,13 @@ impl Filesystem for SynologyFS {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         self.write_buffers.lock().unwrap().insert(
             fh,
-            WriteBuffer {
+            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
                 nas_path: path,
                 ino,
                 data: SpillBuffer::new(),
                 dirty: false,
                 new_file: false,
-            },
+            })),
         );
         // FOPEN_KEEP_CACHE: don't invalidate the kernel page cache between opens.
         reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
@@ -807,31 +993,17 @@ impl Filesystem for SynologyFS {
             data.len()
         );
 
-        // No background upload can be in flight: flush() uploads synchronously,
-        // so by the time a write is dispatched any earlier flush has completed
-        // and already cleared `new_file`.
-        let mut buffers = self.write_buffers.lock().unwrap();
-        let buf = match buffers.get_mut(&fh) {
-            Some(b) => b,
-            None => {
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-
-        // If writing at an offset beyond current buffer, we need the existing file content first.
-        // This is handled by seeding the buffer in create/open if needed.
-        // For simplicity: if offset > current len, seed from API on first write.
         // The buffer spills to a temp file once it outgrows SpillBuffer's
-        // threshold, so a large copy no longer pins the whole file in RAM (and
-        // no longer stalls every other FUSE callback behind that allocation).
-        if let Err(e) = buf.data.write_at(offset, data) {
-            error!("write: buffering failed: {}", e);
-            reply.error(Errno::EIO);
-            return;
+        // threshold, so a large copy no longer pins the whole file in RAM. A
+        // flush already running on this handle holds the buffer's lock, so this
+        // waits for that transfer rather than mutating the file it is streaming.
+        match self.write_buffer_at(fh, offset, data) {
+            Ok(()) => reply.written(data.len() as u32),
+            Err(e) => {
+                error!("write: buffering failed: {}", e);
+                reply.error(Errno::EIO);
+            }
         }
-        buf.dirty = true;
-        reply.written(data.len() as u32);
     }
 
     fn flush(
@@ -845,16 +1017,17 @@ impl Filesystem for SynologyFS {
         let fh = fh.0;
         debug!("flush: fh={}", fh);
         // The kernel returns *this* reply from close(2), and discards whatever
-        // release() reports. So the upload has to happen here, synchronously,
-        // and its error has to come back here — otherwise a failed upload is
-        // reported to the application as a successful close.
-        match self.finish_upload(fh) {
+        // release() reports. So the reply has to carry the upload's real
+        // outcome — but it does not have to be produced here. The transfer runs
+        // on the runtime and answers the kernel when it lands, leaving this
+        // event-loop thread free to serve the rest of the mount meanwhile.
+        self.start_upload(fh, move |r| match r {
             Ok(()) => reply.ok(),
             Err(e) => {
                 error!("flush fh={}: {}", fh, e);
                 reply.error(errno(e.to_errno()));
             }
-        }
+        });
     }
 
     fn release(
@@ -869,15 +1042,19 @@ impl Filesystem for SynologyFS {
     ) {
         let fh = fh.0;
         debug!("release: fh={}", fh);
-        let result = self.finish_upload(fh);
-        self.write_buffers.lock().unwrap().remove(&fh);
-        match result {
-            Ok(()) => reply.ok(),
-            Err(e) => {
-                error!("release fh={}: {}", fh, e);
-                reply.error(errno(e.to_errno()));
+        // Same treatment as flush, plus the handle teardown — which has to wait
+        // for the upload, since the buffer owns the spill file being streamed.
+        let buffers = self.write_buffers.clone();
+        self.start_upload(fh, move |r| {
+            buffers.lock().unwrap().remove(&fh);
+            match r {
+                Ok(()) => reply.ok(),
+                Err(e) => {
+                    error!("release fh={}: {}", fh, e);
+                    reply.error(errno(e.to_errno()));
+                }
             }
-        }
+        });
     }
 
     fn create(
@@ -927,13 +1104,13 @@ impl Filesystem for SynologyFS {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         self.write_buffers.lock().unwrap().insert(
             fh,
-            WriteBuffer {
+            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
                 nas_path: new_path,
                 ino,
                 data: SpillBuffer::new(),
                 dirty: false,
                 new_file: true,
-            },
+            })),
         );
 
         reply.created(
@@ -1135,17 +1312,27 @@ impl Filesystem for SynologyFS {
             return;
         }
 
-        // Cross-directory file move: download, upload, delete.
-        match self.move_across_dirs(&old_path, &new_parent_path, new_name_str) {
-            Ok(()) => {
-                self.cache.invalidate_path(&old_path);
-                reply.ok();
-            }
-            Err(e) => {
-                error!("rename {} -> {}: {}", old_path, new_path, e);
-                reply.error(errno(e.to_errno()));
-            }
-        }
+        // Cross-directory file move: download, upload, delete. A whole-file
+        // transfer, so it goes to the runtime rather than sitting on this
+        // event-loop thread for the length of the copy.
+        let cache = self.cache.clone();
+        let old = old_path.clone();
+        let new = new_path.clone();
+        self.start_move_across_dirs(
+            old_path,
+            new_parent_path,
+            new_name_str.to_string(),
+            move |r| match r {
+                Ok(()) => {
+                    cache.invalidate_path(&old);
+                    reply.ok();
+                }
+                Err(e) => {
+                    error!("rename {} -> {}: {}", old, new, e);
+                    reply.error(errno(e.to_errno()));
+                }
+            },
+        );
     }
 
     fn setattr(
@@ -1181,17 +1368,22 @@ impl Filesystem for SynologyFS {
                 ino, path, new_size
             );
 
-            match self.truncate_file(ino, &path, new_size) {
+            // Read-modify-write over the whole file, so it too runs on the
+            // runtime and replies from there.
+            let cache = self.cache.clone();
+            let (uid, gid) = (self.uid, self.gid);
+            let failed_path = path.clone();
+            self.start_truncate(ino, path, new_size, move |r| match r {
                 Ok(info) => {
-                    let attr = self.syno_to_attr(ino, &info);
-                    self.cache.insert(ino, info);
+                    let attr = file_attr(uid, gid, ino, &info);
+                    cache.insert(ino, info);
                     reply.attr(&TTL, &attr);
                 }
                 Err(e) => {
-                    error!("setattr truncate {}: {}", path, e);
+                    error!("setattr truncate {}: {}", failed_path, e);
                     reply.error(errno(e.to_errno()));
                 }
-            }
+            });
         } else {
             // For other attribute changes (permissions, timestamps), return current attrs
             // The Synology API doesn't support changing these
@@ -1364,19 +1556,24 @@ mod tests {
     }
 
     fn seed_dirty_buffer(f: &Fixture, nas_path: &str, data: &[u8]) -> u64 {
+        seed_dirty_buffer_fh(f, 1, nas_path, data)
+    }
+
+    /// Same, but for the handle of the caller's choosing — the concurrency
+    /// tests need two live buffers at once.
+    fn seed_dirty_buffer_fh(f: &Fixture, fh: u64, nas_path: &str, data: &[u8]) -> u64 {
         let ino = f.fs.cache.get_or_alloc_ino(nas_path);
         let mut buf = SpillBuffer::new();
         buf.write_at(0, data).unwrap();
-        let fh = 1u64;
         f.fs.write_buffers.lock().unwrap().insert(
             fh,
-            WriteBuffer {
+            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
                 nas_path: nas_path.to_string(),
                 ino,
                 data: buf,
                 dirty: true,
                 new_file: true,
-            },
+            })),
         );
         fh
     }
@@ -1605,7 +1802,7 @@ mod tests {
         assert!(f.fs.finish_upload(fh).is_err());
 
         assert!(
-            f.fs.write_buffers.lock().unwrap().get(&fh).unwrap().dirty,
+            f.fs.buffer(fh).unwrap().blocking_lock().dirty,
             "a failed upload must leave the buffer dirty so release() retries it"
         );
     }
@@ -1621,8 +1818,8 @@ mod tests {
         let fh = seed_dirty_buffer(&f, "/share/new.txt", b"payload");
         f.fs.finish_upload(fh).unwrap();
 
-        let buffers = f.fs.write_buffers.lock().unwrap();
-        let buf = buffers.get(&fh).unwrap();
+        let handle = f.fs.buffer(fh).unwrap();
+        let buf = handle.blocking_lock();
         assert!(!buf.dirty, "a successful upload clears dirty");
         assert!(!buf.new_file, "the file now exists on the NAS");
     }
@@ -1638,14 +1835,283 @@ mod tests {
         );
 
         let fh = seed_dirty_buffer(&f, "/share/new.txt", b"payload");
-        f.fs.write_buffers
-            .lock()
-            .unwrap()
-            .get_mut(&fh)
-            .unwrap()
-            .dirty = false;
+        f.fs.buffer(fh).unwrap().blocking_lock().dirty = false;
 
         f.fs.finish_upload(fh).unwrap();
+    }
+
+    // ── T1.5: concurrent dispatch ─────────────────────────────────────────────
+
+    /// A slow upload, so a second thread can be observed racing it.
+    fn mount_upload_slow(f: &Fixture, delay: Duration) {
+        f.rt.block_on(
+            Mock::given(http_method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"success": true, "data": {"blks": null}}))
+                        .set_delay(delay),
+                )
+                .mount(&f.server),
+        );
+    }
+
+    /// Regression: `finish_upload` snapshotted the buffer and then uploaded with
+    /// no lock held, which was safe only because fuser dispatched every callback
+    /// on one thread. Now that the event loop is multi-threaded, a `write` can
+    /// land while that handle's upload is in flight — and for a spilled buffer
+    /// the "snapshot" is the temp file the upload is still streaming, so the
+    /// write would tear the body mid-transfer. A write must wait for the upload
+    /// already running on its handle.
+    #[test]
+    fn a_write_waits_for_an_upload_in_flight_on_the_same_handle() {
+        let f = fixture();
+        mount_upload_slow(&f, Duration::from_millis(600));
+
+        let fh = seed_dirty_buffer(&f, "/share/new.txt", b"original");
+
+        std::thread::scope(|s| {
+            s.spawn(|| f.fs.finish_upload(fh).unwrap());
+            // Let the upload get as far as the wire before racing it.
+            std::thread::sleep(Duration::from_millis(150));
+            let started = std::time::Instant::now();
+            f.fs.write_buffer_at(fh, 0, b"clobbered").unwrap();
+            assert!(
+                started.elapsed() >= Duration::from_millis(300),
+                "the write returned in {:?} — it did not wait for the in-flight upload",
+                started.elapsed()
+            );
+        });
+
+        let posted = posted_bodies(&f);
+        assert_eq!(posted.len(), 1, "exactly one upload");
+        assert!(
+            posted[0].windows(8).any(|w| w == b"original"),
+            "the upload must carry the bytes it started with, not the racing write's"
+        );
+    }
+
+    /// …but only *its* handle. The per-handle wait must not become a global one:
+    /// serialising unrelated files is the very wedge this change removes.
+    #[test]
+    fn an_upload_does_not_block_work_on_another_handle() {
+        let f = fixture();
+        mount_upload_slow(&f, Duration::from_millis(600));
+
+        let slow = seed_dirty_buffer_fh(&f, 1, "/share/slow.bin", b"payload");
+        let other = seed_dirty_buffer_fh(&f, 2, "/share/other.bin", b"payload");
+
+        std::thread::scope(|s| {
+            s.spawn(|| f.fs.finish_upload(slow).unwrap());
+            std::thread::sleep(Duration::from_millis(150));
+            let started = std::time::Instant::now();
+            f.fs.write_buffer_at(other, 0, b"unrelated").unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(300),
+                "a write to an unrelated handle waited {:?} on someone else's upload",
+                started.elapsed()
+            );
+        });
+    }
+
+    /// The `write` callback's own error path: an unknown handle is EIO, not a
+    /// panic and not a silently accepted write.
+    #[test]
+    fn writing_to_an_unknown_handle_fails() {
+        let f = fixture();
+        assert!(f.fs.write_buffer_at(999, 0, b"x").is_err());
+    }
+
+    // ── T1.6: transfers run off the event loop ────────────────────────────────
+
+    /// The outcome of a `start_*` call, as seen from the test thread.
+    type Outcome<T> = std::sync::mpsc::Receiver<Result<T, SynoFsError>>;
+
+    /// Collects a `start_*` outcome from whichever runtime thread produced it.
+    fn outcome_channel<T: Send + 'static>() -> (
+        impl FnOnce(Result<T, SynoFsError>) + Send + 'static,
+        Outcome<T>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            move |r| {
+                let _ = tx.send(r);
+            },
+            rx,
+        )
+    }
+
+    /// Regression: `flush` ran the upload with `block_on` on the FUSE
+    /// event-loop thread, so for the length of a transfer — minutes on a large
+    /// file — that thread served nothing else. The upload belongs on the
+    /// runtime; the callback should return as soon as it is queued.
+    #[test]
+    fn starting_an_upload_does_not_block_the_calling_thread() {
+        let f = fixture();
+        mount_upload_slow(&f, Duration::from_millis(600));
+        let fh = seed_dirty_buffer(&f, "/share/new.txt", b"payload");
+
+        let (done, outcome) = outcome_channel();
+        let started = std::time::Instant::now();
+        f.fs.start_upload(fh, done);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "the calling thread waited {:?} on the transfer",
+            started.elapsed()
+        );
+
+        outcome
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reply must still arrive once the transfer lands")
+            .expect("the upload itself succeeds");
+        assert_eq!(posted_bodies(&f).len(), 1, "the bytes really went out");
+    }
+
+    /// Going off-thread must not cost the error path: `close(2)` still reports
+    /// what the upload did, it just learns it later.
+    #[test]
+    fn a_backgrounded_upload_still_reports_its_failure() {
+        let f = fixture();
+        f.rt.block_on(
+            Mock::given(http_method("POST"))
+                .respond_with(ResponseTemplate::new(400))
+                .mount(&f.server),
+        );
+        let fh = seed_dirty_buffer(&f, "/share/new.txt", b"payload");
+
+        let (done, outcome) = outcome_channel();
+        f.fs.start_upload(fh, done);
+
+        let result = outcome
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a failed upload must still produce a reply");
+        assert!(
+            matches!(result, Err(SynoFsError::Io(_))),
+            "got {result:?} — a failed upload must not look like a successful close"
+        );
+        assert!(
+            f.fs.buffer(fh).unwrap().blocking_lock().dirty,
+            "the data stays buffered for release() to retry"
+        );
+    }
+
+    /// The single event-loop thread used to be the only thing bounding how many
+    /// transfers we aimed at the NAS at once. Now that transfers run on the
+    /// runtime, that accidental limit is gone and an explicit one has to take
+    /// its place: parallel FileStation transfers are what saturated `synoscgi`
+    /// and took the appliance down.
+    #[test]
+    fn concurrent_transfers_are_capped_so_the_nas_is_not_swarmed() {
+        let f = fixture();
+        // Long enough that every upload started below is still on the wire when
+        // the count is taken.
+        mount_upload_slow(&f, Duration::from_secs(3));
+
+        let started = MAX_CONCURRENT_TRANSFERS + 2;
+        for fh in 0..started as u64 {
+            seed_dirty_buffer_fh(&f, fh, &format!("/share/f{fh}.bin"), b"payload");
+            f.fs.start_upload(fh, |_| {});
+        }
+        // Give every task that is *allowed* to run time to reach the server.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let on_the_wire = posted_bodies(&f).len();
+        assert!(
+            on_the_wire <= MAX_CONCURRENT_TRANSFERS,
+            "{started} uploads were queued and {on_the_wire} reached the NAS at once; \
+             the cap is {MAX_CONCURRENT_TRANSFERS}"
+        );
+        assert_eq!(
+            on_the_wire, MAX_CONCURRENT_TRANSFERS,
+            "the cap must also be used in full — a smaller number means transfers \
+             are queueing on something else"
+        );
+    }
+
+    /// Unmounting must not abandon a transfer that is still in flight: the
+    /// runtime dies with the process, so anything still queued would be lost
+    /// data. `destroy` waits for it — and does not re-send it afterwards.
+    #[test]
+    fn unmounting_waits_for_a_transfer_still_in_flight() {
+        let mut f = fixture();
+        mount_upload_slow(&f, Duration::from_millis(400));
+        let fh = seed_dirty_buffer(&f, "/share/new.txt", b"payload");
+
+        let (done, _outcome) = outcome_channel::<()>();
+        f.fs.start_upload(fh, done);
+        fuser::Filesystem::destroy(&mut f.fs);
+
+        assert!(
+            !f.fs.buffer(fh).unwrap().blocking_lock().dirty,
+            "unmount returned with the write still pending"
+        );
+        assert_eq!(
+            posted_bodies(&f).len(),
+            1,
+            "the in-flight upload must be waited for, not re-sent"
+        );
+    }
+
+    /// Truncate is read-modify-write over the whole file, so it blocked its
+    /// event-loop thread for just as long as an upload. Same treatment.
+    #[test]
+    fn starting_a_truncate_does_not_block_the_calling_thread() {
+        let f = fixture();
+        mount_download(&f, ramp(4096), Map::new());
+        mount_delete_ok(&f);
+        mount_getinfo_gone(&f);
+        mount_upload_slow(&f, Duration::from_millis(600));
+
+        let (done, outcome) = outcome_channel();
+        let started = std::time::Instant::now();
+        f.fs.start_truncate(12, "/share/f.bin".to_string(), 100, done);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "the calling thread waited {:?} on the transfer",
+            started.elapsed()
+        );
+
+        // The trailing get_info re-read fails against these mocks (getinfo is
+        // wired to "gone"), which is irrelevant here: what matters is that a
+        // reply came back at all, from the runtime rather than this thread.
+        let _ = outcome
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reply must still arrive once the transfer lands");
+        assert_eq!(
+            posted_bodies(&f).len(),
+            1,
+            "the resized file really went out"
+        );
+    }
+
+    /// So did a cross-directory move, which is a whole download plus a whole
+    /// upload.
+    #[test]
+    fn starting_a_cross_directory_move_does_not_block_the_calling_thread() {
+        let f = fixture();
+        mount_download(&f, ramp(4096), Map::new());
+        mount_delete_ok(&f);
+        mount_getinfo_gone(&f);
+        mount_upload_slow(&f, Duration::from_millis(600));
+
+        let (done, outcome) = outcome_channel();
+        let started = std::time::Instant::now();
+        f.fs.start_move_across_dirs(
+            "/a/f.bin".to_string(),
+            "/b".to_string(),
+            "f.bin".to_string(),
+            done,
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "the calling thread waited {:?} on the transfer",
+            started.elapsed()
+        );
+
+        outcome
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reply must still arrive once the transfer lands")
+            .expect("the move itself succeeds");
+        assert_eq!(posted_bodies(&f).len(), 1, "the copy really went out");
     }
 
     #[test]

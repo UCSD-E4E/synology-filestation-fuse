@@ -814,6 +814,7 @@ pub unsafe extern "C" fn syno_mount(
         let opts = MountOptions {
             cache_ttl,
             read_cache_mb,
+            ..MountOptions::default()
         };
         match spawn_mount(
             c.inner.clone(),
