@@ -20,6 +20,10 @@ reqwest     = { version = "0.13", features = ["json", "multipart", "query", "for
 # new build tools — and install it as the process default in `SynologyClient::new`.
 rustls      = { version = "0.23", default-features = false, features = ["ring"] }
 serde       = { version = "1", features = ["derive"] }
+# Verifies an upload that had to resend a slice: DSM hashes the landed file via
+# SYNO.FileStation.MD5 and we hash the local one. Pure Rust, no build tooling,
+# so the manylinux wheel and the Windows MSVC build stay as they are.
+md-5        = "0.10"
 serde_json  = "1"
 bytes       = "1"
 tracing     = "0.1"
