@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.3.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.2.1...synology-filestation-fuse-v0.3.0) (2026-08-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* TLS certificate verification is now on by default. A stock DSM appliance presents a self-signed certificate and will be rejected until it is trusted or verification is explicitly turned off.
+
+### Features
+
+* **core:** stream large uploads in slices instead of buffering whole files ([0220d73](https://github.com/UCSD-E4E/synology-filestation/commit/0220d735ee1a6d95076e25aaa36a626c4ea0550b))
+* **core:** stream large uploads in slices instead of buffering whole files ([e8cce35](https://github.com/UCSD-E4E/synology-filestation/commit/e8cce358a289aab34efe5d71938b6927ae7253ef))
+* **fuse:** add --password-stdin, and warn when the password comes from argv ([6193e2b](https://github.com/UCSD-E4E/synology-filestation/commit/6193e2b2cf80fad425705e6cfc2e2405ddb2f6d1))
+* verify TLS certificates by default, and keep credentials out of the URL ([6594fda](https://github.com/UCSD-E4E/synology-filestation/commit/6594fdab53978d6f2e3de454d05aa338a848b917))
+
+
+### Bug Fixes
+
+* address review feedback on the slice-upload path ([f525881](https://github.com/UCSD-E4E/synology-filestation/commit/f525881b49e146f5413c655c50f68d39e2ba6e78))
+* **fuse:** bound the wait for an in-flight read-cache block ([a0822a3](https://github.com/UCSD-E4E/synology-filestation/commit/a0822a35d4149be64ef14da93b49a2df70bb1fc4))
+* **fuse:** create write-spill temp files with owner-only permissions ([1e78f20](https://github.com/UCSD-E4E/synology-filestation/commit/1e78f20c9e5bf19ca4445b368caa3c130c0f9d58))
+* **fuse:** stop silently losing data on flush, truncate, move and short reads ([7e8687d](https://github.com/UCSD-E4E/synology-filestation/commit/7e8687dd469124a981fb38202450cb6b721d0fc8))
+* seven data-loss and corruption defects found in review (tier 1) ([6b044aa](https://github.com/UCSD-E4E/synology-filestation/commit/6b044aad69c4ed0f4ab84807ec6a1cc5ab8cc7ae))
+* stop leaking the session id and passwords into logs ([1ad289a](https://github.com/UCSD-E4E/synology-filestation/commit/1ad289a27a7df52121e59b57c72d67c47dd66a3c))
+* **webdav:** use the shared upload payload fork ([7f5cf52](https://github.com/UCSD-E4E/synology-filestation/commit/7f5cf528c7607467d5d43375da8720560715a08f))
+
 ## [0.2.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.2.0...synology-filestation-fuse-v0.2.1) (2026-07-30)
 
 

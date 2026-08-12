@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.2.1...synology_filestation-v0.3.0) (2026-08-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* TLS certificate verification is now on by default. A stock DSM appliance presents a self-signed certificate and will be rejected until it is trusted or verification is explicitly turned off.
+
+### Features
+
+* verify TLS certificates by default, and keep credentials out of the URL ([6594fda](https://github.com/UCSD-E4E/synology-filestation/commit/6594fdab53978d6f2e3de454d05aa338a848b917))
+
+
+### Bug Fixes
+
+* **core:** carry the session id in a cookie instead of the request URL ([740e8ff](https://github.com/UCSD-E4E/synology-filestation/commit/740e8ff59c4490627912944cebb3e6f868571ee0))
+* stop leaking the session id and passwords into logs ([1ad289a](https://github.com/UCSD-E4E/synology-filestation/commit/1ad289a27a7df52121e59b57c72d67c47dd66a3c))
+
 ## [0.2.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.2.0...synology_filestation-v0.2.1) (2026-07-30)
 
 
