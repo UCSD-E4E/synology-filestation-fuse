@@ -69,8 +69,9 @@ struct Args {
     read_cache_mb: u64,
 
     /// FUSE event-loop threads; 0 picks a default from the CPU count.
-    /// Each thread can absorb one slow operation (an upload, a cold read)
-    /// without the rest of the mount queueing behind it (Linux/FUSE only)
+    /// Bounds the callbacks that still hold a thread — a read that misses the
+    /// cache, a listing, a metadata call — not file transfers, which run on the
+    /// async runtime (Linux/FUSE only)
     #[arg(long, default_value_t = 0)]
     fuse_threads: usize,
 

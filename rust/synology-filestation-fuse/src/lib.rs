@@ -41,11 +41,13 @@ pub struct MountOptions {
     pub read_cache_mb: u64,
     /// FUSE event-loop threads (Linux only). `0` means [`default_io_threads`].
     ///
-    /// Every callback runs to completion on the thread that received it, and
-    /// `flush` uploads synchronously, so the thread count is also the number of
-    /// slow operations the mount can absorb before the next request has to
-    /// queue behind one. Each thread costs a ~16 MiB kernel receive buffer,
-    /// which is why this is a small number rather than "as many as possible".
+    /// Every callback runs to completion on the thread that received it. File
+    /// transfers are the exception — they run on the Tokio runtime and reply
+    /// from there — so this bounds only the callbacks that still block: a read
+    /// that misses the cache, a directory listing, a metadata call, and a write
+    /// to a handle whose own upload is in flight. Each thread costs a ~16 MiB
+    /// kernel receive buffer, which is why this is a small number rather than
+    /// "as many as possible".
     pub io_threads: usize,
 }
 
@@ -61,9 +63,10 @@ impl Default for MountOptions {
 
 /// How many FUSE event-loop threads to run when the caller doesn't choose.
 ///
-/// Never 1: a single thread means one in-flight upload blocks every other
-/// filesystem operation on the mount, which is what made a large copy present
-/// as "the whole mount is hung".
+/// Never 1. Transfers no longer hold a thread, but a cache-missing read or a
+/// slow listing still occupies one for a NAS round trip, and with a single
+/// thread every other operation on the mount — `readdir` of the mount point
+/// included — queues behind it.
 pub fn default_io_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -166,11 +169,13 @@ fn session_config(allow_other: bool, opts: &MountOptions) -> fuser::Config {
         SessionACL::Owner
     };
     // fuser defaults to a single event-loop thread, and every callback runs to
-    // completion on the thread that received it. `flush` uploads the whole file
-    // before it replies, so with one thread a multi-gigabyte copy blocked every
-    // other operation on the mount — including `readdir` of the mount point,
+    // completion on the thread that received it. Transfers are spawned onto the
+    // runtime and reply from there, so none of them holds a thread; what still
+    // does is a round trip per cache-missing read, listing or metadata call,
+    // plus a write waiting on its own handle's upload. With one thread any of
+    // those stalls the entire mount, `readdir` of the mount point included —
     // which is what made a copy into `~/mnt` look like "the home directory
-    // won't load". More threads let unrelated work proceed alongside a transfer.
+    // won't load".
     //
     // `clone_fd` is left off: it needs Linux 4.5+ and its failure would surface
     // only after the session thread had already started, killing the mount. The
@@ -599,10 +604,12 @@ mod tests {
     use super::*;
 
     /// Regression: the session ran fuser's default *single* event-loop thread,
-    /// and `flush` uploads synchronously on that thread. One multi-gigabyte
-    /// upload therefore blocked every other FUSE callback on the mount —
-    /// `readdir` of the mount point included — so the whole filesystem looked
-    /// hung for as long as the copy took.
+    /// and `flush` used to upload on that thread. One multi-gigabyte upload
+    /// therefore blocked every other FUSE callback on the mount — `readdir` of
+    /// the mount point included — so the whole filesystem looked hung for as
+    /// long as the copy took. Transfers have since moved to the runtime, but a
+    /// cache-missing read or a listing still holds its thread for a round trip,
+    /// so one thread is still one stall away from the same symptom.
     #[test]
     fn the_event_loop_runs_more_than_one_thread() {
         let cfg = session_config(false, &MountOptions::default());

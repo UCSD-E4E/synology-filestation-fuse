@@ -1857,8 +1857,9 @@ mod tests {
 
     /// Regression: `finish_upload` snapshotted the buffer and then uploaded with
     /// no lock held, which was safe only because fuser dispatched every callback
-    /// on one thread. Now that the event loop is multi-threaded, a `write` can
-    /// land while that handle's upload is in flight — and for a spilled buffer
+    /// on one thread. Uploads now run on the runtime and the event loop is
+    /// multi-threaded, so a `write` can land while that handle's upload is in
+    /// flight — and for a spilled buffer
     /// the "snapshot" is the temp file the upload is still streaming, so the
     /// write would tear the body mid-transfer. A write must wait for the upload
     /// already running on its handle.
