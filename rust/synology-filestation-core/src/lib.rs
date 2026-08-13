@@ -14,7 +14,7 @@ pub mod types;
 pub use client::{SynologyClient, ThrottleConfig};
 pub use error::SynoFsError;
 pub use transport::{
-    BreakerConfig, CircuitBreaker, MetadataTransport, ReadTransport, StreamReadTransport,
-    StreamWriteTransport, WriteTransport,
+    BreakerConfig, CircuitBreaker, MetadataTransport, OpenWriteTransport, ReadTransport,
+    StreamReadTransport, StreamWriteTransport, WriteHandle, WriteOpen, WriteTransport,
 };
 pub use types::{SynoAdditional, SynoFileInfo, SynoOwner, SynoPerm, SynoTime};
