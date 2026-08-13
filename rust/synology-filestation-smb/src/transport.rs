@@ -563,6 +563,73 @@ impl SmbTransport {
     /// the target with the same move-aside guarantee as [`write_atomic`].
     ///
     /// [`write_atomic`]: Self::write_atomic
+    /// Stream a local file to `logical`, which must not already exist.
+    ///
+    /// Unlike [`Self::write_from_path`] this writes the destination directly
+    /// instead of staging a `.part` and renaming. That is the whole point: the
+    /// server's `FILE_CREATE` disposition is what makes "fail if it exists"
+    /// atomic, and a rename would either clobber the winner of a race or need a
+    /// check-then-act that cannot be made safe from here. The cost is that a
+    /// failed transfer leaves a short file at the real name, so a failure
+    /// removes it.
+    pub async fn write_new_from_path(
+        &self,
+        logical: &str,
+        local: &Path,
+    ) -> Result<(), SynoFsError> {
+        let loc = SmbPath::from_logical(logical)?;
+
+        let mut file = tokio::fs::File::open(local)
+            .await
+            .map_err(|e| local_fs_error(&format!("open {}", local.display()), &e))?;
+
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        self.ensure_ready(client, trees, &loc.share).await?;
+
+        // Exclusive create: an existing name comes back as
+        // STATUS_OBJECT_NAME_COLLISION, which maps to AlreadyExists — the
+        // caller's cue that this is an answer, not a transport failure.
+        let mut writer = {
+            let tree = trees.get(&loc.share).expect("tree just ensured");
+            match client.create_file_writer_exclusive(tree, &loc.path).await {
+                Ok(w) => w,
+                Err(e) => return Err(self.mark_and_map(&e)),
+            }
+        };
+
+        let mut buf = vec![0u8; 1 << 20];
+        let mut stream_err: Option<SynoFsError> = None;
+        loop {
+            match file.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = writer.write_chunk(&buf[..n]).await {
+                        stream_err = Some(self.mark_and_map(&e));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    stream_err = Some(SynoFsError::Io(format!("read {}: {e}", local.display())));
+                    break;
+                }
+            }
+        }
+        if let Err(e) = writer.finish().await {
+            stream_err.get_or_insert_with(|| self.mark_and_map(&e));
+        }
+
+        if let Some(e) = stream_err {
+            // We created this name, so removing it is ours to do — leaving a
+            // truncated file where the caller asked for a whole one is worse
+            // than leaving nothing.
+            let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+            self.note_cleanup(client.delete_file(tree, &loc.path).await);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     pub async fn write_from_path(&self, logical: &str, local: &Path) -> Result<(), SynoFsError> {
         let loc = SmbPath::from_logical(logical)?;
         let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -646,6 +713,14 @@ impl WriteTransport for SmbTransport {
 impl StreamWriteTransport for SmbTransport {
     async fn write_from_path(&self, remote_path: &str, local: &Path) -> Result<(), SynoFsError> {
         SmbTransport::write_from_path(self, remote_path, local).await
+    }
+
+    async fn write_new_from_path(
+        &self,
+        remote_path: &str,
+        local: &Path,
+    ) -> Result<(), SynoFsError> {
+        SmbTransport::write_new_from_path(self, remote_path, local).await
     }
 }
 
