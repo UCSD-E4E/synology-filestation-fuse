@@ -2338,6 +2338,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "synology-filestation-connect"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "synology-filestation-core"
 version = "0.3.1"
 dependencies = [

@@ -1,0 +1,21 @@
+[package]
+name = "synology-filestation-connect"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Decides how to reach the NAS — SMB, SMB through a tunnel, or the HTTP API — and re-decides when the answer changes."
+repository = "https://github.com/UCSD-E4E/synology-filestation"
+# Internal: the CLI, the GUI (via the FFI) and the Python bindings all call it,
+# but nothing outside this workspace does.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "time", "net", "macros"] }
+tracing = "0.1"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
