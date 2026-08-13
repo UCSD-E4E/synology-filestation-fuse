@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use smb2::{ClientConfig, SmbClient, Tree};
 use synology_filestation_core::{
-    ReadTransport, StreamReadTransport, StreamWriteTransport, SynoFsError, SynologyClient,
-    WriteTransport,
+    MetadataTransport, ReadTransport, StreamReadTransport, StreamWriteTransport, SynoAdditional,
+    SynoFileInfo, SynoFsError, SynoTime, SynologyClient, WriteTransport,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -254,7 +254,8 @@ pub async fn auto_attach(
             .with_read_transport(smb.clone())
             .with_write_transport(smb.clone())
             .with_stream_write_transport(smb.clone())
-            .with_stream_read_transport(smb),
+            .with_stream_read_transport(smb.clone())
+            .with_metadata_transport(smb),
         None => client,
     }
 }
@@ -845,6 +846,265 @@ mod tests {
             cfg2.addr(),
             "nas.example.com:1445",
             "explicit port preserved"
+        );
+    }
+}
+
+/// Whether a share the server advertised is one a user would browse.
+///
+/// `NetShareEnumAll` also reports the administrative plumbing — `IPC$`, the
+/// per-volume admin shares — which are not places to put files. The special
+/// bit (`0x8000_0000`) marks them, and the `$` suffix catches servers that
+/// don't set it; anything that isn't a disk tree (low bits non-zero) is a
+/// printer or a pipe.
+fn is_user_share(share_type: u32, name: &str) -> bool {
+    const SPECIAL: u32 = 0x8000_0000;
+    const TYPE_MASK: u32 = 0x0000_000F;
+    share_type & SPECIAL == 0 && share_type & TYPE_MASK == 0 && !name.ends_with('$')
+}
+
+/// The logical path a rename produces: `new_name` replaces the last component
+/// of `old_path`, which is what the FileStation `rename` contract means by a
+/// name rather than a path.
+fn sibling_path(old_path: &str, new_name: &str) -> String {
+    let trimmed = old_path.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => format!("{parent}/{new_name}"),
+        _ => format!("/{new_name}"),
+    }
+}
+
+/// Windows FILETIME → unix seconds, for the timestamps FileStation reports.
+fn unix_secs(t: smb2::pack::FileTime) -> i64 {
+    t.to_system_time()
+        .and_then(|st| st.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Build the `SynoFileInfo` a caller expects, so nothing downstream can tell
+/// whether SMB or the HTTP API answered.
+fn file_info(
+    name: &str,
+    path: &str,
+    isdir: bool,
+    size: u64,
+    mtime: i64,
+    crtime: i64,
+) -> SynoFileInfo {
+    SynoFileInfo {
+        name: name.to_string(),
+        path: path.to_string(),
+        isdir,
+        additional: Some(SynoAdditional {
+            size: Some(size),
+            owner: None,
+            time: Some(SynoTime {
+                atime: mtime,
+                mtime,
+                ctime: mtime,
+                crtime,
+            }),
+            perm: None,
+        }),
+        code: None,
+    }
+}
+
+#[async_trait]
+impl MetadataTransport for SmbTransport {
+    async fn list_shares(&self) -> Result<Vec<SynoFileInfo>, SynoFsError> {
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        // No share to attach for an enumeration, so reconnect handling is done
+        // by hand rather than through `ensure_ready`.
+        if self
+            .reconnect
+            .reconnect_if_needed(|| client.reconnect())
+            .await
+            .map_err(|e| self.mark_and_map(&e))?
+        {
+            trees.clear();
+        }
+        let shares = client
+            .list_shares()
+            .await
+            .map_err(|e| self.mark_and_map(&e))?;
+        Ok(shares
+            .into_iter()
+            .filter(|s| is_user_share(s.share_type, &s.name))
+            .map(|s| {
+                let path = format!("/{}", s.name);
+                file_info(&s.name, &path, true, 0, 0, 0)
+            })
+            .collect())
+    }
+
+    async fn list_dir(&self, folder_path: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
+        let loc = SmbPath::from_logical(folder_path)?;
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        self.ensure_ready(client, trees, &loc.share).await?;
+        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let entries = client
+            .list_directory(tree, &loc.path)
+            .await
+            .map_err(|e| self.mark_and_map(&e))?;
+
+        let base = folder_path.trim_end_matches('/');
+        Ok(entries
+            .into_iter()
+            // The dot entries are an SMB directory's own bookkeeping; a
+            // FileStation listing has never had them and readdir synthesises
+            // its own.
+            .filter(|e| e.name != "." && e.name != "..")
+            .map(|e| {
+                let path = format!("{base}/{}", e.name);
+                file_info(
+                    &e.name,
+                    &path,
+                    e.is_directory,
+                    e.size,
+                    unix_secs(e.modified),
+                    unix_secs(e.created),
+                )
+            })
+            .collect())
+    }
+
+    async fn get_info(&self, path: &str) -> Result<SynoFileInfo, SynoFsError> {
+        let loc = SmbPath::from_logical(path)?;
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        self.ensure_ready(client, trees, &loc.share).await?;
+        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let info = client
+            .stat(tree, &loc.path)
+            .await
+            .map_err(|e| self.mark_and_map(&e))?;
+        let name = path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(path);
+        Ok(file_info(
+            name,
+            path,
+            info.is_directory,
+            info.size,
+            unix_secs(info.modified),
+            unix_secs(info.created),
+        ))
+    }
+
+    async fn create_folder(&self, parent: &str, name: &str) -> Result<SynoFileInfo, SynoFsError> {
+        let full = format!("{}/{}", parent.trim_end_matches('/'), name);
+        let loc = SmbPath::from_logical(&full)?;
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        self.ensure_ready(client, trees, &loc.share).await?;
+        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        client
+            .create_directory(tree, &loc.path)
+            .await
+            .map_err(|e| self.mark_and_map(&e))?;
+        Ok(file_info(name, &full, true, 0, 0, 0))
+    }
+
+    async fn rename(&self, old_path: &str, new_name: &str) -> Result<SynoFileInfo, SynoFsError> {
+        let from = SmbPath::from_logical(old_path)?;
+        let new_logical = sibling_path(old_path, new_name);
+        let to = SmbPath::from_logical(&new_logical)?;
+        // A rename is a tree-local operation; crossing shares would be a copy,
+        // which this is not.
+        if from.share != to.share {
+            return Err(SynoFsError::InvalidArg);
+        }
+
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        self.ensure_ready(client, trees, &from.share).await?;
+        let tree = trees.get_mut(&from.share).expect("tree just ensured");
+        client
+            .rename(tree, &from.path, &to.path)
+            .await
+            .map_err(|e| self.mark_and_map(&e))?;
+
+        let info = client
+            .stat(tree, &to.path)
+            .await
+            .map_err(|e| self.mark_and_map(&e))?;
+        Ok(file_info(
+            new_name,
+            &new_logical,
+            info.is_directory,
+            info.size,
+            unix_secs(info.modified),
+            unix_secs(info.created),
+        ))
+    }
+
+    async fn delete(&self, path: &str) -> Result<(), SynoFsError> {
+        let loc = SmbPath::from_logical(path)?;
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        self.ensure_ready(client, trees, &loc.share).await?;
+        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        // SMB deletes files and directories through different calls, so ask
+        // first. FileStation's delete takes either.
+        let info = client
+            .stat(tree, &loc.path)
+            .await
+            .map_err(|e| self.mark_and_map(&e))?;
+        let done = if info.is_directory {
+            client.delete_directory(tree, &loc.path).await
+        } else {
+            client.delete_file(tree, &loc.path).await
+        };
+        done.map_err(|e| self.mark_and_map(&e))
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn administrative_shares_are_not_places_to_put_files() {
+        const DISK: u32 = 0;
+        const IPC: u32 = 3;
+        const SPECIAL: u32 = 0x8000_0000;
+
+        assert!(is_user_share(DISK, "fishsense_data"));
+        // IPC$ is the named-pipe endpoint the share enumeration itself rides on.
+        assert!(!is_user_share(IPC | SPECIAL, "IPC$"));
+        // Per-volume admin shares: flagged special, and named with a $.
+        assert!(!is_user_share(DISK | SPECIAL, "C$"));
+        // A server that forgets the special bit is still caught by the suffix.
+        assert!(!is_user_share(DISK, "ADMIN$"));
+        // Printers and pipes are not directories.
+        assert!(!is_user_share(1, "LaserJet"));
+    }
+
+    #[test]
+    fn rename_replaces_the_last_component_only() {
+        assert_eq!(
+            sibling_path("/share/dir/old.orf", "new.orf"),
+            "/share/dir/new.orf"
+        );
+        // A trailing slash is a directory being renamed, not a different path.
+        assert_eq!(sibling_path("/share/dir/", "renamed"), "/share/renamed");
+        // Renaming a share-level entry keeps it share-level.
+        assert_eq!(sibling_path("/share/file", "other"), "/share/other");
+    }
+
+    #[test]
+    fn a_windows_epoch_timestamp_becomes_unix_seconds() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let when = UNIX_EPOCH + Duration::from_secs(1_786_315_083);
+        assert_eq!(
+            unix_secs(smb2::pack::FileTime::from_system_time(when)),
+            1_786_315_083
         );
     }
 }

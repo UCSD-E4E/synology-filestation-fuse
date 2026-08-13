@@ -38,6 +38,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::error::SynoFsError;
+use crate::types::SynoFileInfo;
 
 /// A read backend serving file bytes as an alternative to the HTTP Download API.
 #[async_trait]
@@ -103,6 +104,58 @@ pub trait StreamWriteTransport: Send + Sync {
         local: &Path,
     ) -> Result<(), SynoFsError> {
         let _ = (remote_path, local);
+        Err(SynoFsError::NotSupported)
+    }
+}
+
+/// A backend that can answer questions about the *namespace* — what is here,
+/// how big is it — and change it: create a directory, rename, delete.
+///
+/// Kept apart from the byte-moving traits because the capabilities are
+/// genuinely separate. SMB can serve all of it; a bulk object store might only
+/// carry contents. Every method defaults to [`SynoFsError::NotSupported`], so a
+/// backend implements the operations it can actually promise and the selection
+/// layer quietly uses HTTP for the rest — a decline is not a failure and does
+/// not count against the backend's breaker.
+///
+/// Paths are FileStation logical paths (`/share/dir/file`), so a backend that
+/// addresses storage differently translates on its own side. Return types match
+/// the HTTP client's, because callers must not be able to tell which backend
+/// answered.
+#[async_trait]
+pub trait MetadataTransport: Send + Sync {
+    /// The shares available to this session, as directory entries.
+    async fn list_shares(&self) -> Result<Vec<SynoFileInfo>, SynoFsError> {
+        Err(SynoFsError::NotSupported)
+    }
+
+    /// Entries directly under `folder_path`.
+    async fn list_dir(&self, folder_path: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
+        let _ = folder_path;
+        Err(SynoFsError::NotSupported)
+    }
+
+    /// Metadata for a single entry.
+    async fn get_info(&self, path: &str) -> Result<SynoFileInfo, SynoFsError> {
+        let _ = path;
+        Err(SynoFsError::NotSupported)
+    }
+
+    /// Create directory `name` under `parent`.
+    async fn create_folder(&self, parent: &str, name: &str) -> Result<SynoFileInfo, SynoFsError> {
+        let _ = (parent, name);
+        Err(SynoFsError::NotSupported)
+    }
+
+    /// Rename within the same directory — `new_name` is a bare name, not a path.
+    async fn rename(&self, old_path: &str, new_name: &str) -> Result<SynoFileInfo, SynoFsError> {
+        let _ = (old_path, new_name);
+        Err(SynoFsError::NotSupported)
+    }
+
+    /// Remove a file or an empty directory.
+    async fn delete(&self, path: &str) -> Result<(), SynoFsError> {
+        let _ = path;
         Err(SynoFsError::NotSupported)
     }
 }
