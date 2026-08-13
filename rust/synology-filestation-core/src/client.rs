@@ -3615,13 +3615,19 @@ mod tests {
     // rename. The fishsense regression is the central case here.
 
     fn unique_tmp_path(name: &str) -> std::path::PathBuf {
+        // A counter, not just the clock. `SystemTime` is only nanosecond-*typed*
+        // — macOS and Windows tick it in microseconds — so two tests starting in
+        // the same tick got the same "unique" path, and whichever finished first
+        // deleted the other's file out from under it.
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
         let mut p = std::env::temp_dir();
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("synofs-test-{pid}-{nanos}-{name}"));
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        p.push(format!("synofs-test-{pid}-{nanos}-{seq}-{name}"));
         p
     }
 
