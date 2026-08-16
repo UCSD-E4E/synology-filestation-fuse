@@ -7,3 +7,18 @@ members = [
     "rust/synology-filestation-smb",
     "python/synology_filestation",
 ]
+
+# Our fork of `smb2`, pinned by revision.
+#
+# It carries two SET_INFO operations upstream does not have yet: a rename that
+# tells the server to replace the destination (so a published file is never
+# briefly absent, instead of the delete-then-rename dance that leaves a gap),
+# and `set_end_of_file`, which truncates in one round trip rather than making
+# the caller download a file, cut the tail off and write it all back.
+#
+# A `patch` rather than a `git` dependency so the crates named in each manifest
+# stay honest: when the changes land upstream, this block goes away and nothing
+# else moves. Pinned to a revision, never a branch — a build that can change
+# under you is not a build.
+[patch.crates-io]
+smb2 = { git = "https://github.com/UCSD-E4E/smb2", rev = "b33283c9963cbef74c2b4a17faae4664980a0f9d" }
