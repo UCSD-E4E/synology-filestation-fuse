@@ -5859,4 +5859,21 @@ mod tests {
         let entries = client.list_dir("/share").await.unwrap();
         assert_eq!(entries[0].name, "from-backend");
     }
+
+    #[tokio::test]
+    async fn a_backend_without_offset_writes_declines_to_open_one() {
+        // The trait default is what every non-SMB backend gets: opening a file
+        // for writing is refused outright, so a caller keeps buffering rather
+        // than discovering the gap halfway through a file.
+        use crate::transport::{OpenWriteTransport, WriteOpen};
+        struct Bulk;
+        impl OpenWriteTransport for Bulk {}
+
+        // `Box<dyn WriteHandle>` has no Debug, so unwrap_err is out.
+        match Bulk.open_write("/share/f.bin", WriteOpen::CreateNew).await {
+            Err(SynoFsError::NotSupported) => {}
+            Err(e) => panic!("expected a decline, got {e:?}"),
+            Ok(_) => panic!("a backend with no offset writes must not hand one out"),
+        }
+    }
 }

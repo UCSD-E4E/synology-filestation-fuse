@@ -160,6 +160,57 @@ pub trait MetadataTransport: Send + Sync {
     }
 }
 
+/// What opening a file for writing may create, and what it promises about a
+/// name that is already taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOpen {
+    /// The file must not exist. An existing name is
+    /// [`SynoFsError::AlreadyExists`], never a silent replacement.
+    CreateNew,
+    /// Open what is there and keep it, creating the file only if it is absent.
+    /// Writes land at the offsets given; bytes outside them are untouched.
+    Existing,
+}
+
+/// A backend that can write **into an open file at arbitrary offsets**.
+///
+/// This is the difference between a mount that spools a 6 GB copy to a local
+/// spill file and ships it on `close(2)`, and one where each `write(2)` goes to
+/// the server as it arrives — bounded memory, back-pressure at network speed,
+/// and a write that fails when it fails rather than minutes later at close.
+///
+/// The HTTP FileStation API cannot do this at all: its upload takes a whole
+/// file, so the buffering is not a design choice there but a consequence. A
+/// backend that can address offsets implements this; the default declines and
+/// the caller keeps buffering.
+#[async_trait]
+pub trait OpenWriteTransport: Send + Sync {
+    async fn open_write(
+        &self,
+        path: &str,
+        mode: WriteOpen,
+    ) -> Result<Box<dyn WriteHandle>, SynoFsError> {
+        let _ = (path, mode);
+        Err(SynoFsError::NotSupported)
+    }
+}
+
+/// An open file being written. Dropping one without [`close`](Self::close)
+/// abandons whatever the server already has, so callers must close and check.
+///
+/// `Send` but not `Sync`: a handle is owned by whoever is writing to it, one
+/// task at a time. Requiring `Sync` would rule out backends whose writer holds
+/// an in-flight request — which is most of them.
+#[async_trait]
+pub trait WriteHandle: Send {
+    /// Place `data` at `offset`. Offsets need not be contiguous; a backend that
+    /// streams may pay a reopen when they jump.
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), SynoFsError>;
+
+    /// Finish. The server holds every byte written when this returns `Ok`.
+    async fn close(&mut self) -> Result<(), SynoFsError>;
+}
+
 /// Tuning for a backend's [`CircuitBreaker`].
 #[derive(Debug, Clone, Copy)]
 pub struct BreakerConfig {

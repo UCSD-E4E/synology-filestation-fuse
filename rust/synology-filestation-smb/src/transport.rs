@@ -20,8 +20,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use smb2::{ClientConfig, SmbClient, Tree};
 use synology_filestation_core::{
-    MetadataTransport, ReadTransport, StreamReadTransport, StreamWriteTransport, SynoAdditional,
-    SynoFileInfo, SynoFsError, SynoTime, SynologyClient, WriteTransport,
+    MetadataTransport, OpenWriteTransport, ReadTransport, StreamReadTransport,
+    StreamWriteTransport, SynoAdditional, SynoFileInfo, SynoFsError, SynoTime, SynologyClient,
+    WriteHandle, WriteOpen, WriteTransport,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -276,11 +277,11 @@ struct Inner {
 
 /// An authenticated SMB connection that reads NAS files.
 pub struct SmbTransport {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
     /// Tracks whether the SMB link needs re-establishing. `smb2` doesn't
     /// auto-reconnect, so without this a mount would degrade to HTTP permanently
     /// after one network flap.
-    reconnect: ReconnectState,
+    reconnect: Arc<ReconnectState>,
 }
 
 impl SmbTransport {
@@ -300,11 +301,11 @@ impl SmbTransport {
         .await
         .map_err(|e| to_syno_error(&e))?;
         Ok(Self {
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 client,
                 trees: HashMap::new(),
-            }),
-            reconnect: ReconnectState::default(),
+            })),
+            reconnect: Arc::new(ReconnectState::default()),
         })
     }
 
@@ -1106,5 +1107,187 @@ mod metadata_tests {
             unix_secs(smb2::pack::FileTime::from_system_time(when)),
             1_786_315_083
         );
+    }
+}
+
+/// One open file being written over SMB.
+///
+/// The server has no notion of a "file position we hold": every write carries
+/// its own offset. What the handle carries instead is a writer *positioned* at
+/// the next offset it expects, because sequential appends — what a copy is —
+/// then cost one round trip each. A write that lands somewhere else closes that
+/// writer and opens another at the offset asked for, which is a reopen a
+/// sequential copy never pays.
+pub struct SmbWriteHandle {
+    inner: Arc<Mutex<Inner>>,
+    reconnect: Arc<ReconnectState>,
+    loc: SmbPath,
+    writer: Option<smb2::FileWriter>,
+    /// Where the open writer will put the next chunk.
+    next: u64,
+}
+
+impl SmbWriteHandle {
+    /// Open a writer at `offset`, replacing whatever this handle had.
+    ///
+    /// `FileOpenIf` is what makes this safe for an existing file: it opens what
+    /// is there and creates only when absent, so bytes outside the ones written
+    /// survive. An overwrite disposition here would quietly truncate a file the
+    /// caller only meant to patch.
+    async fn reopen_at(&mut self, offset: u64) -> Result<(), SynoFsError> {
+        self.finish_writer().await?;
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        ensure_share(client, trees, &self.reconnect, &self.loc.share).await?;
+        let tree = trees.get(&self.loc.share).expect("share just ensured");
+        let writer = client
+            .create_file_writer_at(tree, &self.loc.path, offset)
+            .await
+            .map_err(|e| map_smb_error(&self.reconnect, &e))?;
+        self.writer = Some(writer);
+        self.next = offset;
+        Ok(())
+    }
+
+    /// Close the open writer, if any, surfacing what the server said.
+    async fn finish_writer(&mut self) -> Result<(), SynoFsError> {
+        match self.writer.take() {
+            // `finish` reports the bytes it wrote; the caller tracks its own
+            // offsets, so only the failure matters here.
+            Some(w) => w
+                .finish()
+                .await
+                .map(|_| ())
+                .map_err(|e| map_smb_error(&self.reconnect, &e)),
+            None => Ok(()),
+        }
+    }
+}
+
+#[async_trait]
+impl WriteHandle for SmbWriteHandle {
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), SynoFsError> {
+        if needs_reopen(self.writer.is_some(), self.next, offset) {
+            self.reopen_at(offset).await?;
+        }
+        let writer = self.writer.as_mut().expect("writer just opened");
+        writer
+            .write_chunk(data)
+            .await
+            .map_err(|e| map_smb_error(&self.reconnect, &e))?;
+        self.next = offset + data.len() as u64;
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), SynoFsError> {
+        self.finish_writer().await
+    }
+}
+
+#[async_trait]
+impl OpenWriteTransport for SmbTransport {
+    async fn open_write(
+        &self,
+        path: &str,
+        mode: WriteOpen,
+    ) -> Result<Box<dyn WriteHandle>, SynoFsError> {
+        let loc = SmbPath::from_logical(path)?;
+        let mut handle = SmbWriteHandle {
+            inner: Arc::clone(&self.inner),
+            reconnect: Arc::clone(&self.reconnect),
+            loc: loc.clone(),
+            writer: None,
+            next: 0,
+        };
+
+        match mode {
+            // Create eagerly, so a name already taken is an error the caller
+            // gets from `open` — where `create(2)` can still report it — rather
+            // than from the first write.
+            WriteOpen::CreateNew => {
+                let mut guard = self.inner.lock().await;
+                let Inner { client, trees } = &mut *guard;
+                self.ensure_ready(client, trees, &loc.share).await?;
+                let tree = trees.get(&loc.share).expect("tree just ensured");
+                let writer = client
+                    .create_file_writer_exclusive(tree, &loc.path)
+                    .await
+                    .map_err(|e| self.mark_and_map(&e))?;
+                handle.writer = Some(writer);
+            }
+            // Nothing to do until the first write says where it goes: opening
+            // now would guess an offset and pay a reopen for guessing wrong.
+            WriteOpen::Existing => {}
+        }
+        Ok(Box::new(handle))
+    }
+}
+
+/// Whether the next write has to open a new writer.
+///
+/// Sequential appends — what copying a file into the mount is — keep the writer
+/// they have and cost one round trip per chunk. Anything that lands away from
+/// where the open writer sits has to reopen there, because SMB writes carry
+/// their own offset and the writer's is set when it opens.
+fn needs_reopen(has_writer: bool, next_offset: u64, write_offset: u64) -> bool {
+    !has_writer || write_offset != next_offset
+}
+
+/// `SmbTransport::ensure_ready` without a `&self`, for the write handle — which
+/// owns the pieces rather than the transport.
+async fn ensure_share(
+    client: &mut SmbClient,
+    trees: &mut HashMap<String, Tree>,
+    reconnect: &ReconnectState,
+    share: &str,
+) -> Result<(), SynoFsError> {
+    if reconnect
+        .reconnect_if_needed(|| client.reconnect())
+        .await
+        .map_err(|e| map_smb_error(reconnect, &e))?
+    {
+        trees.clear();
+    }
+    if !trees.contains_key(share) {
+        let tree = client
+            .connect_share(share)
+            .await
+            .map_err(|e| map_smb_error(reconnect, &e))?;
+        trees.insert(share.to_string(), tree);
+    }
+    Ok(())
+}
+
+/// `SmbTransport::mark_and_map` without a `&self`, for the same reason.
+fn map_smb_error(reconnect: &ReconnectState, e: &smb2::Error) -> SynoFsError {
+    reconnect.flag_if_lost(e.kind());
+    to_syno_error(e)
+}
+
+#[cfg(test)]
+mod write_handle_tests {
+    use super::*;
+
+    #[test]
+    fn a_sequential_copy_never_reopens() {
+        // The case that matters: chunk after chunk, each starting where the
+        // last ended. One open writer serves the whole file.
+        let mut next = 0u64;
+        for _ in 0..4 {
+            assert!(!needs_reopen(true, next, next), "offset {next} continued");
+            next += 1 << 20;
+        }
+    }
+
+    #[test]
+    fn the_first_write_opens_a_writer() {
+        assert!(needs_reopen(false, 0, 0));
+    }
+
+    #[test]
+    fn a_write_that_lands_elsewhere_reopens_there() {
+        // Seeking back to patch a header, and skipping forward past a hole.
+        assert!(needs_reopen(true, 4096, 0));
+        assert!(needs_reopen(true, 4096, 8192));
     }
 }
