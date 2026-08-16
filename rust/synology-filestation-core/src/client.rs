@@ -8,9 +8,44 @@ use tracing::{debug, error, warn};
 
 use crate::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
 use crate::transport::{
-    BreakerConfig, CircuitBreaker, ReadTransport, StreamReadTransport, StreamWriteTransport,
-    WriteTransport,
+    BreakerConfig, CircuitBreaker, MetadataTransport, ReadTransport, StreamReadTransport,
+    StreamWriteTransport, WriteTransport,
 };
+/// Offer an operation to each metadata backend in turn before falling back to
+/// HTTP, expanding at the head of the method it belongs to.
+///
+/// A macro rather than a function because the six operations differ in
+/// signature and return type, and an `async` closure over `&dyn Trait` buys
+/// lifetime grief for no gain. The `return` is the point: a backend that
+/// answers *is* the answer.
+macro_rules! via_metadata {
+    ($self:ident, $method:ident ( $($arg:expr),* )) => {
+        for entry in &$self.metadata_transports {
+            if !entry.breaker.lock().unwrap().allows(Instant::now()) {
+                continue;
+            }
+            match entry.transport.$method($($arg),*).await {
+                Ok(v) => {
+                    entry.breaker.lock().unwrap().on_success();
+                    return Ok(v);
+                }
+                // Declining an operation it cannot promise is not a failure.
+                Err(e) if e.category() == ErrorCategory::NotSupported => continue,
+                Err(e) if e.category() == ErrorCategory::Transport => {
+                    warn!("metadata backend failed (transient), falling back: {e}");
+                    entry.breaker.lock().unwrap().on_failure(Instant::now());
+                    continue;
+                }
+                // A reachable backend gave a definitive answer; trust it.
+                Err(e) => {
+                    entry.breaker.lock().unwrap().on_success();
+                    return Err(e);
+                }
+            }
+        }
+    };
+}
+
 use crate::types::{
     AuthData, CreateFolderData, GetInfoData, ListData, ListShareData, Md5StartData, Md5StatusData,
     RenameData, SynoFileInfo, SynoResponse, UploadData, ADDITIONAL_FIELDS, SHARE_ADDITIONAL_FIELDS,
@@ -386,6 +421,9 @@ pub struct SynologyClient {
     /// Injected streaming read backends, tried in order by `download_to_path`
     /// before falling back to the buffering HTTP download.
     stream_read_transports: Vec<TransportEntry<dyn StreamReadTransport>>,
+    /// Injected metadata backends, tried in order before the HTTP List/Delete/
+    /// CreateFolder/Rename APIs.
+    metadata_transports: Vec<TransportEntry<dyn MetadataTransport>>,
     /// Bytes per slice for the chunked upload path. A file larger than this is
     /// uploaded slice-by-slice so it is never held in memory whole; anything
     /// smaller takes the one-shot path. Default [`DEFAULT_SLICE_SIZE`].
@@ -444,6 +482,7 @@ impl SynologyClient {
             write_transports: Vec::new(),
             stream_write_transports: Vec::new(),
             stream_read_transports: Vec::new(),
+            metadata_transports: Vec::new(),
             slice_size: DEFAULT_SLICE_SIZE,
         }
     }
@@ -575,6 +614,15 @@ impl SynologyClient {
     /// HTTP download on transport failures.
     pub fn with_stream_read_transport(mut self, transport: Arc<dyn StreamReadTransport>) -> Self {
         self.stream_read_transports
+            .push(TransportEntry::new(transport));
+        self
+    }
+
+    /// Inject a [`MetadataTransport`] backend. Listings, `get_info`, and the
+    /// namespace mutations prefer it over the HTTP FileStation APIs, falling
+    /// back to HTTP when it is unhealthy or declines an operation.
+    pub fn with_metadata_transport(mut self, transport: Arc<dyn MetadataTransport>) -> Self {
+        self.metadata_transports
             .push(TransportEntry::new(transport));
         self
     }
@@ -1004,6 +1052,7 @@ impl SynologyClient {
     /// List all FileStation shares the account can see.
     pub async fn list_shares(&self) -> Result<Vec<SynoFileInfo>, SynoFsError> {
         debug!("list_shares");
+        via_metadata!(self, list_shares());
         self.list_paged::<ListShareData, _>(
             "list_share",
             &[],
@@ -1017,6 +1066,7 @@ impl SynologyClient {
     /// List the contents of a directory.
     pub async fn list_dir(&self, folder_path: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
         debug!("list_dir: {}", folder_path);
+        via_metadata!(self, list_dir(folder_path));
         self.list_paged::<ListData, _>(
             "list",
             &[("folder_path", folder_path)],
@@ -1032,6 +1082,7 @@ impl SynologyClient {
         let url = format!("{}/entry.cgi", self.base_url);
         let path_json = serde_json::to_string(&[path]).unwrap();
         debug!("get_info: {}", path);
+        via_metadata!(self, get_info(path));
         let text = self
             .get_text_retried(
                 &url,
@@ -2073,6 +2124,7 @@ impl SynologyClient {
         let url = format!("{}/entry.cgi", self.base_url);
         let path_json = serde_json::to_string(&[path]).unwrap();
         debug!("delete: {}", path);
+        via_metadata!(self, delete(path));
 
         let text = self
             .get_text_retried(
@@ -2109,6 +2161,7 @@ impl SynologyClient {
         let parent_json = serde_json::to_string(&[parent]).unwrap();
         let name_json = serde_json::to_string(&[name]).unwrap();
         debug!("create_folder: {}/{}", parent, name);
+        via_metadata!(self, create_folder(parent, name));
 
         let text = self
             .get_text_retried(
@@ -2153,6 +2206,7 @@ impl SynologyClient {
         let path_json = serde_json::to_string(&[old_path]).unwrap();
         let name_json = serde_json::to_string(&[new_name]).unwrap();
         debug!("rename: {} -> {}", old_path, new_name);
+        via_metadata!(self, rename(old_path, new_name));
 
         let text = self
             .get_text_retried(
@@ -5678,5 +5732,131 @@ mod tests {
             "it landed via a resend, so its contents are checked"
         );
         std::fs::remove_file(&local).ok();
+    }
+
+    // ── metadata backends ────────────────────────────────────────────────────
+    //
+    // Listings and namespace changes follow the same selection rules as bytes:
+    // a healthy backend answers, a transport failure falls back to HTTP, a
+    // definitive answer is the answer, and an operation the backend cannot
+    // promise is declined without counting against it.
+
+    struct FakeMeta {
+        behave: Behave,
+        calls: AtomicUsize,
+    }
+
+    impl FakeMeta {
+        fn new(behave: Behave) -> Arc<Self> {
+            Arc::new(Self {
+                behave,
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+        fn entry(&self, name: &str) -> Result<SynoFileInfo, SynoFsError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behave {
+                Behave::Ok(_) => Ok(SynoFileInfo {
+                    name: name.to_string(),
+                    path: format!("/share/{name}"),
+                    isdir: false,
+                    additional: None,
+                    code: None,
+                }),
+                Behave::Transient => Err(SynoFsError::Io("backend down".into())),
+                Behave::NotFound => Err(SynoFsError::NotFound),
+                Behave::Exists => Err(SynoFsError::AlreadyExists),
+                Behave::CannotCreateNew => Err(SynoFsError::NotSupported),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MetadataTransport for FakeMeta {
+        async fn list_dir(&self, _folder: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
+            self.entry("from-backend").map(|e| vec![e])
+        }
+        async fn get_info(&self, _path: &str) -> Result<SynoFileInfo, SynoFsError> {
+            self.entry("from-backend")
+        }
+        async fn delete(&self, _path: &str) -> Result<(), SynoFsError> {
+            self.entry("deleted").map(|_| ())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listing_prefers_the_metadata_backend() {
+        let backend = FakeMeta::new(Behave::Ok(b""));
+        // No HTTP server at all: if the backend didn't answer, this would fail.
+        let client = offline_client().with_metadata_transport(backend.clone());
+        let entries = client.list_dir("/share").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "from-backend");
+        assert_eq!(backend.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_listing_falls_back_to_http_when_the_backend_is_down() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{
+                    "name": "from-http", "path": "/share/from-http", "isdir": false,
+                    "additional": {"size": 1, "owner": null, "time": null, "perm": null}
+                }], "total": 1, "offset": 0}
+            })))
+            .mount(&server)
+            .await;
+        let backend = FakeMeta::new(Behave::Transient);
+        let client = client_for(&server).with_metadata_transport(backend.clone());
+        let entries = client.list_dir("/share").await.unwrap();
+        assert_eq!(entries[0].name, "from-http", "HTTP served the listing");
+        assert_eq!(backend.call_count(), 1, "the backend was tried first");
+    }
+
+    #[tokio::test]
+    async fn a_definitive_answer_from_the_backend_is_not_second_guessed() {
+        // NotFound from a reachable backend is the truth about the namespace.
+        // Asking HTTP for a second opinion would be slower and no more correct.
+        let server = MockServer::start().await;
+        let backend = FakeMeta::new(Behave::NotFound);
+        let client = client_for(&server).with_metadata_transport(backend.clone());
+        let err = client.get_info("/share/gone").await.unwrap_err();
+        assert!(matches!(err, SynoFsError::NotFound), "got {err:?}");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no HTTP second opinion"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operation_the_backend_declines_goes_to_http() {
+        // FakeMeta implements only listings, stat and delete; `create_folder`
+        // falls through to the trait default, which declines.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "create"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"folders": [{"name": "new", "path": "/share/new", "isdir": true}]}
+            })))
+            .mount(&server)
+            .await;
+        let backend = FakeMeta::new(Behave::Ok(b""));
+        let client = client_for(&server).with_metadata_transport(backend.clone());
+        let made = client.create_folder("/share", "new").await.unwrap();
+        assert_eq!(made.name, "new");
+        assert_eq!(backend.call_count(), 0, "declined without being charged");
+
+        // And the decline left the breaker shut: a listing still prefers it.
+        let entries = client.list_dir("/share").await.unwrap();
+        assert_eq!(entries[0].name, "from-backend");
     }
 }
