@@ -5,6 +5,7 @@ members = [
     "rust/synology-filestation-fuse",
     "rust/synology-filestation-ffi",
     "rust/synology-filestation-smb",
+    "rust/synology-filestation-connect",
     "python/synology_filestation",
 ]
 
