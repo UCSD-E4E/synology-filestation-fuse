@@ -83,6 +83,28 @@ pub trait StreamWriteTransport: Send + Sync {
     /// Stream the contents of local file `local` into `remote_path`, replacing
     /// it (old-or-new).
     async fn write_from_path(&self, remote_path: &str, local: &Path) -> Result<(), SynoFsError>;
+
+    /// Stream `local` into `remote_path`, which **must not already exist**.
+    ///
+    /// Creating a file is where the volume is — a mount's large copies are new
+    /// files, not replacements — so a backend that cannot serve this case
+    /// doesn't get the traffic that matters. But "create" carries a promise
+    /// [`write_from_path`](Self::write_from_path) does not: an existing name is
+    /// [`SynoFsError::AlreadyExists`], never a silent clobber. Only a backend
+    /// that can make that atomic (SMB's `FILE_CREATE` disposition, say) should
+    /// implement it.
+    ///
+    /// The default declines with [`SynoFsError::NotSupported`], which the
+    /// selection layer reads as "not for you" rather than "you failed" — the
+    /// backend keeps its breaker shut and still serves replacing writes.
+    async fn write_new_from_path(
+        &self,
+        remote_path: &str,
+        local: &Path,
+    ) -> Result<(), SynoFsError> {
+        let _ = (remote_path, local);
+        Err(SynoFsError::NotSupported)
+    }
 }
 
 /// Tuning for a backend's [`CircuitBreaker`].

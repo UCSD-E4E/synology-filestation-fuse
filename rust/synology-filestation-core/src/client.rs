@@ -1357,17 +1357,33 @@ impl SynologyClient {
         overwrite: bool,
         progress: Option<ProgressSink<'_>>,
     ) -> Result<(), SynoFsError> {
-        if overwrite && !self.stream_write_transports.is_empty() {
+        if !self.stream_write_transports.is_empty() {
             let full_path = format!("{}/{}", folder_path.trim_end_matches('/'), filename);
             for entry in &self.stream_write_transports {
                 let allowed = entry.breaker.lock().unwrap().allows(Instant::now());
                 if !allowed {
                     continue;
                 }
-                match entry.transport.write_from_path(&full_path, local).await {
+                // Creating and replacing are different promises, so they are
+                // different calls. A new file used to skip the backends
+                // entirely — which exempted the case a mount spends its
+                // bandwidth on, since a large copy is a *new* file.
+                let attempt = if overwrite {
+                    entry.transport.write_from_path(&full_path, local).await
+                } else {
+                    entry.transport.write_new_from_path(&full_path, local).await
+                };
+                match attempt {
                     Ok(()) => {
                         entry.breaker.lock().unwrap().on_success();
                         return Ok(());
+                    }
+                    // Declining a case it cannot promise is not a failure:
+                    // leave the breaker shut so this backend still gets the
+                    // writes it can serve.
+                    Err(e) if e.category() == ErrorCategory::NotSupported => {
+                        debug!("stream write backend cannot create new files, using HTTP: {e}");
+                        continue;
                     }
                     Err(e) if e.category() == ErrorCategory::Transport => {
                         warn!("stream write backend failed (transient), falling back: {e}");
@@ -3701,13 +3717,19 @@ mod tests {
     // rename. The fishsense regression is the central case here.
 
     fn unique_tmp_path(name: &str) -> std::path::PathBuf {
+        // A counter, not just the clock. `SystemTime` is only nanosecond-*typed*
+        // — macOS and Windows tick it in microseconds — so two tests starting in
+        // the same tick got the same "unique" path, and whichever finished first
+        // deleted the other's file out from under it.
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
         let mut p = std::env::temp_dir();
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("synofs-test-{pid}-{nanos}-{name}"));
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        p.push(format!("synofs-test-{pid}-{nanos}-{seq}-{name}"));
         p
     }
 
@@ -4137,13 +4159,17 @@ mod tests {
 
     enum Behave {
         Ok(&'static [u8]),
-        Transient, // category Transport → fall back
-        NotFound,  // definitive → propagate, no fallback
+        Transient,       // category Transport → fall back
+        NotFound,        // definitive → propagate, no fallback
+        Exists,          // the create-new case: the name is taken
+        CannotCreateNew, // capability gap, not a failure
     }
 
     struct FakeBackend {
         behave: Behave,
         calls: AtomicUsize,
+        /// Calls that asked for create-new semantics specifically.
+        new_calls: AtomicUsize,
     }
 
     impl FakeBackend {
@@ -4151,10 +4177,14 @@ mod tests {
             Arc::new(Self {
                 behave,
                 calls: AtomicUsize::new(0),
+                new_calls: AtomicUsize::new(0),
             })
         }
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+        fn new_call_count(&self) -> usize {
+            self.new_calls.load(Ordering::SeqCst)
         }
         fn outcome_bytes(&self) -> Result<Bytes, SynoFsError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -4162,6 +4192,8 @@ mod tests {
                 Behave::Ok(b) => Ok(Bytes::from_static(b)),
                 Behave::Transient => Err(SynoFsError::Io("backend down".into())),
                 Behave::NotFound => Err(SynoFsError::NotFound),
+                Behave::Exists => Err(SynoFsError::AlreadyExists),
+                Behave::CannotCreateNew => Err(SynoFsError::NotSupported),
             }
         }
         fn outcome_unit(&self) -> Result<(), SynoFsError> {
@@ -4185,6 +4217,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StreamWriteTransport for FakeBackend {
+        async fn write_new_from_path(&self, _p: &str, _local: &Path) -> Result<(), SynoFsError> {
+            self.new_calls.fetch_add(1, Ordering::SeqCst);
+            self.outcome_unit()
+        }
         async fn write_from_path(&self, _p: &str, _local: &Path) -> Result<(), SynoFsError> {
             self.outcome_unit()
         }
@@ -4203,6 +4239,8 @@ mod tests {
                 }
                 Behave::Transient => Err(SynoFsError::Io("backend down".into())),
                 Behave::NotFound => Err(SynoFsError::NotFound),
+                // Write-side behaviours; a read never sees them.
+                Behave::Exists | Behave::CannotCreateNew => Err(SynoFsError::NotSupported),
             }
         }
     }
@@ -4377,7 +4415,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_from_path_overwrite_false_bypasses_stream_backend() {
+    async fn a_new_file_is_streamed_through_the_backend() {
+        // Creating a file is the case large copies are made of, so it must not
+        // be the one case that skips the fast path. The backend is asked for
+        // create-new semantics rather than the replacing write, so the "don't
+        // clobber" contract survives the change of transport.
+        let src = write_scratch_file(b"streamed payload");
+        let server = MockServer::start().await;
+        let backend = FakeBackend::new(Behave::Ok(b""));
+        let client = client_for(&server).with_stream_write_transport(backend.clone());
+        client
+            .upload_from_path(&src, "/share", "f.bin", false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.new_call_count(),
+            1,
+            "asked to create, not to replace"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "the NAS's HTTP API is not touched when the backend took the write"
+        );
+        std::fs::remove_file(&src).ok();
+    }
+
+    #[tokio::test]
+    async fn a_new_file_whose_name_is_taken_is_refused_rather_than_retried() {
+        // The name being taken is an answer, not a transport hiccup: HTTP would
+        // only reach the same conclusion, and re-uploading to find out costs
+        // the whole file.
+        let src = write_scratch_file(b"streamed payload");
+        let server = MockServer::start().await;
+        let backend = FakeBackend::new(Behave::Exists);
+        let client = client_for(&server).with_stream_write_transport(backend.clone());
+        let err = client
+            .upload_from_path(&src, "/share", "f.bin", false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SynoFsError::AlreadyExists), "got {err:?}");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no second opinion over HTTP"
+        );
+        std::fs::remove_file(&src).ok();
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_cannot_create_new_defers_to_http() {
+        // Declining is not failing. A backend without create-new semantics
+        // simply doesn't get the new-file case, and its breaker stays shut so
+        // it still serves the writes it can.
         let src = write_scratch_file(b"streamed payload");
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -4387,16 +4477,24 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let backend = FakeBackend::new(Behave::Ok(b""));
+        let backend = FakeBackend::new(Behave::CannotCreateNew);
         let client = client_for(&server).with_stream_write_transport(backend.clone());
         client
             .upload_from_path(&src, "/share", "f.bin", false)
             .await
             .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        // Same client, a replacing write: the breaker must not have been
+        // tripped by the decline.
+        client
+            .upload_from_path(&src, "/share", "f.bin", true)
+            .await
+            .unwrap();
         assert_eq!(
             backend.call_count(),
-            0,
-            "overwrite=false must skip the streaming backend"
+            2,
+            "the decline cost the backend nothing"
         );
         std::fs::remove_file(&src).ok();
     }
