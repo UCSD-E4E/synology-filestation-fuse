@@ -158,6 +158,19 @@ pub trait MetadataTransport: Send + Sync {
         let _ = path;
         Err(SynoFsError::NotSupported)
     }
+
+    /// Set the file's length, discarding anything past `size` or extending it
+    /// with zeroes.
+    ///
+    /// A metadata operation rather than a transfer: on a protocol that can
+    /// express it, the bytes being dropped are never read and never rewritten.
+    /// The HTTP API cannot express it at all, which is why the fallback in
+    /// [`SynologyClient::truncate`](crate::SynologyClient::truncate) has to
+    /// move the file's contents to change one number.
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), SynoFsError> {
+        let _ = (path, size);
+        Err(SynoFsError::NotSupported)
+    }
 }
 
 /// What opening a file for writing may create, and what it promises about a

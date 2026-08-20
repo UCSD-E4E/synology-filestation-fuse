@@ -1987,6 +1987,57 @@ impl SynologyClient {
         }
     }
 
+    /// Split a NAS path into `(parent, filename)`. `None` when there is no
+    /// separator, which cannot name a file inside a share.
+    fn split_parent(path: &str) -> Option<(&str, &str)> {
+        let idx = path.rfind('/')?;
+        Some((&path[..idx], &path[idx + 1..]))
+    }
+
+    /// Set a file's length.
+    ///
+    /// A backend that can express this does it in one round trip. The HTTP
+    /// FileStation API cannot: it has no length operation, only "upload this
+    /// whole file", so the fallback reads the part worth keeping and writes it
+    /// back — moving a file's contents to change one number.
+    ///
+    /// The fallback reads only what it keeps. Shrinking is the common case
+    /// (`O_TRUNC`, `> file`, a writer rewinding), and fetching the tail that is
+    /// about to be discarded would double an already regrettable transfer.
+    pub async fn truncate(&self, path: &str, size: u64) -> Result<(), SynoFsError> {
+        debug!("truncate: {} to {}", path, size);
+        via_metadata!(self, truncate(path, size));
+
+        let (parent, filename) = match Self::split_parent(path) {
+            Some(v) => v,
+            None => return Err(SynoFsError::InvalidArg),
+        };
+
+        let data = if size == 0 {
+            // Nothing to keep, so nothing to fetch: the common case costs one
+            // request instead of a download of a file we are discarding.
+            Vec::new()
+        } else {
+            // `length = 0` means "the whole file". Ask for only `size` bytes
+            // when the file is longer than that; when it is shorter (a grow)
+            // we need all of it before padding.
+            let current = self
+                .get_info(path)
+                .await
+                .ok()
+                .and_then(|i| i.additional.and_then(|a| a.size));
+            let want = match current {
+                Some(len) if len > size => size,
+                _ => 0,
+            };
+            let mut data = self.download(path, 0, want).await?.to_vec();
+            data.resize(size as usize, 0);
+            data
+        };
+
+        self.upload(parent, filename, data, true).await
+    }
+
     /// Delete a file that is in the way of an upload, then wait for it to
     /// actually disappear. Shared by the one-shot and slice upload paths:
     /// `overwrite=true` on the multipart API times out on some DSM versions, so
@@ -5785,6 +5836,9 @@ mod tests {
         async fn delete(&self, _path: &str) -> Result<(), SynoFsError> {
             self.entry("deleted").map(|_| ())
         }
+        async fn truncate(&self, _path: &str, _size: u64) -> Result<(), SynoFsError> {
+            self.entry("truncated").map(|_| ())
+        }
     }
 
     #[tokio::test]
@@ -5875,5 +5929,164 @@ mod tests {
             Err(e) => panic!("expected a decline, got {e:?}"),
             Ok(_) => panic!("a backend with no offset writes must not hand one out"),
         }
+    }
+
+    // ── truncate ─────────────────────────────────────────────────────────────
+    //
+    // A file's length is a number. On a protocol that can say so it is one
+    // round trip; over the FileStation API, which only knows "upload this whole
+    // file", it costs a read and a write of the contents. The fallback at least
+    // reads only the part it keeps.
+
+    #[tokio::test]
+    async fn truncate_prefers_the_metadata_backend() {
+        let backend = FakeMeta::new(Behave::Ok(b""));
+        // Offline: if the backend didn't take it, there is no HTTP to fall to.
+        let client = offline_client().with_metadata_transport(backend.clone());
+        client.truncate("/share/big.bin", 1024).await.unwrap();
+        assert_eq!(backend.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn truncating_to_zero_never_reads_the_file() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+
+        client_for(&server)
+            .truncate("/share/f.bin", 0)
+            .await
+            .unwrap();
+
+        let downloads = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.query().is_some_and(|q| q.contains("method=download")))
+            .count();
+        assert_eq!(downloads, 0, "nothing worth keeping, so nothing fetched");
+    }
+
+    #[tokio::test]
+    async fn shrinking_reads_only_the_bytes_it_keeps() {
+        // The tail is about to be discarded. Fetching it would double a
+        // transfer that is already the wrong shape for the job.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{
+                    "name": "f.bin", "path": "/share/f.bin", "isdir": false,
+                    "additional": {"size": 5000, "owner": null, "time": null, "perm": null}
+                }]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .set_body_bytes(vec![7u8; 100]),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+
+        client_for(&server)
+            .truncate("/share/f.bin", 100)
+            .await
+            .unwrap();
+
+        let ranges: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.query().is_some_and(|q| q.contains("method=download")))
+            .map(|r| {
+                r.headers
+                    .get("Range")
+                    .map(|v| v.to_str().unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![Some("bytes=0-99".to_string())],
+            "asked for the 100 bytes it keeps, not the 5000 that exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn growing_reads_the_whole_file_before_padding() {
+        // Extending needs everything that is already there; the new tail is
+        // zeroes the caller never sent.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{
+                    "name": "f.bin", "path": "/share/f.bin", "isdir": false,
+                    "additional": {"size": 4, "owner": null, "time": null, "perm": null}
+                }]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .set_body_bytes(b"abcd".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+
+        client_for(&server)
+            .truncate("/share/f.bin", 8)
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let range = reqs
+            .iter()
+            .find(|r| r.url.query().is_some_and(|q| q.contains("method=download")))
+            .and_then(|r| r.headers.get("Range").cloned());
+        assert!(range.is_none(), "the whole file, so no range");
+
+        let body = reqs
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .unwrap();
+        assert!(
+            body.contains("abcd\0\0\0\0"),
+            "the old bytes, then zeroes to the new length"
+        );
     }
 }

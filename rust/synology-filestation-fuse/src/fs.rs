@@ -257,27 +257,12 @@ impl Transfers {
         path: &str,
         new_size: u64,
     ) -> Result<SynoFileInfo, SynoFsError> {
-        // Shrinking to nothing needs no prior content, and this is the common
-        // case (O_TRUNC, `> file`). Skip the round trip entirely rather than
-        // downloading a file we are about to discard.
-        let data = if new_size == 0 {
-            Vec::new()
-        } else {
-            let permit = self.permit().await;
-            let current = self.client.download(path, 0, 0).await?;
-            drop(permit);
-            let mut data = current.to_vec();
-            data.resize(new_size as usize, 0);
-            data
-        };
-
-        let (parent, filename) = match split_nas_path(path) {
-            Some(v) => v,
-            None => return Err(SynoFsError::InvalidArg),
-        };
+        // The client picks how: a backend that can set a length does it in one
+        // round trip, and only the HTTP fallback still has to move the file's
+        // contents to change one number.
         {
             let _permit = self.permit().await;
-            self.client.upload(parent, filename, data, true).await?;
+            self.client.truncate(path, new_size).await?;
         }
 
         self.read_cache.invalidate_ino(ino);
