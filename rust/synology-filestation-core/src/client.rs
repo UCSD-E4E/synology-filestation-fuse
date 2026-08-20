@@ -1988,10 +1988,20 @@ impl SynologyClient {
     }
 
     /// Split a NAS path into `(parent, filename)`. `None` when there is no
-    /// separator, which cannot name a file inside a share.
+    /// separator, or when the path names no file at all.
+    ///
+    /// A trailing slash is the dangerous case: it yields an empty filename,
+    /// and an empty filename rejoined to its parent is the parent. Handed to
+    /// an overwriting upload, `clear_for_overwrite` would then delete the
+    /// *directory* before writing. Refusing here is the difference between an
+    /// invalid argument and a removed folder.
     fn split_parent(path: &str) -> Option<(&str, &str)> {
         let idx = path.rfind('/')?;
-        Some((&path[..idx], &path[idx + 1..]))
+        let (parent, filename) = (&path[..idx], &path[idx + 1..]);
+        if filename.is_empty() {
+            return None;
+        }
+        Some((parent, filename))
     }
 
     /// Set a file's length.
@@ -2030,8 +2040,12 @@ impl SynologyClient {
                 Some(len) if len > size => size,
                 _ => 0,
             };
+            // Checked, not `as`: the fallback has to materialise the whole
+            // result in memory, so a size this machine cannot address is an
+            // argument error rather than a silently wrapped length.
+            let len = usize::try_from(size).map_err(|_| SynoFsError::InvalidArg)?;
             let mut data = self.download(path, 0, want).await?.to_vec();
-            data.resize(size as usize, 0);
+            data.resize(len, 0);
             data
         };
 
@@ -6087,6 +6101,39 @@ mod tests {
         assert!(
             body.contains("abcd\0\0\0\0"),
             "the old bytes, then zeroes to the new length"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncating_a_directory_path_refuses_instead_of_deleting_it() {
+        // A trailing slash yields an empty filename, and an empty filename
+        // rejoined to its parent IS the parent — so the overwrite path would
+        // have cleared the directory before writing. The bug is worth a test
+        // precisely because its symptom is a missing folder, not an error.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server)
+            .truncate("/share/dir/", 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SynoFsError::InvalidArg), "got {err:?}");
+
+        let touched_the_nas = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
+        assert!(
+            !touched_the_nas,
+            "nothing was deleted on the way to the error"
         );
     }
 }
