@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use smb2::{ClientConfig, SmbClient, Tree};
+use smb2::{ClientConfig, RenameOptions, SmbClient, Tree};
 use synology_filestation_core::{
     MetadataTransport, OpenWriteTransport, ReadTransport, StreamReadTransport,
     StreamWriteTransport, SynoAdditional, SynoFileInfo, SynoFsError, SynoTime, SynologyClient,
@@ -362,29 +362,33 @@ impl SmbTransport {
         tree: &mut Tree,
         tmp: &str,
         target: &str,
-        seq: u64,
+        _seq: u64,
     ) -> Result<(), SynoFsError> {
-        match client.rename(tree, tmp, target).await {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == smb2::ErrorKind::AlreadyExists => {} // replace below
+        // One operation, performed by the server. The old-or-new guarantee is
+        // now the server's to keep: there is no moment when the name resolves
+        // to nothing, and nothing left half-done if this process dies here.
+        //
+        // What this replaces: rename, and on a name collision move the old
+        // file aside, rename again, delete the backup, restoring the old file
+        // if the second rename failed. Four operations, three of them
+        // recovery, and a window in the middle where a reader looking for the
+        // target found neither copy. That dance existed only because the SMB
+        // library hardcoded ReplaceIfExists=false; our fork sends it.
+        match client
+            .rename_with_options(
+                tree,
+                tmp,
+                target,
+                RenameOptions {
+                    replace_if_exists: true,
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
             Err(e) => {
+                // The temp file is ours and now has no name anyone wants.
                 self.note_cleanup(client.delete_file(tree, tmp).await);
-                return Err(self.mark_and_map(&e));
-            }
-        }
-        // Move the old file aside so no step ever deletes the only copy.
-        let backup = part_name(&format!("{target}.bak"), seq);
-        if let Err(e) = client.rename(tree, target, &backup).await {
-            self.note_cleanup(client.delete_file(tree, tmp).await);
-            return Err(self.mark_and_map(&e));
-        }
-        match client.rename(tree, tmp, target).await {
-            Ok(()) => {
-                self.note_cleanup(client.delete_file(tree, &backup).await); // best-effort
-                Ok(())
-            }
-            Err(e) => {
-                self.note_cleanup(client.rename(tree, &backup, target).await); // restore old
                 Err(self.mark_and_map(&e))
             }
         }
@@ -1063,6 +1067,21 @@ impl MetadataTransport for SmbTransport {
             client.delete_file(tree, &loc.path).await
         };
         done.map_err(|e| self.mark_and_map(&e))
+    }
+
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), SynoFsError> {
+        let loc = SmbPath::from_logical(path)?;
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        self.ensure_ready(client, trees, &loc.share).await?;
+        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        // SET_INFO with FileEndOfFileInformation: the file's length is a
+        // number the server sets, so the bytes past it are never read and
+        // never rewritten — regardless of how many there are.
+        client
+            .set_end_of_file(tree, &loc.path, size)
+            .await
+            .map_err(|e| self.mark_and_map(&e))
     }
 }
 
