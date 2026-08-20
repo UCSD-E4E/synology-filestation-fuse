@@ -1198,7 +1198,13 @@ impl Filesystem for SynologyFS {
                 sink: self.open_sink(&new_path),
                 nas_path: new_path,
                 ino,
-                dirty: false,
+                // Dirty from birth. `create(2)` is a request for a file to
+                // exist, and `touch` makes exactly this handle: opened,
+                // written to never, closed. Starting clean meant close saw
+                // nothing to do and the file never reached the NAS at all —
+                // it lived in the inode cache until the TTL expired and then
+                // vanished.
+                dirty: true,
                 new_file: true,
                 broken: false,
             })),
@@ -2500,5 +2506,33 @@ mod tests {
         let f = fixture();
         let sink = f.fs.open_sink("/share/plain.bin");
         assert!(matches!(sink, WriteSink::Buffered(_)));
+    }
+
+    #[test]
+    fn creating_a_file_and_writing_nothing_still_puts_it_on_the_nas() {
+        // `touch`. The handle is opened, never written, and closed. Before
+        // this, close found nothing dirty and did nothing, so the file existed
+        // only in the inode cache and disappeared when the TTL lapsed.
+        let f = fixture();
+        mount_upload_ok(&f);
+
+        let fh = f.fs.next_fh.fetch_add(1, Ordering::Relaxed);
+        f.fs.write_buffers.lock().unwrap().insert(
+            fh,
+            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+                nas_path: "/share/touched.txt".to_string(),
+                ino: 7,
+                sink: WriteSink::Buffered(SpillBuffer::new()),
+                // What `create` now seeds.
+                dirty: true,
+                new_file: true,
+                broken: false,
+            })),
+        );
+
+        f.fs.finish_upload(fh).expect("close");
+
+        let bodies = posted_bodies(&f);
+        assert_eq!(bodies.len(), 1, "the empty file was uploaded");
     }
 }

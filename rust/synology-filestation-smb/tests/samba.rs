@@ -109,3 +109,29 @@ async fn truncate_can_also_extend_a_file() {
 
     smb.delete(path).await.ok();
 }
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn closing_a_handle_nothing_was_written_to_still_creates_the_file() {
+    // `touch` through the mount: opened, never written, closed. The file has
+    // to exist afterwards, and the only thing that can make it exist is the
+    // close — there was no write to do it.
+    use synology_filestation_core::transport::{OpenWriteTransport, WriteOpen};
+
+    let servers = TestServers::start().await.expect("docker compose up");
+    let smb = connect(&servers).await;
+
+    let path = "/private/touched.txt";
+    smb.delete(path).await.ok();
+
+    let mut handle = smb
+        .open_write(path, WriteOpen::Existing)
+        .await
+        .expect("open for writing");
+    handle.close().await.expect("close");
+
+    let meta = smb.stat(path).await.expect("the file should exist now");
+    assert_eq!(meta.size, 0, "created, and empty");
+
+    smb.delete(path).await.ok();
+}
