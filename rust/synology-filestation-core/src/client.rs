@@ -664,6 +664,30 @@ impl SynologyClient {
         self
     }
 
+    /// Register a streaming write backend with a test-tuned breaker.
+    #[cfg(test)]
+    fn with_stream_write_transport_breaker(
+        mut self,
+        transport: Arc<dyn StreamWriteTransport>,
+        config: BreakerConfig,
+    ) -> Self {
+        self.stream_write_transports
+            .push(TransportEntry::with_breaker(transport, config));
+        self
+    }
+
+    /// Register an open-write backend with a test-tuned breaker.
+    #[cfg(test)]
+    fn with_open_write_transport_breaker(
+        mut self,
+        transport: Arc<dyn OpenWriteTransport>,
+        config: BreakerConfig,
+    ) -> Self {
+        self.open_write_transports
+            .push(TransportEntry::with_breaker(transport, config));
+        self
+    }
+
     /// Inject an [`OpenWriteTransport`] backend, letting `open_write` hand out
     /// streaming write handles instead of buffering whole files.
     pub fn with_open_write_transport(mut self, transport: Arc<dyn OpenWriteTransport>) -> Self {
@@ -6279,5 +6303,124 @@ mod tests {
             "the backend was asked again after declining; a stranded breaker \
              would have stopped at 2"
         );
+    }
+
+    /// The same script as `ScriptedMeta`, for the other two decline sites:
+    /// trip the breaker, decline the half-open probe, then answer.
+    struct ScriptedWriter {
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedWriter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn next(&self) -> Result<(), SynoFsError> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(SynoFsError::Io("link down".into())),
+                1 => Err(SynoFsError::NotSupported),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamWriteTransport for ScriptedWriter {
+        async fn write_from_path(&self, _p: &str, _local: &Path) -> Result<(), SynoFsError> {
+            self.next()
+        }
+        async fn write_new_from_path(&self, _p: &str, _local: &Path) -> Result<(), SynoFsError> {
+            self.next()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OpenWriteTransport for ScriptedWriter {
+        async fn open_write(
+            &self,
+            _path: &str,
+            _mode: WriteOpen,
+        ) -> Result<Box<dyn WriteHandle>, SynoFsError> {
+            self.next()?;
+            struct Nowhere;
+            #[async_trait::async_trait]
+            impl WriteHandle for Nowhere {
+                async fn write_at(&mut self, _o: u64, _d: &[u8]) -> Result<(), SynoFsError> {
+                    Ok(())
+                }
+                async fn close(&mut self) -> Result<(), SynoFsError> {
+                    Ok(())
+                }
+            }
+            Ok(Box::new(Nowhere))
+        }
+    }
+
+    fn twitchy_breaker() -> BreakerConfig {
+        BreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declined_open_write_leaves_the_backend_askable() {
+        let server = MockServer::start().await;
+        let backend = ScriptedWriter::new();
+        let client = client_for(&server)
+            .with_open_write_transport_breaker(backend.clone(), twitchy_breaker());
+
+        // Trip, then a declined half-open probe, then it must be asked again.
+        client
+            .open_write("/share/f.bin", WriteOpen::Existing)
+            .await
+            .ok();
+        client
+            .open_write("/share/f.bin", WriteOpen::Existing)
+            .await
+            .ok();
+        client
+            .open_write("/share/f.bin", WriteOpen::Existing)
+            .await
+            .ok();
+
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            3,
+            "a stranded breaker would have stopped asking at 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declined_create_new_leaves_the_backend_askable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+
+        let src = write_scratch_file(b"payload");
+        let backend = ScriptedWriter::new();
+        let client = client_for(&server)
+            .with_stream_write_transport_breaker(backend.clone(), twitchy_breaker());
+
+        for _ in 0..3 {
+            client
+                .upload_from_path(&src, "/share", "f.bin", false)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            3,
+            "a stranded breaker would have stopped asking at 2"
+        );
+        std::fs::remove_file(&src).ok();
     }
 }
