@@ -2341,8 +2341,10 @@ name = "synology-filestation-connect"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "synology-filestation-core",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
