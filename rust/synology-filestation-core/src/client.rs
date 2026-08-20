@@ -8,8 +8,8 @@ use tracing::{debug, error, warn};
 
 use crate::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
 use crate::transport::{
-    BreakerConfig, CircuitBreaker, MetadataTransport, ReadTransport, StreamReadTransport,
-    StreamWriteTransport, WriteTransport,
+    BreakerConfig, CircuitBreaker, MetadataTransport, OpenWriteTransport, ReadTransport,
+    StreamReadTransport, StreamWriteTransport, WriteHandle, WriteOpen, WriteTransport,
 };
 /// Offer an operation to each metadata backend in turn before falling back to
 /// HTTP, expanding at the head of the method it belongs to.
@@ -424,6 +424,10 @@ pub struct SynologyClient {
     /// Injected metadata backends, tried in order before the HTTP List/Delete/
     /// CreateFolder/Rename APIs.
     metadata_transports: Vec<TransportEntry<dyn MetadataTransport>>,
+    /// Injected backends that can write into an open file at offsets. Empty is
+    /// the HTTP case, where a write has to be buffered until the whole file is
+    /// known.
+    open_write_transports: Vec<TransportEntry<dyn OpenWriteTransport>>,
     /// Bytes per slice for the chunked upload path. A file larger than this is
     /// uploaded slice-by-slice so it is never held in memory whole; anything
     /// smaller takes the one-shot path. Default [`DEFAULT_SLICE_SIZE`].
@@ -483,6 +487,7 @@ impl SynologyClient {
             stream_write_transports: Vec::new(),
             stream_read_transports: Vec::new(),
             metadata_transports: Vec::new(),
+            open_write_transports: Vec::new(),
             slice_size: DEFAULT_SLICE_SIZE,
         }
     }
@@ -625,6 +630,51 @@ impl SynologyClient {
         self.metadata_transports
             .push(TransportEntry::new(transport));
         self
+    }
+
+    /// Inject an [`OpenWriteTransport`] backend, letting `open_write` hand out
+    /// streaming write handles instead of buffering whole files.
+    pub fn with_open_write_transport(mut self, transport: Arc<dyn OpenWriteTransport>) -> Self {
+        self.open_write_transports
+            .push(TransportEntry::new(transport));
+        self
+    }
+
+    /// Open `path` for writing through a backend that can address offsets.
+    ///
+    /// `Ok(None)` is the ordinary answer when nothing can: the caller buffers
+    /// the writes and uploads the whole file, which is all the HTTP API
+    /// supports. An `Err` means a backend had a real answer — an existing name
+    /// under [`WriteOpen::CreateNew`], say — and that answer stands rather than
+    /// being retried down a path that would reach the same conclusion.
+    pub async fn open_write(
+        &self,
+        path: &str,
+        mode: WriteOpen,
+    ) -> Result<Option<Box<dyn WriteHandle>>, SynoFsError> {
+        for entry in &self.open_write_transports {
+            if !entry.breaker.lock().unwrap().allows(Instant::now()) {
+                continue;
+            }
+            match entry.transport.open_write(path, mode).await {
+                Ok(handle) => {
+                    entry.breaker.lock().unwrap().on_success();
+                    return Ok(Some(handle));
+                }
+                // Cannot stream. Not a failure, and not this backend's fault.
+                Err(e) if e.category() == ErrorCategory::NotSupported => continue,
+                Err(e) if e.category() == ErrorCategory::Transport => {
+                    warn!("open-write backend failed (transient), buffering instead: {e}");
+                    entry.breaker.lock().unwrap().on_failure(Instant::now());
+                    continue;
+                }
+                Err(e) => {
+                    entry.breaker.lock().unwrap().on_success();
+                    return Err(e);
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Override the slice size used by the chunked upload path (default

@@ -256,7 +256,8 @@ pub async fn auto_attach(
             .with_write_transport(smb.clone())
             .with_stream_write_transport(smb.clone())
             .with_stream_read_transport(smb.clone())
-            .with_metadata_transport(smb),
+            .with_metadata_transport(smb.clone())
+            .with_open_write_transport(smb),
         None => client,
     }
 }
