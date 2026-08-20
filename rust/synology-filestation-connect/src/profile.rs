@@ -41,11 +41,38 @@ impl ProfileSource {
     /// Cheap on the common path: an existing copy is used as-is, so a mount
     /// does not re-download the file on every connect.
     pub async fn ensure(&self, client: &SynologyClient) -> Result<PathBuf, SynoFsError> {
-        if tokio::fs::metadata(&self.local).await.is_ok() {
-            debug!("vpn profile: using the copy at {}", self.local.display());
-            return Ok(self.local.clone());
+        if let Some(cached) = self.usable_copy()? {
+            debug!("vpn profile: using the copy at {}", cached.display());
+            return Ok(cached);
         }
         self.refresh(client).await
+    }
+
+    /// The cached copy, if there is one worth trusting.
+    ///
+    /// `symlink_metadata`, so a symlink is seen rather than followed. This is
+    /// not paranoia about the filesystem: a profile names the server the client
+    /// connects to, and the user types their AD password into whatever answers.
+    /// Anything able to plant a symlink (or a file) in the cache directory
+    /// would otherwise choose that server. So only a regular file counts, and
+    /// its permissions are re-applied rather than assumed — a copy that has
+    /// drifted world-readable, or that was pre-created by someone else, is
+    /// exactly the case the 0600 was for.
+    fn usable_copy(&self) -> Result<Option<PathBuf>, SynoFsError> {
+        let meta = match std::fs::symlink_metadata(&self.local) {
+            Ok(m) => m,
+            // Absent is the ordinary case on a first connect.
+            Err(_) => return Ok(None),
+        };
+        if !meta.is_file() {
+            return Err(SynoFsError::Io(format!(
+                "vpn profile: {} exists but is not a regular file; refusing to \
+                 treat it as a profile",
+                self.local.display()
+            )));
+        }
+        restrict_existing_file(&self.local, &meta)?;
+        Ok(Some(self.local.clone()))
     }
 
     /// Fetch the profile, replacing any copy already here.
@@ -54,7 +81,7 @@ impl ProfileSource {
     /// address may have changed under a cached file, and re-fetching is far
     /// cheaper than diagnosing that by hand.
     pub async fn refresh(&self, client: &SynologyClient) -> Result<PathBuf, SynoFsError> {
-        if let Some(dir) = self.local.parent() {
+        if let Some(dir) = dir_to_create(&self.local) {
             tokio::fs::create_dir_all(dir)
                 .await
                 .map_err(|e| SynoFsError::Io(format!("vpn profile: {} : {e}", dir.display())))?;
@@ -70,6 +97,40 @@ impl ProfileSource {
         restrict_file(&self.local)?;
         Ok(self.local.clone())
     }
+}
+
+/// The directory that must exist before `local` can be written, if any.
+///
+/// `Path::parent` answers `Some("")` for a bare filename, and creating an
+/// empty path fails — but a caller who wrote `e4e-nas-vpn.ovpn` meant the
+/// working directory, which is already there. Nothing to create.
+fn dir_to_create(local: &Path) -> Option<&Path> {
+    local.parent().filter(|d| !d.as_os_str().is_empty())
+}
+
+/// Tighten a copy that already exists, saying so when it had to.
+///
+/// Silence would hide the interesting case: a profile that was readable by
+/// others has been readable by others for as long as it sat there.
+#[cfg(unix)]
+fn restrict_existing_file(path: &Path, meta: &std::fs::Metadata) -> Result<(), SynoFsError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            "vpn profile: {} was mode {:o}; tightening to 600 (it embeds the \
+             tls-auth key, so anyone who could read it has it)",
+            path.display(),
+            mode
+        );
+        return restrict_file(path);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_existing_file(_path: &Path, _meta: &std::fs::Metadata) -> Result<(), SynoFsError> {
+    Ok(())
 }
 
 /// Make a directory reachable only by its owner (`0700`).
@@ -256,5 +317,63 @@ mod tests {
             "nothing was left behind for the next connect to trust"
         );
         std::fs::remove_dir_all(src.local.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_in_the_cache_is_refused_rather_than_followed() {
+        // The sharp end of trusting whatever is at the path: a profile names
+        // the server the client connects to, and the user types their AD
+        // password into whatever answers. Following a planted symlink would
+        // let whoever planted it choose that server.
+        let server = MockServer::start().await;
+        mount_download(&server).await;
+        let src = source(scratch("symlink"));
+        std::fs::create_dir_all(src.local.parent().unwrap()).unwrap();
+
+        let elsewhere = src.local.with_file_name("attacker.ovpn");
+        std::fs::write(&elsewhere, b"remote attacker.example 1194 udp\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &src.local).unwrap();
+
+        let err = src.ensure(&client_for(&server)).await.unwrap_err();
+        assert!(format!("{err}").contains("not a regular file"), "got {err}");
+        std::fs::remove_dir_all(src.local.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_profile_whose_permissions_drifted_is_tightened_before_use() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let server = MockServer::start().await;
+        mount_download(&server).await;
+        let src = source(scratch("drifted"));
+        std::fs::create_dir_all(src.local.parent().unwrap()).unwrap();
+        std::fs::write(&src.local, PROFILE).unwrap();
+        std::fs::set_permissions(&src.local, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        src.ensure(&client_for(&server)).await.unwrap();
+
+        let mode = std::fs::metadata(&src.local).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a readable copy is tightened, not trusted as-is"
+        );
+        std::fs::remove_dir_all(src.local.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_bare_filename_needs_no_directory_created() {
+        // `parent()` answers Some("") here, and creating an empty path fails.
+        // The caller meant the working directory, which already exists.
+        //
+        // A pure test rather than one that changes the process's working
+        // directory: that is global state, and this suite runs in parallel
+        // with tests resolving their own paths.
+        assert_eq!(dir_to_create(Path::new("e4e-nas-vpn.ovpn")), None);
+        assert_eq!(
+            dir_to_create(Path::new("/home/u/.config/syno/e4e-nas-vpn.ovpn")),
+            Some(Path::new("/home/u/.config/syno"))
+        );
     }
 }
