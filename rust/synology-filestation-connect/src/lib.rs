@@ -137,12 +137,59 @@ impl TransportPolicy {
     }
 }
 
-/// Can SMB be reached right now?
+/// Where the NAS is, on each side of the tunnel.
+///
+/// Two addresses, not one, because the tunnel deliberately pushes no DNS: a
+/// client inside it reaches the NAS at a private address that its public name
+/// does not resolve to. Probing the wrong one is the difference between "SMB
+/// is down" and "SMB is one escalation away".
+#[derive(Debug, Clone)]
+pub struct Endpoints {
+    /// The publicly resolvable name. Carries the HTTP API, and is what the
+    /// direct SMB probe asks.
+    pub public_host: String,
+    /// The NAS's address inside the tunnel, when one is configured. `None`
+    /// means there is nowhere for an escalation to land, so none is attempted
+    /// however healthy the tunnel is.
+    pub tunnel_host: Option<String>,
+}
+
+impl Endpoints {
+    /// A NAS reachable only by its public name.
+    pub fn public_only(host: impl Into<String>) -> Self {
+        Self {
+            public_host: host.into(),
+            tunnel_host: None,
+        }
+    }
+
+    /// A NAS that is also reachable at `tunnel_host` once the tunnel is up.
+    pub fn with_tunnel(host: impl Into<String>, tunnel_host: impl Into<String>) -> Self {
+        Self {
+            public_host: host.into(),
+            tunnel_host: Some(tunnel_host.into()),
+        }
+    }
+}
+
+/// A chosen transport and the address to use it against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    /// Which leg of the chain this is.
+    pub transport: Transport,
+    /// The host SMB should connect to. `None` on the HTTP leg, which carries
+    /// no SMB at all.
+    pub smb_host: Option<String>,
+}
+
+/// Can SMB be reached at `host` right now?
 #[async_trait]
 pub trait Prober: Send + Sync {
-    /// True when the SMB port answers. Implementations must bound their own
-    /// wait: this runs while a user watches a spinner.
-    async fn smb_reachable(&self) -> bool;
+    /// True when the SMB port answers. The host is a parameter because the
+    /// answer differs per leg: the public name for a direct connection, the
+    /// in-tunnel address once a tunnel is up. Implementations must bound their
+    /// own wait: this runs while a user watches a spinner.
+    async fn smb_reachable(&self, host: &str) -> bool;
 }
 
 /// Something that can make an unreachable NAS reachable.
@@ -183,26 +230,25 @@ impl Tunnel for NoTunnel {
 /// authentication is settled separately, against the HTTP API, before any of
 /// this runs.
 pub struct TcpProber {
-    host: String,
     port: u16,
     timeout: Duration,
 }
 
 impl TcpProber {
-    /// Probe `host` on the standard SMB port.
-    pub fn new(host: impl Into<String>, timeout: Duration) -> Self {
-        Self {
-            host: host.into(),
-            port: 445,
-            timeout,
-        }
+    /// Probe the standard SMB port, giving up after `timeout`.
+    ///
+    /// A TCP connect and nothing more: reachability, not authorization. ICMP
+    /// is not used — the tunnel drops it by design, so a ping would report a
+    /// working path as dead.
+    pub fn new(timeout: Duration) -> Self {
+        Self { port: 445, timeout }
     }
 }
 
 #[async_trait]
 impl Prober for TcpProber {
-    async fn smb_reachable(&self) -> bool {
-        let addr = format!("{}:{}", self.host, self.port);
+    async fn smb_reachable(&self, host: &str) -> bool {
+        let addr = format!("{}:{}", host, self.port);
         match tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr)).await {
             Ok(Ok(_)) => true,
             Ok(Err(e)) => {
@@ -230,9 +276,9 @@ impl std::fmt::Display for NoTransport {
 impl std::error::Error for NoTransport {}
 
 /// A cached choice and the moment it stops being trusted.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Decision {
-    transport: Transport,
+    route: Route,
     /// `None` for a choice at the top of the chain: there is nothing better to
     /// find, so it never expires on its own.
     expires_at: Option<Instant>,
@@ -242,6 +288,7 @@ struct Decision {
 /// improved.
 pub struct Chain {
     policy: TransportPolicy,
+    endpoints: Endpoints,
     prober: Box<dyn Prober>,
     tunnel: Box<dyn Tunnel>,
     recheck: Duration,
@@ -253,12 +300,14 @@ impl Chain {
     /// see [`DEFAULT_RECHECK`].
     pub fn new(
         policy: TransportPolicy,
+        endpoints: Endpoints,
         prober: Box<dyn Prober>,
         tunnel: Box<dyn Tunnel>,
         recheck: Duration,
     ) -> Self {
         Self {
             policy,
+            endpoints,
             prober,
             tunnel,
             recheck,
@@ -266,70 +315,91 @@ impl Chain {
         }
     }
 
-    /// The transport to use now.
+    /// The transport to use now, and the address to use it against.
     ///
     /// Cheap on the common path: a decision that has not expired is returned
     /// without touching the network.
-    pub async fn transport(&self) -> Result<Transport, NoTransport> {
+    pub async fn route(&self) -> Result<Route, NoTransport> {
         if let Some(cached) = self.cached(Instant::now()) {
             return Ok(cached);
         }
         let chosen = self.decide().await?;
-        self.remember(chosen, Instant::now());
+        self.remember(chosen.clone(), Instant::now());
         Ok(chosen)
     }
 
     /// The current choice without deciding one, for a status line that must
     /// not cause network traffic to render.
-    pub fn current(&self) -> Option<Transport> {
-        self.decision.lock().unwrap().map(|d| d.transport)
+    pub fn current(&self) -> Option<Route> {
+        self.decision
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|d| d.route.clone())
     }
 
-    fn cached(&self, now: Instant) -> Option<Transport> {
-        let decision = (*self.decision.lock().unwrap())?;
+    fn cached(&self, now: Instant) -> Option<Route> {
+        let guard = self.decision.lock().unwrap();
+        let decision = guard.as_ref()?;
         match decision.expires_at {
             // Best available: nothing to look for, so it never goes stale.
-            None => Some(decision.transport),
-            Some(at) if now < at => Some(decision.transport),
+            None => Some(decision.route.clone()),
+            Some(at) if now < at => Some(decision.route.clone()),
             Some(_) => None,
         }
     }
 
-    fn remember(&self, transport: Transport, now: Instant) {
-        let expires_at = if transport.is_best() {
+    fn remember(&self, route: Route, now: Instant) {
+        let expires_at = if route.transport.is_best() {
             None
         } else {
             Some(now + self.recheck)
         };
-        *self.decision.lock().unwrap() = Some(Decision {
-            transport,
-            expires_at,
-        });
+        *self.decision.lock().unwrap() = Some(Decision { route, expires_at });
     }
 
-    async fn decide(&self) -> Result<Transport, NoTransport> {
+    async fn decide(&self) -> Result<Route, NoTransport> {
         if self.policy.allows_smb() {
-            if self.prober.smb_reachable().await {
-                debug!("transport: SMB answers directly");
-                return Ok(Transport::SmbDirect);
+            let public = &self.endpoints.public_host;
+            if self.prober.smb_reachable(public).await {
+                debug!("transport: SMB answers directly at {public}");
+                return Ok(Route {
+                    transport: Transport::SmbDirect,
+                    smb_host: Some(public.clone()),
+                });
             }
-            if self.policy.allows_vpn() {
-                match self.tunnel.bring_up().await {
-                    Ok(()) if self.prober.smb_reachable().await => {
-                        info!("transport: SMB reachable through the tunnel");
-                        return Ok(Transport::SmbOverVpn);
+            match (self.policy.allows_vpn(), &self.endpoints.tunnel_host) {
+                (true, Some(inside)) => match self.tunnel.bring_up().await {
+                    // Probe the address *inside* the tunnel, not the public
+                    // name: the tunnel pushes no DNS, and the public name is
+                    // exactly the one that just failed.
+                    Ok(()) if self.prober.smb_reachable(inside).await => {
+                        info!("transport: SMB reachable through the tunnel at {inside}");
+                        return Ok(Route {
+                            transport: Transport::SmbOverVpn,
+                            smb_host: Some(inside.clone()),
+                        });
                     }
                     // A tunnel that came up without making SMB reachable is
                     // not a tunnel to here; say so rather than blaming SMB.
                     Ok(()) => warn!("transport: tunnel is up but SMB still does not answer"),
                     Err(e) => debug!("transport: no tunnel ({e})"),
+                },
+                // Nowhere for an escalation to land. Raising the tunnel would
+                // still leave us with no address to mount, so don't.
+                (true, None) => {
+                    debug!("transport: no in-tunnel address configured, so no escalation")
                 }
+                (false, _) => {}
             }
         }
 
         if self.policy.allows_https() {
             info!("transport: falling back to the HTTP API");
-            return Ok(Transport::Https);
+            return Ok(Route {
+                transport: Transport::Https,
+                smb_host: None,
+            });
         }
         Err(NoTransport)
     }
@@ -338,62 +408,107 @@ impl Chain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    const PUBLIC: &str = "e4e-nas.ucsd.edu";
+    const INSIDE: &str = "10.90.24.1";
 
     #[derive(Default)]
     struct FakeProber {
-        reachable: AtomicBool,
-        probes: AtomicUsize,
+        /// Hosts that answer on 445.
+        answering: StdMutex<Vec<String>>,
+        /// Every host asked, in order.
+        asked: StdMutex<Vec<String>>,
     }
 
     impl FakeProber {
-        fn new(reachable: bool) -> Self {
-            Self {
-                reachable: AtomicBool::new(reachable),
-                probes: AtomicUsize::new(0),
-            }
+        fn answering(hosts: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                answering: StdMutex::new(hosts.iter().map(|h| h.to_string()).collect()),
+                asked: StdMutex::new(Vec::new()),
+            })
+        }
+        fn nothing_answers() -> Arc<Self> {
+            Self::answering(&[])
+        }
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
         }
         fn probes(&self) -> usize {
-            self.probes.load(Ordering::SeqCst)
+            self.asked.lock().unwrap().len()
+        }
+        fn starts_answering(&self, host: &str) {
+            self.answering.lock().unwrap().push(host.to_string());
         }
     }
 
     #[async_trait]
-    impl Prober for std::sync::Arc<FakeProber> {
-        async fn smb_reachable(&self) -> bool {
-            self.probes.fetch_add(1, Ordering::SeqCst);
-            self.reachable.load(Ordering::SeqCst)
+    impl Prober for Arc<FakeProber> {
+        async fn smb_reachable(&self, host: &str) -> bool {
+            self.asked.lock().unwrap().push(host.to_string());
+            self.answering.lock().unwrap().iter().any(|h| h == host)
         }
     }
 
-    #[derive(Default)]
     struct FakeTunnel {
         works: bool,
-        /// Set when the tunnel is what makes SMB answer.
+        /// The host the tunnel makes reachable, if any.
+        reveals: Option<(&'static str, Arc<FakeProber>)>,
         opens: AtomicUsize,
-        prober: Option<std::sync::Arc<FakeProber>>,
+    }
+
+    impl FakeTunnel {
+        fn absent() -> Arc<Self> {
+            Arc::new(Self {
+                works: false,
+                reveals: None,
+                opens: AtomicUsize::new(0),
+            })
+        }
+        /// A tunnel that comes up and makes `host` answer.
+        fn reaching(host: &'static str, prober: Arc<FakeProber>) -> Arc<Self> {
+            Arc::new(Self {
+                works: true,
+                reveals: Some((host, prober)),
+                opens: AtomicUsize::new(0),
+            })
+        }
+        /// A tunnel that comes up but reaches nothing useful.
+        fn to_nowhere() -> Arc<Self> {
+            Arc::new(Self {
+                works: true,
+                reveals: None,
+                opens: AtomicUsize::new(0),
+            })
+        }
+        fn opens(&self) -> usize {
+            self.opens.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
-    impl Tunnel for std::sync::Arc<FakeTunnel> {
+    impl Tunnel for Arc<FakeTunnel> {
         async fn bring_up(&self) -> Result<(), TunnelUnavailable> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             if !self.works {
                 return Err(TunnelUnavailable("no route".into()));
             }
-            if let Some(p) = &self.prober {
-                p.reachable.store(true, Ordering::SeqCst);
+            if let Some((host, prober)) = &self.reveals {
+                prober.starts_answering(host);
             }
             Ok(())
         }
     }
 
-    fn chain(
-        policy: TransportPolicy,
-        prober: std::sync::Arc<FakeProber>,
-        tunnel: std::sync::Arc<FakeTunnel>,
-    ) -> Chain {
-        Chain::new(policy, Box::new(prober), Box::new(tunnel), DEFAULT_RECHECK)
+    fn chain(policy: TransportPolicy, prober: Arc<FakeProber>, tunnel: Arc<FakeTunnel>) -> Chain {
+        Chain::new(
+            policy,
+            Endpoints::with_tunnel(PUBLIC, INSIDE),
+            Box::new(prober),
+            Box::new(tunnel),
+            DEFAULT_RECHECK,
+        )
     }
 
     #[test]
@@ -415,97 +530,115 @@ mod tests {
 
     #[tokio::test]
     async fn a_reachable_smb_wins_and_no_tunnel_is_dialled() {
-        let prober = std::sync::Arc::new(FakeProber::new(true));
-        let tunnel = std::sync::Arc::new(FakeTunnel::default());
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::absent();
         let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
 
-        assert_eq!(chain.transport().await.unwrap(), Transport::SmbDirect);
-        assert_eq!(
-            tunnel.opens.load(Ordering::SeqCst),
-            0,
-            "nothing to escalate"
-        );
+        let route = chain.route().await.unwrap();
+        assert_eq!(route.transport, Transport::SmbDirect);
+        assert_eq!(route.smb_host.as_deref(), Some(PUBLIC));
+        assert_eq!(prober.asked(), vec![PUBLIC], "the public name, once");
+        assert_eq!(tunnel.opens(), 0, "nothing to escalate");
     }
 
     #[tokio::test]
-    async fn an_unreachable_smb_escalates_through_the_tunnel() {
-        let prober = std::sync::Arc::new(FakeProber::new(false));
-        let tunnel = std::sync::Arc::new(FakeTunnel {
-            works: true,
-            prober: Some(prober.clone()),
-            ..Default::default()
-        });
+    async fn the_tunnel_leg_is_probed_at_the_in_tunnel_address() {
+        // The whole reason Endpoints carries two hosts: the tunnel pushes no
+        // DNS, so the public name still fails inside it. Probing that name
+        // again would report the escalation as useless and fall to HTTP.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching(INSIDE, prober.clone());
         let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
 
-        assert_eq!(chain.transport().await.unwrap(), Transport::SmbOverVpn);
-        assert_eq!(tunnel.opens.load(Ordering::SeqCst), 1);
+        let route = chain.route().await.unwrap();
+        assert_eq!(route.transport, Transport::SmbOverVpn);
+        assert_eq!(
+            route.smb_host.as_deref(),
+            Some(INSIDE),
+            "callers mount the in-tunnel address, not the public name"
+        );
+        assert_eq!(
+            prober.asked(),
+            vec![PUBLIC, INSIDE],
+            "public first, then inside the tunnel"
+        );
+        assert_eq!(tunnel.opens(), 1);
+    }
+
+    #[tokio::test]
+    async fn without_an_in_tunnel_address_no_tunnel_is_dialled() {
+        // Raising a tunnel we have no address to mount through would cost the
+        // user a connection and change nothing.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::to_nowhere();
+        let chain = Chain::new(
+            TransportPolicy::default(),
+            Endpoints::public_only(PUBLIC),
+            Box::new(prober.clone()),
+            Box::new(tunnel.clone()),
+            DEFAULT_RECHECK,
+        );
+
+        assert_eq!(chain.route().await.unwrap().transport, Transport::Https);
+        assert_eq!(tunnel.opens(), 0);
     }
 
     #[tokio::test]
     async fn a_tunnel_that_comes_up_without_reaching_smb_is_not_the_answer() {
         // Connected to *a* network is not connected to *this* NAS. Reporting
         // SmbOverVpn here would blame SMB for a routing problem.
-        let prober = std::sync::Arc::new(FakeProber::new(false));
-        let tunnel = std::sync::Arc::new(FakeTunnel {
-            works: true,
-            prober: None,
-            ..Default::default()
-        });
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::to_nowhere();
         let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
 
-        assert_eq!(chain.transport().await.unwrap(), Transport::Https);
+        let route = chain.route().await.unwrap();
+        assert_eq!(route.transport, Transport::Https);
+        assert_eq!(route.smb_host, None, "the HTTP leg carries no SMB");
+        assert_eq!(tunnel.opens(), 1, "tried, and honestly reported");
     }
 
     #[tokio::test]
     async fn a_disabled_tunnel_falls_straight_to_http() {
-        let prober = std::sync::Arc::new(FakeProber::new(false));
-        let tunnel = std::sync::Arc::new(FakeTunnel {
-            works: true,
-            prober: Some(prober.clone()),
-            ..Default::default()
-        });
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching(INSIDE, prober.clone());
         let policy = TransportPolicy::from_flags(false, true, false).unwrap();
         let chain = chain(policy, prober.clone(), tunnel.clone());
 
-        assert_eq!(chain.transport().await.unwrap(), Transport::Https);
-        assert_eq!(
-            tunnel.opens.load(Ordering::SeqCst),
-            0,
-            "no dialog, no dialling"
-        );
+        assert_eq!(chain.route().await.unwrap().transport, Transport::Https);
+        assert_eq!(tunnel.opens(), 0, "no dialog, no dialling");
     }
 
     #[tokio::test]
     async fn disabling_smb_costs_no_probe() {
         // The point of the flag on a network that black-holes 445: not one
         // connect timeout is paid.
-        let prober = std::sync::Arc::new(FakeProber::new(true));
-        let tunnel = std::sync::Arc::new(FakeTunnel::default());
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::absent();
         let policy = TransportPolicy::from_flags(true, false, false).unwrap();
         let chain = chain(policy, prober.clone(), tunnel.clone());
 
-        assert_eq!(chain.transport().await.unwrap(), Transport::Https);
+        assert_eq!(chain.route().await.unwrap().transport, Transport::Https);
         assert_eq!(prober.probes(), 0);
     }
 
     #[tokio::test]
     async fn disabling_http_fails_loudly_rather_than_pretending() {
-        let prober = std::sync::Arc::new(FakeProber::new(false));
-        let tunnel = std::sync::Arc::new(FakeTunnel::default());
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::absent();
         let policy = TransportPolicy::from_flags(false, false, true).unwrap();
         let chain = chain(policy, prober.clone(), tunnel.clone());
 
-        assert!(chain.transport().await.is_err());
+        assert!(chain.route().await.is_err());
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_choice_is_not_re_probed_on_every_call() {
-        let prober = std::sync::Arc::new(FakeProber::new(true));
-        let tunnel = std::sync::Arc::new(FakeTunnel::default());
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::absent();
         let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
 
         for _ in 0..5 {
-            assert_eq!(chain.transport().await.unwrap(), Transport::SmbDirect);
+            assert_eq!(chain.route().await.unwrap().transport, Transport::SmbDirect);
         }
         assert_eq!(prober.probes(), 1, "decided once, remembered after that");
     }
@@ -514,47 +647,50 @@ mod tests {
     async fn sitting_on_the_best_transport_never_probes_again() {
         // Nothing better exists, so a timer here would be pure noise on the
         // network for the entire life of the mount.
-        let prober = std::sync::Arc::new(FakeProber::new(true));
-        let tunnel = std::sync::Arc::new(FakeTunnel::default());
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::absent();
         let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
 
-        chain.transport().await.unwrap();
+        chain.route().await.unwrap();
         tokio::time::advance(DEFAULT_RECHECK * 10).await;
-        chain.transport().await.unwrap();
+        chain.route().await.unwrap();
 
         assert_eq!(prober.probes(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_degraded_choice_is_looked_at_again_and_promoted() {
-        let prober = std::sync::Arc::new(FakeProber::new(false));
-        let tunnel = std::sync::Arc::new(FakeTunnel::default());
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::absent();
         let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
 
-        assert_eq!(chain.transport().await.unwrap(), Transport::Https);
+        assert_eq!(chain.route().await.unwrap().transport, Transport::Https);
 
         // The network comes back: on campus, off the hotel wifi, tunnel up by
         // other means.
-        prober.reachable.store(true, Ordering::SeqCst);
+        prober.starts_answering(PUBLIC);
         assert_eq!(
-            chain.transport().await.unwrap(),
+            chain.route().await.unwrap().transport,
             Transport::Https,
             "still trusted until it expires"
         );
 
         tokio::time::advance(DEFAULT_RECHECK + Duration::from_secs(1)).await;
-        assert_eq!(chain.transport().await.unwrap(), Transport::SmbDirect);
+        assert_eq!(chain.route().await.unwrap().transport, Transport::SmbDirect);
     }
 
     #[tokio::test]
     async fn the_status_line_never_causes_traffic() {
-        let prober = std::sync::Arc::new(FakeProber::new(true));
-        let tunnel = std::sync::Arc::new(FakeTunnel::default());
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::absent();
         let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
 
         assert_eq!(chain.current(), None, "nothing decided yet");
-        chain.transport().await.unwrap();
-        assert_eq!(chain.current(), Some(Transport::SmbDirect));
+        chain.route().await.unwrap();
+        assert_eq!(
+            chain.current().map(|r| r.transport),
+            Some(Transport::SmbDirect)
+        );
         assert_eq!(prober.probes(), 1, "asking what is live decided nothing");
     }
 }
