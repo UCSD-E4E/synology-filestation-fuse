@@ -16,6 +16,7 @@ use crate::cache::{InodeCache, ReadCache};
 use crate::spill::{payload_for, upload_payload, SpillBuffer};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
+use synology_filestation_core::transport::{WriteHandle, WriteOpen};
 use synology_filestation_core::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -38,15 +39,35 @@ fn split_nas_path(path: &str) -> Option<(&str, &str)> {
     Some((&path[..idx], &path[idx + 1..]))
 }
 
+/// Where an open handle's writes go.
+///
+/// Two shapes, because the transports differ in what they can be told. SMB
+/// addresses ranges, so a write goes to the server as it arrives: memory is
+/// bounded by one chunk, `write(2)` back-pressures at network speed instead of
+/// returning instantly into a growing temp file, and a failure surfaces where
+/// it happened rather than minutes later at `close(2)`. The HTTP Upload API
+/// takes a whole file and nothing smaller, so it keeps the old shape.
+enum WriteSink {
+    /// Streamed to the server. `None` once closed, or once a write failed and
+    /// the handle was abandoned.
+    Streamed(Option<Box<dyn WriteHandle>>),
+    /// Held locally, spilling to a temp file, and uploaded whole on close.
+    Buffered(SpillBuffer),
+}
+
 struct WriteBuffer {
     nas_path: String,
     ino: u64,
-    data: SpillBuffer,
+    sink: WriteSink,
     dirty: bool,
     /// True when the file was just created and has not yet been uploaded.
     /// Allows the first upload to use overwrite=false, skipping the
     /// delete-before-upload round trips. Cleared once an upload succeeds.
     new_file: bool,
+    /// Set when a streamed write failed. The file on the server is short and
+    /// the handle is gone, so `close` must report that rather than claim the
+    /// write landed.
+    broken: bool,
 }
 
 /// How the mount presents ownership and permissions to the kernel.
@@ -209,28 +230,58 @@ impl Transfers {
         // spilled buffer the payload *is* the temp file being streamed, so a
         // concurrent write would tear the body mid-flight.
         let mut buf = handle.lock().await;
+        if buf.broken {
+            // A write already failed and took the handle with it. Reporting
+            // success here would tell the application its file is safe.
+            return Err(SynoFsError::Io(format!(
+                "close {}: an earlier write to this file failed",
+                buf.nas_path
+            )));
+        }
         if !buf.dirty {
             // Nothing written since the last successful upload.
             return Ok(());
         }
-        let payload = payload_for(&mut buf.data).map_err(|e| SynoFsError::Io(e.to_string()))?;
+
+        // Decide what this handle needs before touching any other field: the
+        // match borrows the sink, and the rest of the work wants the buffer.
+        enum Finish {
+            Close(Option<Box<dyn WriteHandle>>),
+            Send(crate::spill::Payload),
+        }
+        let finish = match &mut buf.sink {
+            WriteSink::Streamed(slot) => Finish::Close(slot.take()),
+            WriteSink::Buffered(spill) => {
+                Finish::Send(payload_for(spill).map_err(|e| SynoFsError::Io(e.to_string()))?)
+            }
+        };
         let (nas_path, ino, overwrite) = (buf.nas_path.clone(), buf.ino, !buf.new_file);
 
-        let (parent, filename) = match split_nas_path(&nas_path) {
-            Some(v) => v,
-            None => return Err(SynoFsError::InvalidArg),
-        };
-
-        debug!(
-            "upload: fh={} parent={:?} filename={:?} size={}",
-            fh,
-            parent,
-            filename,
-            payload.len()
-        );
-        {
-            let _permit = self.permit().await;
-            upload_payload(&self.client, parent, filename, payload, overwrite).await?;
+        match finish {
+            // Streamed: the bytes went out as they were written, so closing is
+            // the whole of "make it durable".
+            Finish::Close(stream) => {
+                if let Some(mut stream) = stream {
+                    let _permit = self.permit().await;
+                    stream.close().await?;
+                }
+                debug!("close: fh={} path={}", fh, nas_path);
+            }
+            Finish::Send(payload) => {
+                let (parent, filename) = match split_nas_path(&nas_path) {
+                    Some(v) => v,
+                    None => return Err(SynoFsError::InvalidArg),
+                };
+                debug!(
+                    "upload: fh={} parent={:?} filename={:?} size={}",
+                    fh,
+                    parent,
+                    filename,
+                    payload.len()
+                );
+                let _permit = self.permit().await;
+                upload_payload(&self.client, parent, filename, payload, overwrite).await?;
+            }
         }
 
         // Durable now: stop advertising the buffer as dirty, and record that the
@@ -431,13 +482,53 @@ impl SynologyFS {
             .buffer(fh)
             .ok_or_else(|| SynoFsError::Io(format!("write to unknown file handle {fh}")))?;
         // A FUSE callback thread is not a runtime thread, so blocking here is
-        // allowed — and it blocks only this handle's writer.
-        let mut buf = handle.blocking_lock();
-        buf.data
-            .write_at(offset, data)
-            .map_err(|e| SynoFsError::Io(e.to_string()))?;
-        buf.dirty = true;
-        Ok(())
+        // allowed — and on the streamed path that block IS the back-pressure:
+        // `write(2)` returns when the server has the bytes, so a copy runs at
+        // the speed of the link rather than the speed of the local disk.
+        self.rt.block_on(async move {
+            let mut buf = handle.lock().await;
+            match &mut buf.sink {
+                WriteSink::Streamed(slot) => {
+                    let stream = slot
+                        .as_mut()
+                        .ok_or_else(|| SynoFsError::Io("write to a closed handle".into()))?;
+                    if let Err(e) = stream.write_at(offset, data).await {
+                        // Whatever is on the server is now short of what the
+                        // caller asked for. Drop the handle so `close` cannot
+                        // report success over a failed write.
+                        *slot = None;
+                        buf.broken = true;
+                        return Err(e);
+                    }
+                }
+                WriteSink::Buffered(spill) => {
+                    spill
+                        .write_at(offset, data)
+                        .map_err(|e| SynoFsError::Io(e.to_string()))?;
+                }
+            }
+            buf.dirty = true;
+            Ok(())
+        })
+    }
+
+    /// Open `path` for writing, streaming when a backend can take ranges.
+    ///
+    /// `WriteOpen::Existing` rather than `CreateNew`: `create(2)` without
+    /// `O_EXCL` may legitimately land on a file that already exists, and by
+    /// the time this runs the kernel has already decided that is allowed.
+    fn open_sink(&self, path: &str) -> WriteSink {
+        match self.block(self.client.open_write(path, WriteOpen::Existing)) {
+            Ok(Some(stream)) => WriteSink::Streamed(Some(stream)),
+            Ok(None) => WriteSink::Buffered(SpillBuffer::new()),
+            // A backend that refused is not a reason to fail the open: the
+            // buffered path may still succeed, and it is what this mount did
+            // for every write before streaming existed.
+            Err(e) => {
+                warn!("open_write {path}: {e}; buffering this handle instead");
+                WriteSink::Buffered(SpillBuffer::new())
+            }
+        }
     }
 
     /// The buffer for `fh`, if the handle is still open. The map lock is only
@@ -958,11 +1049,12 @@ impl Filesystem for SynologyFS {
         self.write_buffers.lock().unwrap().insert(
             fh,
             Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+                sink: self.open_sink(&path),
                 nas_path: path,
                 ino,
-                data: SpillBuffer::new(),
                 dirty: false,
                 new_file: false,
+                broken: false,
             })),
         );
         // FOPEN_KEEP_CACHE: don't invalidate the kernel page cache between opens.
@@ -1103,11 +1195,18 @@ impl Filesystem for SynologyFS {
         self.write_buffers.lock().unwrap().insert(
             fh,
             Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+                sink: self.open_sink(&new_path),
                 nas_path: new_path,
                 ino,
-                data: SpillBuffer::new(),
-                dirty: false,
+                // Dirty from birth. `create(2)` is a request for a file to
+                // exist, and `touch` makes exactly this handle: opened,
+                // written to never, closed. Starting clean meant close saw
+                // nothing to do and the file never reached the NAS at all —
+                // it lived in the inode cache until the TTL expired and then
+                // vanished.
+                dirty: true,
                 new_file: true,
+                broken: false,
             })),
         );
 
@@ -1571,9 +1670,10 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(WriteBuffer {
                 nas_path: nas_path.to_string(),
                 ino,
-                data: buf,
+                sink: WriteSink::Buffered(buf),
                 dirty: true,
                 new_file: true,
+                broken: false,
             })),
         );
         fh
@@ -2234,5 +2334,205 @@ mod tests {
         assert_eq!(attr.uid, 1000);
         assert_eq!(attr.gid, 1000);
         assert_eq!(attr.perm, 0o755);
+    }
+
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex as StdMutex;
+
+    // ── streamed writes ──────────────────────────────────────────────────────
+    //
+    // With a backend that takes ranges, a write goes out when it is made. The
+    // difference from the buffered path is not speed but *when things happen*:
+    // memory stays bounded, `write(2)` waits for the server rather than for a
+    // local temp file, and a failure is reported by the call that caused it.
+
+    /// What a recording sink saw: each write as (offset, bytes).
+    type SeenWrites = Arc<StdMutex<Vec<(u64, Vec<u8>)>>>;
+
+    /// A write sink that records what it was given, and can be told to fail.
+    #[derive(Default)]
+    struct RecordingSink {
+        writes: SeenWrites,
+        closed: Arc<AtomicBool>,
+        fail_writes: bool,
+    }
+
+    struct RecordingHandle {
+        writes: SeenWrites,
+        closed: Arc<AtomicBool>,
+        fail_writes: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl WriteHandle for RecordingHandle {
+        async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), SynoFsError> {
+            if self.fail_writes {
+                return Err(SynoFsError::Io("the link died mid-write".into()));
+            }
+            self.writes.lock().unwrap().push((offset, data.to_vec()));
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), SynoFsError> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl synology_filestation_core::transport::OpenWriteTransport for RecordingSink {
+        async fn open_write(
+            &self,
+            _path: &str,
+            _mode: WriteOpen,
+        ) -> Result<Box<dyn WriteHandle>, SynoFsError> {
+            Ok(Box::new(RecordingHandle {
+                writes: self.writes.clone(),
+                closed: self.closed.clone(),
+                fail_writes: self.fail_writes,
+            }))
+        }
+    }
+
+    /// A fixture whose client can stream, plus the sink it streams into.
+    fn streaming_fixture(fail_writes: bool) -> (Fixture, Arc<RecordingSink>) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let server = rt.block_on(MockServer::start());
+        let sink = Arc::new(RecordingSink {
+            fail_writes,
+            ..Default::default()
+        });
+        let client = client_for(&server).with_open_write_transport(sink.clone());
+        let fs = SynologyFS::new(
+            Arc::new(client),
+            Arc::new(InodeCache::new(30)),
+            Arc::new(ReadCache::new(BLOCK, 64)),
+            rt.handle().clone(),
+            Ownership {
+                uid: 1000,
+                gid: 1000,
+                umask: 0o022,
+            },
+        );
+        (Fixture { fs, server, rt }, sink)
+    }
+
+    /// Open a handle whose sink comes from the client, the way `create` does.
+    fn streamed_handle(f: &Fixture, nas_path: &str) -> u64 {
+        let fh = f.fs.next_fh.fetch_add(1, Ordering::Relaxed);
+        let sink = f.fs.open_sink(nas_path);
+        assert!(
+            matches!(sink, WriteSink::Streamed(_)),
+            "the backend should have taken this handle"
+        );
+        f.fs.write_buffers.lock().unwrap().insert(
+            fh,
+            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+                nas_path: nas_path.to_string(),
+                ino: 42,
+                sink,
+                dirty: false,
+                new_file: true,
+                broken: false,
+            })),
+        );
+        fh
+    }
+
+    #[test]
+    fn a_streamed_write_reaches_the_server_before_close() {
+        // The buffered path cannot do this: nothing leaves the machine until
+        // the file is complete. Here the bytes are gone by the time write(2)
+        // returns, which is what bounds memory and paces the copy.
+        let (f, sink) = streaming_fixture(false);
+        let fh = streamed_handle(&f, "/share/streamed.bin");
+
+        f.fs.write_buffer_at(fh, 0, b"first").unwrap();
+        f.fs.write_buffer_at(fh, 5, b"second").unwrap();
+
+        let writes = sink.writes.lock().unwrap().clone();
+        assert_eq!(
+            writes,
+            vec![(0, b"first".to_vec()), (5, b"second".to_vec())],
+            "each write went out where it was made, before any close"
+        );
+        assert!(!sink.closed.load(Ordering::SeqCst), "still open");
+    }
+
+    #[test]
+    fn closing_a_streamed_handle_uploads_nothing() {
+        // No POST at close: the bytes are already there. A second copy over
+        // HTTP would be the whole file's worth of traffic for nothing.
+        let (f, sink) = streaming_fixture(false);
+        let fh = streamed_handle(&f, "/share/streamed.bin");
+        f.fs.write_buffer_at(fh, 0, b"payload").unwrap();
+
+        f.fs.finish_upload(fh).expect("close");
+
+        assert!(sink.closed.load(Ordering::SeqCst), "the handle was closed");
+        assert_eq!(
+            posted_bodies(&f).len(),
+            0,
+            "nothing was re-sent over the HTTP API"
+        );
+    }
+
+    #[test]
+    fn a_failed_streamed_write_is_reported_at_the_write_and_again_at_close() {
+        // Both halves matter. The write must fail where it happened — the
+        // whole reason to stream — and close must not then report success over
+        // a file the server never fully received.
+        let (f, sink) = streaming_fixture(true);
+        let fh = streamed_handle(&f, "/share/doomed.bin");
+
+        let err =
+            f.fs.write_buffer_at(fh, 0, b"payload")
+                .expect_err("the write failed, so write(2) must say so");
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+
+        let err =
+            f.fs.finish_upload(fh)
+                .expect_err("close must not claim a file landed when a write failed");
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+        assert!(
+            !sink.closed.load(Ordering::SeqCst),
+            "the handle was abandoned, not closed as if it were fine"
+        );
+    }
+
+    #[test]
+    fn without_a_streaming_backend_writes_are_buffered_as_before() {
+        // The HTTP mount is unchanged: nothing can take a range, so the whole
+        // file still goes at close.
+        let f = fixture();
+        let sink = f.fs.open_sink("/share/plain.bin");
+        assert!(matches!(sink, WriteSink::Buffered(_)));
+    }
+
+    #[test]
+    fn creating_a_file_and_writing_nothing_still_puts_it_on_the_nas() {
+        // `touch`. The handle is opened, never written, and closed. Before
+        // this, close found nothing dirty and did nothing, so the file existed
+        // only in the inode cache and disappeared when the TTL lapsed.
+        let f = fixture();
+        mount_upload_ok(&f);
+
+        let fh = f.fs.next_fh.fetch_add(1, Ordering::Relaxed);
+        f.fs.write_buffers.lock().unwrap().insert(
+            fh,
+            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+                nas_path: "/share/touched.txt".to_string(),
+                ino: 7,
+                sink: WriteSink::Buffered(SpillBuffer::new()),
+                // What `create` now seeds.
+                dirty: true,
+                new_file: true,
+                broken: false,
+            })),
+        );
+
+        f.fs.finish_upload(fh).expect("close");
+
+        let bodies = posted_bodies(&f);
+        assert_eq!(bodies.len(), 1, "the empty file was uploaded");
     }
 }

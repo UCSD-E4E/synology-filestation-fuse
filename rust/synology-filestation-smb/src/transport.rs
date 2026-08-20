@@ -256,7 +256,8 @@ pub async fn auto_attach(
             .with_write_transport(smb.clone())
             .with_stream_write_transport(smb.clone())
             .with_stream_read_transport(smb.clone())
-            .with_metadata_transport(smb),
+            .with_metadata_transport(smb.clone())
+            .with_open_write_transport(smb),
         None => client,
     }
 }
@@ -1199,6 +1200,13 @@ impl WriteHandle for SmbWriteHandle {
     }
 
     async fn close(&mut self) -> Result<(), SynoFsError> {
+        // A handle opened and never written still names a file the caller
+        // expects to exist — `touch` is precisely that sequence. Opening at 0
+        // here is what creates it; without this, closing an untouched handle
+        // would report success over a file that was never made.
+        if self.writer.is_none() && self.next == 0 {
+            self.reopen_at(0).await?;
+        }
         self.finish_writer().await
     }
 }

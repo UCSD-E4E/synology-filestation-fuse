@@ -8,8 +8,8 @@ use tracing::{debug, error, warn};
 
 use crate::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
 use crate::transport::{
-    BreakerConfig, CircuitBreaker, MetadataTransport, ReadTransport, StreamReadTransport,
-    StreamWriteTransport, WriteTransport,
+    BreakerConfig, CircuitBreaker, MetadataTransport, OpenWriteTransport, ReadTransport,
+    StreamReadTransport, StreamWriteTransport, WriteHandle, WriteOpen, WriteTransport,
 };
 /// Offer an operation to each metadata backend in turn before falling back to
 /// HTTP, expanding at the head of the method it belongs to.
@@ -30,7 +30,10 @@ macro_rules! via_metadata {
                     return Ok(v);
                 }
                 // Declining an operation it cannot promise is not a failure.
-                Err(e) if e.category() == ErrorCategory::NotSupported => continue,
+                Err(e) if e.category() == ErrorCategory::NotSupported => {
+                    entry.answered();
+                    continue;
+                }
                 Err(e) if e.category() == ErrorCategory::Transport => {
                     warn!("metadata backend failed (transient), falling back: {e}");
                     entry.breaker.lock().unwrap().on_failure(Instant::now());
@@ -225,10 +228,26 @@ struct TransportEntry<T: ?Sized> {
 
 impl<T: ?Sized> TransportEntry<T> {
     fn new(transport: Arc<T>) -> Self {
+        Self::with_breaker(transport, BreakerConfig::default())
+    }
+
+    fn with_breaker(transport: Arc<T>, config: BreakerConfig) -> Self {
         Self {
             transport,
-            breaker: StdMutex::new(CircuitBreaker::new(BreakerConfig::default())),
+            breaker: StdMutex::new(CircuitBreaker::new(config)),
         }
+    }
+
+    /// Record that the backend *answered*, including when the answer was "I
+    /// cannot do this".
+    ///
+    /// Load-bearing on the decline path. A breaker that has just admitted a
+    /// half-open probe refuses everything until a verdict is recorded, so
+    /// declining without one strands it half-open — and `allows` never returns
+    /// true again, disabling the backend for the life of the process over an
+    /// operation it merely does not implement.
+    fn answered(&self) {
+        self.breaker.lock().unwrap().on_success();
     }
 }
 
@@ -424,6 +443,10 @@ pub struct SynologyClient {
     /// Injected metadata backends, tried in order before the HTTP List/Delete/
     /// CreateFolder/Rename APIs.
     metadata_transports: Vec<TransportEntry<dyn MetadataTransport>>,
+    /// Injected backends that can write into an open file at offsets. Empty is
+    /// the HTTP case, where a write has to be buffered until the whole file is
+    /// known.
+    open_write_transports: Vec<TransportEntry<dyn OpenWriteTransport>>,
     /// Bytes per slice for the chunked upload path. A file larger than this is
     /// uploaded slice-by-slice so it is never held in memory whole; anything
     /// smaller takes the one-shot path. Default [`DEFAULT_SLICE_SIZE`].
@@ -483,6 +506,7 @@ impl SynologyClient {
             stream_write_transports: Vec::new(),
             stream_read_transports: Vec::new(),
             metadata_transports: Vec::new(),
+            open_write_transports: Vec::new(),
             slice_size: DEFAULT_SLICE_SIZE,
         }
     }
@@ -625,6 +649,91 @@ impl SynologyClient {
         self.metadata_transports
             .push(TransportEntry::new(transport));
         self
+    }
+
+    /// Register a metadata backend with a breaker tuned for a test, so
+    /// half-open states are reachable without waiting out a real cooldown.
+    #[cfg(test)]
+    fn with_metadata_transport_breaker(
+        mut self,
+        transport: Arc<dyn MetadataTransport>,
+        config: BreakerConfig,
+    ) -> Self {
+        self.metadata_transports
+            .push(TransportEntry::with_breaker(transport, config));
+        self
+    }
+
+    /// Register a streaming write backend with a test-tuned breaker.
+    #[cfg(test)]
+    fn with_stream_write_transport_breaker(
+        mut self,
+        transport: Arc<dyn StreamWriteTransport>,
+        config: BreakerConfig,
+    ) -> Self {
+        self.stream_write_transports
+            .push(TransportEntry::with_breaker(transport, config));
+        self
+    }
+
+    /// Register an open-write backend with a test-tuned breaker.
+    #[cfg(test)]
+    fn with_open_write_transport_breaker(
+        mut self,
+        transport: Arc<dyn OpenWriteTransport>,
+        config: BreakerConfig,
+    ) -> Self {
+        self.open_write_transports
+            .push(TransportEntry::with_breaker(transport, config));
+        self
+    }
+
+    /// Inject an [`OpenWriteTransport`] backend, letting `open_write` hand out
+    /// streaming write handles instead of buffering whole files.
+    pub fn with_open_write_transport(mut self, transport: Arc<dyn OpenWriteTransport>) -> Self {
+        self.open_write_transports
+            .push(TransportEntry::new(transport));
+        self
+    }
+
+    /// Open `path` for writing through a backend that can address offsets.
+    ///
+    /// `Ok(None)` is the ordinary answer when nothing can: the caller buffers
+    /// the writes and uploads the whole file, which is all the HTTP API
+    /// supports. An `Err` means a backend had a real answer — an existing name
+    /// under [`WriteOpen::CreateNew`], say — and that answer stands rather than
+    /// being retried down a path that would reach the same conclusion.
+    pub async fn open_write(
+        &self,
+        path: &str,
+        mode: WriteOpen,
+    ) -> Result<Option<Box<dyn WriteHandle>>, SynoFsError> {
+        for entry in &self.open_write_transports {
+            if !entry.breaker.lock().unwrap().allows(Instant::now()) {
+                continue;
+            }
+            match entry.transport.open_write(path, mode).await {
+                Ok(handle) => {
+                    entry.breaker.lock().unwrap().on_success();
+                    return Ok(Some(handle));
+                }
+                // Cannot stream. Not a failure, and not this backend's fault.
+                Err(e) if e.category() == ErrorCategory::NotSupported => {
+                    entry.answered();
+                    continue;
+                }
+                Err(e) if e.category() == ErrorCategory::Transport => {
+                    warn!("open-write backend failed (transient), buffering instead: {e}");
+                    entry.breaker.lock().unwrap().on_failure(Instant::now());
+                    continue;
+                }
+                Err(e) => {
+                    entry.breaker.lock().unwrap().on_success();
+                    return Err(e);
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Override the slice size used by the chunked upload path (default
@@ -1434,6 +1543,7 @@ impl SynologyClient {
                     // writes it can serve.
                     Err(e) if e.category() == ErrorCategory::NotSupported => {
                         debug!("stream write backend cannot create new files, using HTTP: {e}");
+                        entry.answered();
                         continue;
                     }
                     Err(e) if e.category() == ErrorCategory::Transport => {
@@ -6135,5 +6245,182 @@ mod tests {
             !touched_the_nas,
             "nothing was deleted on the way to the error"
         );
+    }
+
+    /// A backend whose answer changes call by call.
+    struct ScriptedMeta {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MetadataTransport for ScriptedMeta {
+        async fn list_dir(&self, _folder: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                // Trip the breaker.
+                0 => Err(SynoFsError::Io("link down".into())),
+                // The half-open probe, which this backend simply cannot serve.
+                1 => Err(SynoFsError::NotSupported),
+                // If the breaker was left half-open, we never get asked again.
+                _ => Ok(vec![]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn declining_a_half_open_probe_does_not_strand_the_backend() {
+        // `allows` returns false in HalfOpen until a verdict is recorded, so a
+        // decline that records nothing disables the backend for the life of
+        // the process — over an operation it merely does not implement.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [], "total": 0, "offset": 0}
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = Arc::new(ScriptedMeta {
+            calls: AtomicUsize::new(0),
+        });
+        let client = client_for(&server).with_metadata_transport_breaker(
+            backend.clone(),
+            BreakerConfig {
+                failure_threshold: 1,
+                cooldown: Duration::ZERO,
+            },
+        );
+
+        client.list_dir("/share").await.unwrap(); // trips the breaker
+        client.list_dir("/share").await.unwrap(); // half-open probe, declined
+        client.list_dir("/share").await.unwrap(); // must reach the backend again
+
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            3,
+            "the backend was asked again after declining; a stranded breaker \
+             would have stopped at 2"
+        );
+    }
+
+    /// The same script as `ScriptedMeta`, for the other two decline sites:
+    /// trip the breaker, decline the half-open probe, then answer.
+    struct ScriptedWriter {
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedWriter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn next(&self) -> Result<(), SynoFsError> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(SynoFsError::Io("link down".into())),
+                1 => Err(SynoFsError::NotSupported),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamWriteTransport for ScriptedWriter {
+        async fn write_from_path(&self, _p: &str, _local: &Path) -> Result<(), SynoFsError> {
+            self.next()
+        }
+        async fn write_new_from_path(&self, _p: &str, _local: &Path) -> Result<(), SynoFsError> {
+            self.next()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OpenWriteTransport for ScriptedWriter {
+        async fn open_write(
+            &self,
+            _path: &str,
+            _mode: WriteOpen,
+        ) -> Result<Box<dyn WriteHandle>, SynoFsError> {
+            self.next()?;
+            struct Nowhere;
+            #[async_trait::async_trait]
+            impl WriteHandle for Nowhere {
+                async fn write_at(&mut self, _o: u64, _d: &[u8]) -> Result<(), SynoFsError> {
+                    Ok(())
+                }
+                async fn close(&mut self) -> Result<(), SynoFsError> {
+                    Ok(())
+                }
+            }
+            Ok(Box::new(Nowhere))
+        }
+    }
+
+    fn twitchy_breaker() -> BreakerConfig {
+        BreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declined_open_write_leaves_the_backend_askable() {
+        let server = MockServer::start().await;
+        let backend = ScriptedWriter::new();
+        let client = client_for(&server)
+            .with_open_write_transport_breaker(backend.clone(), twitchy_breaker());
+
+        // Trip, then a declined half-open probe, then it must be asked again.
+        client
+            .open_write("/share/f.bin", WriteOpen::Existing)
+            .await
+            .ok();
+        client
+            .open_write("/share/f.bin", WriteOpen::Existing)
+            .await
+            .ok();
+        client
+            .open_write("/share/f.bin", WriteOpen::Existing)
+            .await
+            .ok();
+
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            3,
+            "a stranded breaker would have stopped asking at 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declined_create_new_leaves_the_backend_askable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webapi/entry.cgi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"blks": null}
+            })))
+            .mount(&server)
+            .await;
+
+        let src = write_scratch_file(b"payload");
+        let backend = ScriptedWriter::new();
+        let client = client_for(&server)
+            .with_stream_write_transport_breaker(backend.clone(), twitchy_breaker());
+
+        for _ in 0..3 {
+            client
+                .upload_from_path(&src, "/share", "f.bin", false)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            3,
+            "a stranded breaker would have stopped asking at 2"
+        );
+        std::fs::remove_file(&src).ok();
     }
 }
