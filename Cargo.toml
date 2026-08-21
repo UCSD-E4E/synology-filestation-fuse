@@ -6,6 +6,7 @@ members = [
     "rust/synology-filestation-ffi",
     "rust/synology-filestation-smb",
     "rust/synology-filestation-connect",
+    "rust/synology-filestation-openvpn",
     "python/synology_filestation",
 ]
 
