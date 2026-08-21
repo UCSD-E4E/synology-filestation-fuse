@@ -27,7 +27,7 @@ impl SessionId {
     /// Session ids are 8 bytes (`SID_SIZE`).
     pub const LEN: usize = 8;
 
-    pub fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
+    pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
         Self(bytes)
     }
 
