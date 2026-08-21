@@ -18,10 +18,12 @@
 //! `tests/wire_format.rs`.
 
 mod packet;
+mod reliable;
 mod static_key;
 mod tls_auth;
 
 pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
+pub use reliable::{Delivery, Outgoing, RecvWindow, SendWindow};
 pub use static_key::{KeyDirection, StaticKey, STATIC_KEY_LEN};
 pub use tls_auth::{TlsAuth, TlsAuthHeader};
 
