@@ -150,6 +150,31 @@
             ]
           );
 
+          # Launcher entry for the Nix output. Without one the package installs
+          # a bare executable: nothing in the GNOME/KDE application grid, so the
+          # only way to start the GUI is to type its name in a terminal.
+          guiDesktopItem = pkgs.makeDesktopItem {
+            name = "synologyfuse";
+            desktopName = "NAS Folder Access";
+            comment = "Open a Synology NAS folder as a local volume";
+            exec = "SynologyFuse.Gui";
+            icon = "synologyfuse";
+            categories = [
+              "Network"
+              "FileTools"
+            ];
+            keywords = [
+              "synology"
+              "nas"
+              "fuse"
+              "mount"
+              "volume"
+            ];
+            # Matches the unwrapped binary the wrapper execs, so the compositor
+            # associates the window with this entry.
+            startupWMClass = "SynologyFuse.Gui";
+          };
+
           synologyfuse-gui = pkgs.buildDotnetModule {
             pname = "synologyfuse-gui";
             inherit (crateName) version;
@@ -169,6 +194,19 @@
             executables = [ "SynologyFuse.Gui" ];
             selfContainedBuild = true;
             runtimeDeps = guiRuntimeDeps;
+
+            # Desktop entry + icon, so the app is discoverable in a launcher
+            # instead of terminal-only. Linux-only: on darwin the .app bundle
+            # built by SynologyFuse.MacInstaller carries this instead.
+            nativeBuildInputs = lib.optionals isLinux [ pkgs.copyDesktopItems ];
+            desktopItems = lib.optionals isLinux [ guiDesktopItem ];
+
+            postInstall = lib.optionalString isLinux ''
+              # The source asset is 1024×1024, so it goes in the directory that
+              # says so — icon themes scale down from the largest available.
+              install -Dm644 SynologyFuse.Gui/Assets/app.png \
+                "$out/share/icons/hicolor/1024x1024/apps/synologyfuse.png"
+            '';
 
             # The GUI calls the Rust core directly through the native FFI
             # library (no subprocess). The resolver in NativeMethods.cs honours
