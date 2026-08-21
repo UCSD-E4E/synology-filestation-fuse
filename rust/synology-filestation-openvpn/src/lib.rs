@@ -17,11 +17,13 @@
 //! Everything is pinned against packets a real OpenVPN client emitted; see
 //! `tests/wire_format.rs`.
 
+mod channel;
 mod packet;
 mod reliable;
 mod static_key;
 mod tls_auth;
 
+pub use channel::ControlChannel;
 pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 pub use reliable::{Delivery, Outgoing, RecvWindow, SendWindow};
 pub use static_key::{KeyDirection, StaticKey, STATIC_KEY_LEN};
@@ -50,6 +52,12 @@ pub enum Error {
 
     #[error("packet is not authentic: the tls-auth HMAC does not match")]
     BadHmac,
+
+    #[error("packet belongs to a different session")]
+    WrongSession,
+
+    #[error("packet acknowledges messages of a different session")]
+    AckForAnotherSession,
 
     #[error("a static key is {STATIC_KEY_LEN} bytes; this one is {actual}")]
     KeyLength {

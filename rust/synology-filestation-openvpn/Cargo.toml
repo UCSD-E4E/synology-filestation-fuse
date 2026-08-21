@@ -25,3 +25,7 @@ hex = "0.4"
 # so they sign them themselves.
 hmac = "0.12"
 sha2 = "0.10"
+# The interop test hands a real `openvpn` a certificate. Generating it here
+# rather than shelling out to `openssl` keeps the test's dependencies to the
+# one binary it is actually testing against.
+rcgen = "0.14"

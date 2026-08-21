@@ -226,7 +226,7 @@ impl Delivery {
 
 /// Incoming control messages, reassembled into the order they were sent.
 pub struct RecvWindow {
-    buffered: BTreeMap<u32, Vec<u8>>,
+    buffered: BTreeMap<u32, (Opcode, Vec<u8>)>,
     /// The id we are waiting for; everything below it has been delivered.
     next_expected: u32,
     pending_acks: Vec<u32>,
@@ -247,7 +247,11 @@ impl RecvWindow {
     }
 
     /// Offer a received message.
-    pub fn accept(&mut self, packet_id: u32, payload: Vec<u8>) -> Delivery {
+    ///
+    /// The opcode is kept with it: a reset and a TLS record both occupy a slot
+    /// in the sequence, but only one of them is something to hand upwards, and
+    /// by the time a message comes back out its header is long gone.
+    pub fn accept(&mut self, packet_id: u32, opcode: Opcode, payload: Vec<u8>) -> Delivery {
         if !self.in_window(packet_id) {
             return Delivery::OutOfWindow;
         }
@@ -255,7 +259,7 @@ impl RecvWindow {
         let verdict = if packet_id < self.next_expected || self.buffered.contains_key(&packet_id) {
             Delivery::Duplicate
         } else {
-            self.buffered.insert(packet_id, payload);
+            self.buffered.insert(packet_id, (opcode, payload));
             Delivery::Buffered
         };
 
@@ -266,10 +270,10 @@ impl RecvWindow {
     }
 
     /// The next message in order, if it has arrived.
-    pub fn next_in_order(&mut self) -> Option<Vec<u8>> {
-        let payload = self.buffered.remove(&self.next_expected)?;
+    pub fn next_in_order(&mut self) -> Option<(Opcode, Vec<u8>)> {
+        let message = self.buffered.remove(&self.next_expected)?;
         self.next_expected = self.next_expected.wrapping_add(1);
-        Some(payload)
+        Some(message)
     }
 
     /// Up to `max` ids to acknowledge, oldest first, removed as they are taken.

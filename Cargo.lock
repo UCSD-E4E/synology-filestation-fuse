@@ -2443,6 +2443,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "hmac 0.12.1",
+ "rcgen",
  "sha2 0.10.9",
  "thiserror",
  "zeroize",

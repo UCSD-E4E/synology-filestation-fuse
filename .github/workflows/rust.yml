@@ -93,6 +93,21 @@ jobs:
       if: failure()
       run: docker compose ls && docker ps -a
 
+  openvpn-interop:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install OpenVPN
+      # The peer under test. No tun device and no privileges are needed —
+      # `--dev null` gives a process that speaks the control channel and has
+      # nowhere to put a tunnel afterwards, which is as far as this goes.
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openvpn
+    - name: Handshake against a real openvpn
+      run: cargo test -p synology-filestation-openvpn --test interop -- --ignored --nocapture
+
   build-macos:
 
     runs-on: macos-latest

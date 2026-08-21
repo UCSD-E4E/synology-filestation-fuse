@@ -235,22 +235,37 @@ fn an_ack_for_an_unknown_id_is_ignored() {
 fn messages_arrive_in_order_however_they_were_delivered() {
     let mut window = RecvWindow::new();
 
-    assert_eq!(window.accept(2, payload(2)), Delivery::Buffered);
+    assert_eq!(
+        window.accept(2, Opcode::ControlV1, payload(2)),
+        Delivery::Buffered
+    );
     assert_eq!(
         window.next_in_order(),
         None,
         "0 has not arrived, so 2 waits its turn"
     );
 
-    assert_eq!(window.accept(0, payload(0)), Delivery::Buffered);
-    assert_eq!(window.next_in_order(), Some(payload(0)));
-    assert_eq!(window.next_in_order(), None, "1 is still missing");
-
-    assert_eq!(window.accept(1, payload(1)), Delivery::Buffered);
-    assert_eq!(window.next_in_order(), Some(payload(1)));
+    assert_eq!(
+        window.accept(0, Opcode::ControlV1, payload(0)),
+        Delivery::Buffered
+    );
     assert_eq!(
         window.next_in_order(),
-        Some(payload(2)),
+        Some((Opcode::ControlV1, payload(0)))
+    );
+    assert_eq!(window.next_in_order(), None, "1 is still missing");
+
+    assert_eq!(
+        window.accept(1, Opcode::ControlV1, payload(1)),
+        Delivery::Buffered
+    );
+    assert_eq!(
+        window.next_in_order(),
+        Some((Opcode::ControlV1, payload(1)))
+    );
+    assert_eq!(
+        window.next_in_order(),
+        Some((Opcode::ControlV1, payload(2))),
         "and now 2 follows"
     );
 }
@@ -261,11 +276,11 @@ fn a_duplicate_is_acknowledged_again_but_delivered_once() {
     // a replay" (ssl.c). A duplicate usually means our ack was the thing that
     // got lost, so staying silent would keep the peer retransmitting.
     let mut window = RecvWindow::new();
-    window.accept(0, payload(0));
+    window.accept(0, Opcode::ControlV1, payload(0));
     window.next_in_order();
 
     assert_eq!(
-        window.accept(0, payload(0)),
+        window.accept(0, Opcode::ControlV1, payload(0)),
         Delivery::Duplicate,
         "already delivered, but still worth acknowledging"
     );
@@ -281,11 +296,14 @@ fn a_message_too_far_ahead_is_dropped_without_acknowledgement() {
     let mut window = RecvWindow::new();
 
     let far_ahead = RecvWindow::CAPACITY as u32;
-    assert_eq!(window.accept(far_ahead, payload(9)), Delivery::OutOfWindow);
+    assert_eq!(
+        window.accept(far_ahead, Opcode::ControlV1, payload(9)),
+        Delivery::OutOfWindow
+    );
     assert!(!Delivery::OutOfWindow.should_acknowledge());
 
     assert_eq!(
-        window.accept(far_ahead - 1, payload(8)),
+        window.accept(far_ahead - 1, Opcode::ControlV1, payload(8)),
         Delivery::Buffered,
         "the last slot in the window is still usable"
     );
@@ -295,7 +313,7 @@ fn a_message_too_far_ahead_is_dropped_without_acknowledgement() {
 fn acknowledgements_are_handed_out_in_packet_sized_batches() {
     let mut window = RecvWindow::new();
     for id in 0..5 {
-        window.accept(id, payload(id as u8));
+        window.accept(id, Opcode::ControlV1, payload(id as u8));
     }
 
     assert_eq!(window.take_acks(3), vec![0, 1, 2], "oldest first");
@@ -306,7 +324,7 @@ fn acknowledgements_are_handed_out_in_packet_sized_batches() {
 #[test]
 fn an_out_of_window_message_leaves_nothing_to_acknowledge() {
     let mut window = RecvWindow::new();
-    window.accept(RecvWindow::CAPACITY as u32, payload(9));
+    window.accept(RecvWindow::CAPACITY as u32, Opcode::ControlV1, payload(9));
 
     assert_eq!(window.take_acks(8), Vec::<u32>::new());
 }
