@@ -52,13 +52,7 @@ const OUR_SESSION: SessionId =
 fn a_real_openvpn_answers_our_opening_reset() {
     let server = OpenVpnServer::start();
 
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("a local socket");
-    socket
-        .connect(("127.0.0.1", server.port))
-        .expect("point it at the server");
-    socket
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .expect("so the loop can drive retransmission");
+    let socket = connected_socket(server.port);
 
     let key = StaticKey::from_hex(TA_KEY_HEX).expect("test vector");
     let mut channel = ControlChannel::new(
@@ -129,6 +123,19 @@ fn a_real_openvpn_answers_our_opening_reset() {
         OUR_SESSION,
         "addressed to the session we opened, which is how we know it is for us"
     );
+}
+
+/// A socket pointed at the server, with a read timeout short enough that the
+/// drive loop keeps retransmitting.
+fn connected_socket(port: u16) -> UdpSocket {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("a local socket");
+    socket
+        .connect(("127.0.0.1", port))
+        .expect("point it at the server");
+    socket
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("so the loop can drive retransmission");
+    socket
 }
 
 fn net_time() -> u32 {
@@ -288,13 +295,7 @@ fn a_tls_handshake_completes_over_the_control_channel() {
     // degrade, it fails to decrypt.
     let server = OpenVpnServer::start();
 
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("a local socket");
-    socket
-        .connect(("127.0.0.1", server.port))
-        .expect("point it at the server");
-    socket
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .expect("so the loop can drive retransmission");
+    let socket = connected_socket(server.port);
 
     let mut config = SessionConfig::new(
         server.pki.ca_pem.clone(),
@@ -343,6 +344,70 @@ fn a_tls_handshake_completes_over_the_control_channel() {
     assert!(
         session.remote_session().is_some(),
         "and it finished with the peer we opened against"
+    );
+}
+
+#[test]
+#[ignore = "spawns a real openvpn process"]
+fn the_key_exchange_completes_against_a_real_openvpn() {
+    // The end of the handshake: TLS comes up, both ends send their key
+    // material inside it, and the data-channel keys fall out of the PRF.
+    //
+    // This is the test that says the message layout is right. A field a byte
+    // out of place, a string length that counts its NUL wrongly, a random in
+    // the wrong order — openvpn reads all of those as a malformed key method
+    // and stops, and no amount of testing our encoder against our decoder
+    // would notice.
+    let server = OpenVpnServer::start();
+    let socket = connected_socket(server.port);
+
+    let mut config = SessionConfig::new(
+        server.pki.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.client_auth = Some(ClientAuth {
+        cert_chain_pem: server.pki.client_cert_pem.clone(),
+        private_key_pem: zeroize::Zeroizing::new(server.pki.client_key_pem.clone()),
+    });
+
+    let mut session = Session::new(config).expect("a client");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut buf = [0u8; 4096];
+
+    while Instant::now() < deadline && !session.is_established() {
+        let now = Instant::now();
+        while let Some(datagram) = session.poll_transmit(now, net_time()) {
+            socket
+                .send(&datagram)
+                .unwrap_or_else(|error| panic!("{error}\n--- openvpn log ---\n{}", server.log()));
+        }
+
+        match socket.recv(&mut buf) {
+            Ok(len) => session
+                .handle(&buf[..len], Instant::now())
+                .unwrap_or_else(|error| panic!("{error}\n--- openvpn log ---\n{}", server.log())),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == ErrorKind::TimedOut => {}
+            Err(error) => panic!("recv failed: {error}"),
+        }
+    }
+
+    assert!(
+        session.is_established(),
+        "the key exchange did not finish.\n--- openvpn log ---\n{}",
+        server.log()
+    );
+
+    let keys = session.keys().expect("established means keys");
+    assert_eq!(
+        keys.len(),
+        256,
+        "two directions, a cipher and an HMAC key each"
+    );
+    assert!(
+        keys.iter().any(|&byte| byte != 0),
+        "and they are derived rather than left empty"
     );
 }
 

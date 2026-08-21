@@ -23,6 +23,11 @@ zeroize = { version = "1", features = ["derive"] }
 # manylinux builds do not have.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+# The key derivation is TLS 1.0's PRF, which is MD5 and SHA-1 in parallel.
+# Both are long dead as hashes; here they are a fixed part of a wire format we
+# do not get to choose, and are used only through HMAC.
+md-5 = "0.10"
+sha1 = "0.10"
 # Session ids have to be unpredictable, not merely distinct.
 rand = "0.9"
 thiserror = "2"

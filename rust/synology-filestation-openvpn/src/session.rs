@@ -19,8 +19,12 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use zeroize::Zeroizing;
 
+use std::io::{Read, Write};
+
 use crate::channel::ControlChannel;
+use crate::key_method::{ClientKeyMethod2, ServerKeyMethod2};
 use crate::packet::SessionId;
+use crate::prf::{key_expansion, KeySource2};
 use crate::static_key::{KeyDirection, StaticKey};
 use crate::tls_auth::TlsAuth;
 use crate::Error;
@@ -42,6 +46,18 @@ const CONTROL_OVERHEAD: usize = 9 + 64 + 8 + 41 + 4;
 /// The most TLS we can put in one control message.
 pub const MAX_TLS_FRAGMENT: usize = CONTROL_MTU - CONTROL_OVERHEAD;
 
+/// The options string both ends compare. A mismatch is a warning in the
+/// peer's log rather than a refusal, which is why this can be a constant: it
+/// describes the tunnel we are asking for, and the server tells us if it
+/// disagrees.
+const OPTIONS: &str = "V4,dev-type tun,link-mtu 1602,tun-mtu 1500,proto UDPv4,\
+cipher AES-256-CBC,auth SHA512,keysize 256,key-method 2,tls-client";
+
+/// What we tell the server about ourselves. `IV_PROTO=2` is the bit that says
+/// we understand `P_DATA_V2` and its peer id, which is what a modern server
+/// assigns; `IV_CIPHERS` is what it negotiates the data cipher from.
+const PEER_INFO: &str = "IV_VER=2.5.11\nIV_PLAT=rust\nIV_PROTO=2\nIV_CIPHERS=AES-256-CBC\n";
+
 /// How to reach the peer, and how to be sure it is the peer.
 pub struct SessionConfig {
     /// The `<ca>` block from the `.ovpn`, in PEM. It *replaces* the system
@@ -61,6 +77,9 @@ pub struct SessionConfig {
     pub session_id: SessionId,
     /// `--tls-timeout`, the first retransmission interval.
     pub tls_timeout: Duration,
+    /// The credentials the server authenticates. e4e-nas takes an AD username
+    /// and password; a peer that asks for neither is sent empty fields.
+    pub credentials: Option<Credentials>,
     /// A client certificate, if the server asks for one.
     ///
     /// e4e-nas does not: it runs `verify-client-cert none` and authenticates
@@ -68,6 +87,12 @@ pub struct SessionConfig {
     /// point-to-point OpenVPN — which is what the interop test can run without
     /// privileges — always asks.
     pub client_auth: Option<ClientAuth>,
+}
+
+/// What the server checks against the directory.
+pub struct Credentials {
+    pub username: String,
+    pub password: Zeroizing<String>,
 }
 
 /// A certificate chain and its key, for a server that asks.
@@ -94,9 +119,21 @@ impl SessionConfig {
             key_direction: KeyDirection::Inverse,
             session_id: SessionId::random(),
             tls_timeout: Duration::from_secs(2),
+            credentials: None,
             client_auth: None,
         }
     }
+}
+
+/// How far along a session is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// TLS is still negotiating.
+    Tls,
+    /// Our key material has gone out; the peer's has not come back.
+    AwaitingKeys,
+    /// Both ends have contributed, and the data-channel keys exist.
+    Established,
 }
 
 /// A TLS session and the control channel underneath it.
@@ -104,6 +141,12 @@ pub struct Session {
     channel: ControlChannel,
     tls: ClientConnection,
     outbox: Outbox,
+    phase: Phase,
+    source: KeySource2,
+    credentials: Option<Credentials>,
+    /// Plaintext read out of TLS, which arrives in pieces.
+    inbound: Vec<u8>,
+    keys: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl Session {
@@ -128,6 +171,11 @@ impl Session {
             channel,
             tls,
             outbox: Outbox::default(),
+            phase: Phase::Tls,
+            source: KeySource2::new_client(),
+            credentials: config.credentials,
+            inbound: Vec::new(),
+            keys: None,
         };
         // Opened here rather than by a separate call. rustls has a
         // `ClientHello` ready the moment it is built, so a session that could
@@ -144,8 +192,22 @@ impl Session {
         self.tls.is_handshaking()
     }
 
+    /// Whether both ends have contributed key material and the data-channel
+    /// keys exist.
+    pub fn is_established(&self) -> bool {
+        self.phase == Phase::Established
+    }
+
+    /// The derived key material: two directions, each a cipher key then an
+    /// HMAC key, 64 bytes apiece.
+    pub fn keys(&self) -> Option<&[u8]> {
+        self.keys.as_ref().map(|keys| keys.as_slice())
+    }
+
     /// The next datagram to send.
     pub fn poll_transmit(&mut self, now: Instant, net_time: u32) -> Option<Vec<u8>> {
+        self.send_our_key_material();
+
         // Take whatever TLS has produced, then hand the channel as much of it
         // as its window will hold.
         while self.tls.wants_write() {
@@ -193,12 +255,81 @@ impl Session {
             }
         }
 
-        Ok(())
+        self.receive_their_key_material()
     }
 
     /// The peer's session id, once it has told us.
     pub fn remote_session(&self) -> Option<SessionId> {
         self.channel.remote_session()
+    }
+
+    /// Send our half of the key material, once TLS will carry it.
+    ///
+    /// Exactly once: the phase moves whether or not the write succeeds,
+    /// because rustls buffers it and a second copy would be read as a second
+    /// message.
+    fn send_our_key_material(&mut self) {
+        if self.phase != Phase::Tls || self.tls.is_handshaking() {
+            return;
+        }
+
+        let empty = Zeroizing::new(String::new());
+        let (username, password) = match &self.credentials {
+            Some(credentials) => (credentials.username.as_str(), &credentials.password),
+            None => ("", &empty),
+        };
+
+        let message = ClientKeyMethod2 {
+            source: &self.source,
+            options: OPTIONS,
+            username,
+            password,
+            peer_info: PEER_INFO,
+        }
+        .encode();
+
+        // A failure here is a closed session, which the next poll reports
+        // through the ordinary path rather than by panicking in a setter.
+        let _ = self.tls.writer().write_all(&message);
+        self.phase = Phase::AwaitingKeys;
+    }
+
+    /// Take the peer's key material if all of it has arrived.
+    fn receive_their_key_material(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::AwaitingKeys {
+            return Ok(());
+        }
+
+        let mut buffer = [0u8; 2048];
+        while let Ok(read) = self.tls.reader().read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            self.inbound.extend_from_slice(&buffer[..read]);
+        }
+
+        match ServerKeyMethod2::decode(&self.inbound) {
+            // Not all of it is here yet. TLS is a stream, so this is ordinary.
+            Err(Error::Truncated { .. }) => Ok(()),
+            Err(error) => Err(error),
+            Ok(reply) => {
+                self.source.server_random1 = reply.random1;
+                self.source.server_random2 = reply.random2;
+
+                let server_session = self
+                    .channel
+                    .remote_session()
+                    .ok_or_else(|| Error::Tls("key material before a session id".into()))?;
+                self.keys = Some(Zeroizing::new(key_expansion(
+                    &self.source,
+                    self.channel.local_session(),
+                    server_session,
+                )));
+                self.inbound.clear();
+                self.phase = Phase::Established;
+                Ok(())
+            }
+        }
     }
 }
 
