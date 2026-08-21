@@ -557,7 +557,9 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/). 
 |---|---|---|
 | `fix:` | `fix: handle HTTP 416 as EOF` | patch (`0.1.0` → `0.1.1`) |
 | `feat:` | `feat: add read cache` | minor (`0.1.0` → `0.2.0`) |
-| `feat!:` or `BREAKING CHANGE:` footer | `feat!: change CLI flag names` | major (`0.1.0` → `1.0.0`) |
+| `feat!:` or `BREAKING CHANGE:` footer | `feat!: change CLI flag names` | minor while pre-1.0 (`0.3.0` → `0.4.0`) |
+
+While the project is pre-1.0, `bump-minor-pre-major` keeps a breaking change on the minor track rather than reaching for `1.0.0`; the jump to `1.0.0` is a deliberate act, not something a `!` triggers.
 
 Other prefixes (`docs:`, `chore:`, `refactor:`, `test:`, etc.) do not trigger a release.
 
