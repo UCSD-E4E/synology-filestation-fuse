@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 synology-filestation-core = { path = "../synology-filestation-core" }
 synology-filestation-smb = { path = "../synology-filestation-smb" }
+synology-filestation-connect = { path = "../synology-filestation-connect" }
 
 tokio       = { version = "1", features = ["full"] }
 reqwest     = { version = "0.13", features = ["json", "multipart", "query", "rustls-no-provider"], default-features = false }

@@ -206,12 +206,35 @@ impl SmbConfig {
 /// * `SYNOLOGY_FS_SMB_PORT` — override the SMB port (default 445).
 /// * `SYNOLOGY_FS_SMB_TIMEOUT_MS` — probe timeout (default 2000).
 pub async fn auto_connect(host: &str, username: &str, password: &str) -> Option<Arc<SmbTransport>> {
+    auto_connect_as(host, username, password, None).await
+}
+
+/// [`auto_connect`] with the domain chosen by the caller.
+///
+/// An explicit domain wins over `SYNOLOGY_FS_SMB_DOMAIN`, which wins over
+/// none. The environment variable predates the flag and stays supported: it is
+/// how existing mounts are configured, and breaking them to tidy a precedence
+/// list would be a poor trade.
+pub async fn auto_connect_as(
+    host: &str,
+    username: &str,
+    password: &str,
+    domain: Option<&str>,
+) -> Option<Arc<SmbTransport>> {
     if std::env::var_os("SYNOLOGY_FS_SMB_DISABLE").is_some() {
         return None;
     }
     let mut cfg = SmbConfig::from_login(host, username, password);
-    if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
-        cfg.domain = domain;
+    // `Some("")` is an explicit answer, not an absent one: an empty domain is
+    // how a local DSM user is named, so it has to be able to override an
+    // environment variable back to none.
+    match domain {
+        Some(domain) => cfg.domain = domain.to_string(),
+        None => {
+            if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
+                cfg.domain = domain;
+            }
+        }
     }
     if let Some(port) = std::env::var("SYNOLOGY_FS_SMB_PORT")
         .ok()
@@ -250,7 +273,22 @@ pub async fn auto_attach(
     username: &str,
     password: &str,
 ) -> SynologyClient {
-    match auto_connect(host, username, password).await {
+    auto_attach_as(client, host, username, password, None).await
+}
+
+/// [`auto_attach`] with the SMB host and domain chosen by the caller.
+///
+/// The host is separate from the one used for HTTP because inside the tunnel
+/// they differ: the NAS answers SMB at a private address its public name does
+/// not resolve to.
+pub async fn auto_attach_as(
+    client: SynologyClient,
+    host: &str,
+    username: &str,
+    password: &str,
+    domain: Option<&str>,
+) -> SynologyClient {
+    match auto_connect_as(host, username, password, domain).await {
         Some(smb) => client
             .with_read_transport(smb.clone())
             .with_write_transport(smb.clone())
