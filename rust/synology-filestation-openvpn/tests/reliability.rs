@@ -47,6 +47,38 @@ fn the_send_window_refuses_work_it_could_not_track() {
 }
 
 #[test]
+fn the_window_will_not_run_ahead_of_its_oldest_unacknowledged_message() {
+    // Counting outstanding messages is not the same as bounding how far ahead
+    // we have run, and the difference deadlocks. Queue a full window, then let
+    // everything but the first be acknowledged: only one message is
+    // outstanding, but the next id would be CAPACITY beyond the one the peer
+    // is still waiting for. Its receive window would eventually drop such a
+    // message *without acknowledging it* — see `RecvWindow::accept` — and we
+    // would retransmit something it has promised never to accept.
+    let start = Instant::now();
+    let mut window = send_window();
+    for _ in 0..SendWindow::CAPACITY {
+        window.queue(Opcode::ControlV1, payload(0)).expect("room");
+        window.next_due(start).expect("sent");
+    }
+
+    window.acknowledge(&(1..SendWindow::CAPACITY as u32).collect::<Vec<_>>());
+    assert_eq!(window.in_flight(), 1, "only message 0 is still outstanding");
+
+    assert_eq!(
+        window.queue(Opcode::ControlV1, payload(0)),
+        None,
+        "a free slot is not permission to get further ahead"
+    );
+
+    window.acknowledge(&[0]);
+    assert!(
+        window.queue(Opcode::ControlV1, payload(0)).is_some(),
+        "and once the peer has caught up, the window moves with it"
+    );
+}
+
+#[test]
 fn a_queued_message_is_due_immediately_and_lowest_id_first() {
     let now = Instant::now();
     let mut window = send_window();

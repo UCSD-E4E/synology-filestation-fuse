@@ -54,8 +54,11 @@ pub struct SendWindow {
 }
 
 impl SendWindow {
-    /// `TLS_RELIABLE_N_SEND_BUFFERS`. Also the window size: the peer is
-    /// entitled to assume we will not run further ahead than this.
+    /// `TLS_RELIABLE_N_SEND_BUFFERS`. Also the window size, and the window is
+    /// a promise: the peer sizes its receive buffer on the assumption that we
+    /// will not get further ahead than this, and drops anything beyond it
+    /// *without acknowledging it*. Breaking the promise does not lose one
+    /// message, it deadlocks the session.
     pub const CAPACITY: usize = 6;
 
     /// Three acknowledgements for *later* messages mean this one is lost
@@ -96,8 +99,28 @@ impl SendWindow {
         Some(id)
     }
 
+    /// Whether another message can be taken.
+    ///
+    /// Two separate limits, both of them OpenVPN's
+    /// (`reliable_get_buf_output_sequenced`). There has to be a free slot —
+    /// and the next id has to still be within `CAPACITY` of the oldest message
+    /// the peer has not acknowledged.
+    ///
+    /// The second is the one that is easy to miss, because a free slot looks
+    /// like permission. Acknowledgements arriving out of order free slots
+    /// without moving the oldest outstanding id, so counting alone would let
+    /// us run arbitrarily far ahead of a peer that is still waiting for one
+    /// early message.
     pub fn is_full(&self) -> bool {
-        self.in_flight.len() >= Self::CAPACITY
+        if self.in_flight.len() >= Self::CAPACITY {
+            return true;
+        }
+        // A `BTreeMap` is ordered, so the first key is the oldest id still
+        // outstanding.
+        match self.in_flight.keys().next() {
+            Some(&oldest) => self.next_id.wrapping_sub(oldest) >= Self::CAPACITY as u32,
+            None => false,
+        }
     }
 
     pub fn in_flight(&self) -> usize {
