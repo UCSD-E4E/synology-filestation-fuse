@@ -186,13 +186,19 @@ impl ControlChannel {
             // rule bite: a captured reset acknowledges a session id we no
             // longer have, and ours is random.
             None if self.opened => {
-                // Three conditions, and together they say "this is the
-                // answer to what we just sent" rather than merely "this is
-                // well formed". The acknowledgement carries most of the
-                // weight: it has to name our session id, which is random, and
-                // it has to acknowledge the opening message itself. A packet
-                // captured from an earlier session satisfies neither.
+                // Together these say "this is the answer to what we just
+                // sent" rather than merely "this is well formed". The
+                // acknowledgement carries most of the weight — it has to name
+                // our session id, which is random, and acknowledge the opening
+                // message itself — and a packet captured from an earlier
+                // session satisfies neither.
+                //
+                // Its own message id has to be the first one too. A reset
+                // numbered anything else would be admitted and then sit in the
+                // receive window behind a message zero that never comes, so
+                // the session would be established and mute.
                 let answers_our_open = packet.opcode == Opcode::ControlHardResetServerV2
+                    && packet.packet_id == Some(Self::OPENING_MESSAGE_ID)
                     && packet
                         .acks
                         .as_ref()

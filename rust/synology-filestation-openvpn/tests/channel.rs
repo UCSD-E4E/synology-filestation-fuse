@@ -72,12 +72,22 @@ fn read(datagram: &[u8]) -> (ControlPacket, TlsAuthHeader) {
 /// first is exactly what is under test in places, the harness has to be able
 /// to send the real thing, and to send things that are nearly it.
 fn server_reset(replay_id: u32, acking: Vec<u32>, session_id: SessionId) -> Vec<u8> {
+    server_reset_numbered(replay_id, 0, acking, session_id)
+}
+
+/// The same, with control over the reset's own message id.
+fn server_reset_numbered(
+    replay_id: u32,
+    message_id: u32,
+    acking: Vec<u32>,
+    session_id: SessionId,
+) -> Vec<u8> {
     let packet = ControlPacket {
         opcode: Opcode::ControlHardResetServerV2,
         key_id: KeyId::FIRST,
         session_id: SERVER_SESSION,
         acks: Some(Acks::new(acking, session_id).expect("acks fit")),
-        packet_id: Some(0),
+        packet_id: Some(message_id),
         payload: Vec::new(),
     };
     TlsAuth::new(&key(), KeyDirection::Normal).wrap(&packet, replay_id, 0)
@@ -421,6 +431,27 @@ fn a_reset_that_answers_some_other_message_does_not_open_our_session() {
         .handle(&server_reset(2, vec![0], CLIENT_SESSION), now)
         .expect("the one that answers message 0 is accepted");
     assert_eq!(client.remote_session(), Some(SERVER_SESSION));
+}
+
+#[test]
+fn a_reset_that_is_not_the_peers_first_message_does_not_open_our_session() {
+    // A reset numbered anything but zero would be admitted and then wait in
+    // the receive window behind a message zero that is never coming. The
+    // session would be established and permanently mute — which is worse than
+    // a refusal, because there is nothing left to retry.
+    let now = Instant::now();
+    let mut client = client();
+    client.open();
+    client.poll_transmit(now, 0).expect("our reset");
+
+    assert_eq!(
+        client
+            .handle(&server_reset_numbered(1, 1, vec![0], CLIENT_SESSION), now)
+            .unwrap_err(),
+        Error::UnexpectedFirstPacket,
+        "a peer's first message is its message zero"
+    );
+    assert_eq!(client.remote_session(), None);
 }
 
 #[test]
