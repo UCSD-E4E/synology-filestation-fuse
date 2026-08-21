@@ -310,15 +310,84 @@ fn a_message_too_far_ahead_is_dropped_without_acknowledgement() {
 }
 
 #[test]
-fn acknowledgements_are_handed_out_in_packet_sized_batches() {
+fn acknowledgements_are_repeated_rather_than_spent() {
+    // An acknowledgement rides inside a datagram, and that datagram can be
+    // lost like any other. Handing each id out once means a single loss
+    // silently withdraws an acknowledgement, and the peer goes on
+    // retransmitting a message we have had all along — so ids already sent are
+    // kept and offered again whenever there is room. This is OpenVPN's
+    // `ack_mru`, newest first.
     let mut window = RecvWindow::new();
     for id in 0..5 {
         window.accept(id, Opcode::ControlV1, payload(id as u8));
     }
 
-    assert_eq!(window.take_acks(3), vec![0, 1, 2], "oldest first");
-    assert_eq!(window.take_acks(3), vec![3, 4]);
-    assert_eq!(window.take_acks(3), Vec::<u32>::new(), "and then nothing");
+    assert_eq!(
+        window.take_acks(3),
+        vec![0, 1, 2],
+        "the oldest three, in order"
+    );
+    assert_eq!(
+        window.take_acks(3),
+        vec![3, 4, 0],
+        "the two still waiting, and room for one already sent"
+    );
+    assert_eq!(
+        window.take_acks(3),
+        vec![3, 4, 0],
+        "with nothing new to say, it says the recent ones again"
+    );
+    assert!(
+        !window.owes_acks(),
+        "though repeating them is not a reason to send a packet of its own"
+    );
+}
+
+#[test]
+fn repeating_an_acknowledgement_moves_it_rather_than_duplicating_it() {
+    // A retransmitted message is acknowledged again, and its id is already in
+    // the recent list. Adding a second copy would let one id fill the eight
+    // slots and push out the others — so the acknowledgements that most need
+    // repeating would be the ones that stopped being repeated.
+    let mut window = RecvWindow::new();
+    window.accept(0, Opcode::ControlV1, payload(0));
+    window.accept(1, Opcode::ControlV1, payload(1));
+    assert_eq!(window.take_acks(8), vec![0, 1]);
+
+    // The peer did not hear us, and sends message 0 again.
+    window.accept(0, Opcode::ControlV1, payload(0));
+
+    assert_eq!(
+        window.take_acks(8),
+        vec![0, 1],
+        "0 moves back to the front; it does not appear twice"
+    );
+}
+
+#[test]
+fn asking_for_more_acknowledgements_than_fit_loses_none_of_them() {
+    // `take_acks` removes ids from the pending list on its way to the recent
+    // one, and the recent one holds eight. Taking twelve would drop four
+    // somewhere in between, after they had stopped being pending — so they
+    // would never be sent at all.
+    let mut window = RecvWindow::new();
+    for id in 0..12 {
+        window.accept(id, Opcode::ControlV1, payload(0));
+    }
+
+    let first = window.take_acks(12);
+
+    assert_eq!(
+        first,
+        (0..8).collect::<Vec<_>>(),
+        "as many as a packet holds"
+    );
+    assert!(window.owes_acks(), "and the rest are still owed");
+    let second = window.take_acks(8);
+    assert!(
+        second.contains(&8) && second.contains(&11),
+        "so they go out next time: {second:?}"
+    );
 }
 
 #[test]

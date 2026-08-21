@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 use crate::reliable::{RecvWindow, SendWindow};
+use crate::replay::ReplayWindow;
 use crate::tls_auth::TlsAuth;
 use crate::Error;
 
@@ -28,6 +29,11 @@ pub struct ControlChannel {
     /// The `tls-auth` replay counter, which counts *datagrams* rather than
     /// messages. OpenVPN's first packet carries 1, not 0.
     next_replay_id: u32,
+    /// The same counter in the other direction, as the peer sends it.
+    replay: ReplayWindow,
+    /// Whether we opened this session, which decides how strict we are about
+    /// the first packet back.
+    opened: bool,
 }
 
 impl ControlChannel {
@@ -40,11 +46,22 @@ impl ControlChannel {
             send: SendWindow::new(tls_timeout),
             recv: RecvWindow::new(),
             next_replay_id: 1,
+            replay: ReplayWindow::new(),
+            opened: false,
         }
     }
 
+    /// The message id of the reset that opens a session. It is the first
+    /// message we send, so it is always zero.
+    const OPENING_MESSAGE_ID: u32 = 0;
+
     /// Begin a session by queueing the opening reset.
+    ///
+    /// This also decides what we will accept back. Having opened a session, the
+    /// only packet that can legitimately be its first answer is the server
+    /// reset that acknowledges it — see [`ControlChannel::handle`].
     pub fn open(&mut self) {
+        self.opened = true;
         self.send
             .queue(Opcode::ControlHardResetClientV2, Vec::new());
     }
@@ -63,14 +80,31 @@ impl ControlChannel {
         self.remote_session
     }
 
+    /// Whether the send window has room for another message.
+    ///
+    /// A caller deciding when to wake needs this: bytes waiting for a full
+    /// window are not a reason to be polled now, they are a reason to wait for
+    /// the window to move.
+    pub fn can_send(&self) -> bool {
+        !self.send.is_full()
+    }
+
     /// The next datagram to put on the wire, if there is one.
     ///
     /// `net_time` is what goes in the packet's replay header: the sender's
     /// clock in seconds since the epoch, truncated to 32 bits.
     pub fn poll_transmit(&mut self, now: Instant, net_time: u32) -> Option<Vec<u8>> {
+        // Decide whether there is anything to send *before* collecting
+        // acknowledgements. `take_acks` also offers ids already sent, so
+        // asking it first would make every call look like it had something to
+        // say, and a caller polling until `None` would never stop.
+        let due = self.send.next_due(now);
+        if due.is_none() && !self.recv.owes_acks() {
+            return None;
+        }
         let acks = self.take_acks();
 
-        let packet = match self.send.next_due(now) {
+        let packet = match due {
             Some(outgoing) => ControlPacket {
                 opcode: outgoing.opcode,
                 key_id: self.key_id,
@@ -99,10 +133,15 @@ impl ControlChannel {
 
     /// When [`ControlChannel::poll_transmit`] will next have something.
     ///
-    /// `None` means nothing is outstanding — but an acknowledgement may still
-    /// be owed, so a caller that has just handled a datagram should poll
-    /// before sleeping on this.
+    /// `None` means there is nothing to send and nothing to wait for. It has
+    /// to account for acknowledgements as well as the send window: handling a
+    /// datagram leaves an ack owed without putting anything in flight, and a
+    /// caller that slept on the window alone would sit there while the peer
+    /// retransmitted what we already have.
     pub fn next_wakeup(&self, now: Instant) -> Option<Instant> {
+        if self.recv.owes_acks() {
+            return Some(now);
+        }
         self.send.next_wakeup(now)
     }
 
@@ -112,17 +151,65 @@ impl ControlChannel {
     /// caller is the only thing that can count them, and a peer that is
     /// consistently rejected is worth noticing.
     pub fn handle(&mut self, datagram: &[u8], _now: Instant) -> Result<(), Error> {
-        let (packet, _header) = self.auth.unwrap(datagram)?;
+        let (packet, header) = self.auth.unwrap(datagram)?;
 
-        // Everything is checked before anything is changed. The first
+        // Straight after authentication, and before anything is interpreted —
+        // which is where OpenVPN checks it too. A captured datagram stays
+        // authentic forever; this is the only thing that stops it being
+        // replayed into a later session.
+        //
+        // The window is updated for a packet we may still reject below. That
+        // is deliberate: the id was genuinely used, and a rejection on other
+        // grounds does not hand it back.
+        if !self.replay.accept(header.packet_id, header.net_time) {
+            return Err(Error::Replayed);
+        }
+
+        // Everything else is checked before anything is changed. The first
         // authentic packet settles who the peer is, so a packet we are about
         // to reject must not settle it first — that would lock the channel
         // onto a peer it has just refused, and the real server would then be
         // turned away as an impostor for the rest of the session.
-        if let Some(known) = self.remote_session {
-            if known != packet.session_id {
-                return Err(Error::WrongSession);
+        match self.remote_session {
+            Some(known) if known != packet.session_id => return Err(Error::WrongSession),
+            Some(_) => {}
+            // Nothing is known about the peer yet, so this packet is about to
+            // decide it — which makes it the one worth being strict about. We
+            // are always the side that opens a session, so the only thing that
+            // can legitimately answer is a server reset acknowledging ours.
+            //
+            // Without this, a datagram captured from an *earlier* session is
+            // still authentic and still passes a replay window that was
+            // created along with this channel, and it would latch us onto a
+            // peer that is not there — after which the real server is refused
+            // as an impostor. Requiring the acknowledgement is what makes the
+            // rule bite: a captured reset acknowledges a session id we no
+            // longer have, and ours is random.
+            None if self.opened => {
+                // Together these say "this is the answer to what we just
+                // sent" rather than merely "this is well formed". The
+                // acknowledgement carries most of the weight — it has to name
+                // our session id, which is random, and acknowledge the opening
+                // message itself — and a packet captured from an earlier
+                // session satisfies neither.
+                //
+                // Its own message id has to be the first one too. A reset
+                // numbered anything else would be admitted and then sit in the
+                // receive window behind a message zero that never comes, so
+                // the session would be established and mute.
+                let answers_our_open = packet.opcode == Opcode::ControlHardResetServerV2
+                    && packet.packet_id == Some(Self::OPENING_MESSAGE_ID)
+                    && packet
+                        .acks
+                        .as_ref()
+                        .is_some_and(|acks| acks.ids().contains(&Self::OPENING_MESSAGE_ID));
+                if !answers_our_open {
+                    return Err(Error::UnexpectedFirstPacket);
+                }
             }
+            // A channel that has not opened anything has no expectation to
+            // hold the first packet to.
+            None => {}
         }
         if let Some(acks) = &packet.acks {
             if acks.session_id() != self.local_session {

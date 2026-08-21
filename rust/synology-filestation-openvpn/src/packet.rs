@@ -31,6 +31,15 @@ impl SessionId {
         Self(bytes)
     }
 
+    /// A fresh session id.
+    ///
+    /// It has to be unpredictable, not merely unique: it is one of the two
+    /// things a packet must name correctly to be accepted, and the other —
+    /// the `tls-auth` key — is shared with everyone who may use the VPN.
+    pub fn random() -> Self {
+        Self(rand::random())
+    }
+
     pub fn as_bytes(&self) -> &[u8; Self::LEN] {
         &self.0
     }
