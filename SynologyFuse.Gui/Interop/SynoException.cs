@@ -49,3 +49,21 @@ public sealed class TlsVerificationException : SynoException
     {
     }
 }
+
+/// <summary>
+/// Raised when the login succeeded but the local mount did not. Distinct from a
+/// bare <see cref="SynoException"/> because the remedy is entirely different:
+/// nothing is wrong with the credentials or the NAS, so the user must be pointed
+/// at the mount point and the filesystem driver instead.
+/// </summary>
+public sealed class MountFailedException : SynoException
+{
+    internal MountFailedException(SynoException inner)
+        : base(inner.Status, inner.DsmCode, inner.Message)
+    {
+        InnerSynoException = inner;
+    }
+
+    /// <summary>The underlying failure, as reported by the native mount call.</summary>
+    internal SynoException InnerSynoException { get; }
+}
