@@ -124,16 +124,19 @@ impl Session {
         )
         .map_err(|error| Error::Tls(error.to_string()))?;
 
-        Ok(Self {
+        let mut session = Self {
             channel,
             tls,
             outbox: Outbox::default(),
-        })
-    }
-
-    /// Start the session: the opening reset, and the `ClientHello` behind it.
-    pub fn open(&mut self) {
-        self.channel.open();
+        };
+        // Opened here rather than by a separate call. rustls has a
+        // `ClientHello` ready the moment it is built, so a session that could
+        // be polled before it was opened would put that hello on the wire as
+        // an ordinary control message with no reset in front of it — a start
+        // no server accepts. Removing the window is better than documenting
+        // it.
+        session.channel.open();
+        Ok(session)
     }
 
     /// Whether the TLS handshake is still in progress.
@@ -328,6 +331,30 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(session.next_wakeup(now), Some(now));
+    }
+
+    #[test]
+    fn the_first_thing_a_session_sends_is_a_reset() {
+        // rustls has a `ClientHello` ready as soon as it exists. If a session
+        // could be polled before it was opened, that hello would go out as an
+        // ordinary control message with no reset in front of it, and no server
+        // would accept the session.
+        use crate::packet::{ControlPacket, Opcode};
+
+        let mut session = test_session();
+        let datagram = session
+            .poll_transmit(Instant::now(), 0)
+            .expect("a new session has something to say");
+
+        let peer = TlsAuth::new(&StaticKey::from_bytes([7; 256]), KeyDirection::Normal);
+        let (packet, _): (ControlPacket, _) = peer.unwrap(&datagram).expect("authentic");
+
+        assert_eq!(packet.opcode, Opcode::ControlHardResetClientV2);
+        assert_eq!(packet.packet_id, Some(0));
+        assert!(
+            packet.payload.is_empty(),
+            "the handshake does not start until the session is open"
+        );
     }
 
     #[test]

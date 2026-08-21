@@ -22,6 +22,7 @@ use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use synology_filestation_openvpn::{
@@ -164,6 +165,14 @@ impl OpenVpnServer {
         write(&dir.join("server.key"), &pki.server_key_pem);
         write(&dir.join("ta.key"), &static_key_file());
 
+        // Held until the child has bound, because `free_port` lets go of the
+        // port to hand it over: two servers starting at once could otherwise
+        // be given the same one, and the loser fails to bind while the winner
+        // talks to the wrong test.
+        static SPAWNING: Mutex<()> = Mutex::new(());
+        let spawning = SPAWNING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let port = free_port();
         let log = dir.join("openvpn.log");
         let binary = std::env::var("OPENVPN_BIN").unwrap_or_else(|_| "openvpn".to_string());
@@ -198,6 +207,7 @@ impl OpenVpnServer {
             pki,
         };
         server.wait_until_listening(&log);
+        drop(spawning);
         server
     }
 
@@ -301,7 +311,6 @@ fn a_tls_handshake_completes_over_the_control_channel() {
     });
 
     let mut session = Session::new(config).expect("a client");
-    session.open();
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut buf = [0u8; 4096];

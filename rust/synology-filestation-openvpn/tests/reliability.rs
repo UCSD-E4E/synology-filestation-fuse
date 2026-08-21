@@ -365,6 +365,32 @@ fn repeating_an_acknowledgement_moves_it_rather_than_duplicating_it() {
 }
 
 #[test]
+fn asking_for_more_acknowledgements_than_fit_loses_none_of_them() {
+    // `take_acks` removes ids from the pending list on its way to the recent
+    // one, and the recent one holds eight. Taking twelve would drop four
+    // somewhere in between, after they had stopped being pending — so they
+    // would never be sent at all.
+    let mut window = RecvWindow::new();
+    for id in 0..12 {
+        window.accept(id, Opcode::ControlV1, payload(0));
+    }
+
+    let first = window.take_acks(12);
+
+    assert_eq!(
+        first,
+        (0..8).collect::<Vec<_>>(),
+        "as many as a packet holds"
+    );
+    assert!(window.owes_acks(), "and the rest are still owed");
+    let second = window.take_acks(8);
+    assert!(
+        second.contains(&8) && second.contains(&11),
+        "so they go out next time: {second:?}"
+    );
+}
+
+#[test]
 fn an_out_of_window_message_leaves_nothing_to_acknowledge() {
     let mut window = RecvWindow::new();
     window.accept(RecvWindow::CAPACITY as u32, Opcode::ControlV1, payload(9));

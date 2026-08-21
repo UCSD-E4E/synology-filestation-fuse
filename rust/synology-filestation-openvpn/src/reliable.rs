@@ -306,7 +306,13 @@ impl RecvWindow {
     /// `max` is the caller's, because how many fit depends on the packet they
     /// are riding on — see [`crate::Acks::MAX`].
     pub fn take_acks(&mut self, max: usize) -> Vec<u32> {
-        let taking = self.pending_acks.len().min(max);
+        // Never take more than the list can hold: promoting twelve ids into
+        // eight slots would drop four of them on the floor, and they have
+        // already been removed from `pending_acks` by then. `Acks::MAX` and
+        // `RECENT_ACKS` are both eight, so this only bites a caller asking for
+        // more than a packet could carry anyway.
+        let room = max.min(Self::RECENT_ACKS);
+        let taking = self.pending_acks.len().min(room);
         let promoting: Vec<u32> = self.pending_acks.drain(..taking).collect();
         for id in promoting.into_iter().rev() {
             // A retransmitted message is acknowledged again, and its id may
@@ -318,7 +324,7 @@ impl RecvWindow {
             self.recent_acks.insert(0, id);
         }
         self.recent_acks.truncate(Self::RECENT_ACKS);
-        self.recent_acks.iter().take(max).copied().collect()
+        self.recent_acks.iter().take(room).copied().collect()
     }
 
     /// Only the *upper* bound is checked, matching `reliable_pid_in_range2`:
