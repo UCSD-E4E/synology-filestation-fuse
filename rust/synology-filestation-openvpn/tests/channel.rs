@@ -167,6 +167,22 @@ fn an_answered_reset_is_replaced_by_a_bare_acknowledgement() {
 }
 
 #[test]
+fn an_owed_acknowledgement_asks_to_be_sent_now() {
+    // `next_wakeup` is what a caller sleeps on. Handling a datagram leaves an
+    // ack owed without putting anything in flight, so a wakeup that looked
+    // only at the send window would report "nothing to do" while the peer
+    // retransmitted a message we already have.
+    let now = Instant::now();
+    let (client, _) = handshaken(now);
+
+    assert_eq!(
+        client.next_wakeup(now),
+        Some(now),
+        "we owe the server an acknowledgement for its reset"
+    );
+}
+
+#[test]
 fn acknowledgements_ride_along_on_the_next_real_packet() {
     // A bare ack costs a datagram. If there is something to say anyway, the
     // acks belong on it — which is why the ack block sits inside every control
@@ -218,16 +234,24 @@ fn a_packet_from_a_different_session_is_refused() {
     let now = Instant::now();
     let (mut client, _) = handshaken(now);
 
-    let mut impostor = server_at(SessionId::from_bytes([0xff; 8]));
-    impostor.open();
-    let datagram = impostor
-        .poll_transmit(now, 0)
-        .expect("a correctly signed packet");
+    // Built by hand for one reason: the replay id. The real server's reset
+    // already spent 1, so an impostor reusing it is refused by the replay
+    // window before the session check gets a look — a correct refusal, but not
+    // the one under test here.
+    let impostor = ControlPacket {
+        opcode: Opcode::ControlHardResetServerV2,
+        key_id: KeyId::FIRST,
+        session_id: SessionId::from_bytes([0xff; 8]),
+        acks: None,
+        packet_id: Some(0),
+        payload: Vec::new(),
+    };
+    let datagram = TlsAuth::new(&key(), KeyDirection::Normal).wrap(&impostor, 2, 0);
 
     assert_eq!(
         client.handle(&datagram, now).unwrap_err(),
         Error::WrongSession,
-        "correctly signed, wrong session"
+        "correctly signed, fresh replay id, wrong session"
     );
 }
 
@@ -326,11 +350,18 @@ fn a_rejected_packet_does_not_get_to_decide_who_the_peer_is() {
         )
         .expect("valid");
     server.open();
+
+    // The refused packet spent replay id 1, so the server's first datagram —
+    // which also carries 1 — is dropped. That is the cost of the replay
+    // window, it is OpenVPN's behaviour too, and the session recovers on the
+    // retransmission rather than stalling.
+    let first = server.poll_transmit(retry, 0).expect("server reset");
+    assert_eq!(client.handle(&first, retry).unwrap_err(), Error::Replayed);
+
+    let later = retry + TLS_TIMEOUT;
+    let again = server.poll_transmit(later, 0).expect("its retransmission");
     client
-        .handle(
-            &server.poll_transmit(retry, 0).expect("server reset"),
-            retry,
-        )
+        .handle(&again, later)
         .expect("the channel is not locked onto the impostor");
 
     assert_eq!(client.remote_session(), Some(SERVER_SESSION));

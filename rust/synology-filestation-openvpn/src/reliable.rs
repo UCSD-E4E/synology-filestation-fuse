@@ -276,6 +276,15 @@ impl RecvWindow {
         Some(message)
     }
 
+    /// Whether anything is waiting to be acknowledged.
+    ///
+    /// Separate from [`RecvWindow::take_acks`], which empties the list: a
+    /// caller deciding whether it needs to send at all must be able to ask
+    /// without consuming the answer.
+    pub fn owes_acks(&self) -> bool {
+        !self.pending_acks.is_empty()
+    }
+
     /// Up to `max` ids to acknowledge, oldest first, removed as they are taken.
     ///
     /// `max` is the caller's, because how many fit depends on the packet they

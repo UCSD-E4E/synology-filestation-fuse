@@ -154,7 +154,15 @@ impl Session {
     }
 
     /// When [`Session::poll_transmit`] will next have something.
+    ///
+    /// `None` means idle. TLS counts here as well as the channel: a handshake
+    /// step leaves rustls with bytes to send and the send window empty, and a
+    /// caller sleeping on the window alone would stall the handshake it is
+    /// trying to drive.
     pub fn next_wakeup(&self, now: Instant) -> Option<Instant> {
+        if self.tls.wants_write() || !self.outbox.is_empty() {
+            return Some(now);
+        }
         self.channel.next_wakeup(now)
     }
 
@@ -253,6 +261,10 @@ impl Outbox {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     #[cfg(test)]
     fn pending(&self) -> usize {
         self.pending.len()
@@ -280,6 +292,34 @@ mod tests {
             count += 1;
         }
         count
+    }
+
+    /// A session pointed at a certificate authority that exists only here.
+    fn test_session() -> Session {
+        let key = rcgen::KeyPair::generate().expect("a key");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = params.self_signed(&key).expect("a certificate");
+
+        Session::new(SessionConfig::new(
+            ca.pem(),
+            "localhost",
+            StaticKey::from_bytes([7; 256]),
+        ))
+        .expect("a session")
+    }
+
+    #[test]
+    fn a_handshake_waiting_to_go_out_asks_to_be_polled_now() {
+        // rustls has a ClientHello ready the moment it is created, before the
+        // channel has anything of its own. A wakeup that consulted only the
+        // send window would report "nothing to do" and a caller sleeping on it
+        // would stall the handshake before it started.
+        let session = test_session();
+        let now = Instant::now();
+
+        assert_eq!(session.next_wakeup(now), Some(now));
     }
 
     #[test]

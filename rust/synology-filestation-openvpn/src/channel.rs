@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 use crate::reliable::{RecvWindow, SendWindow};
+use crate::replay::ReplayWindow;
 use crate::tls_auth::TlsAuth;
 use crate::Error;
 
@@ -28,6 +29,8 @@ pub struct ControlChannel {
     /// The `tls-auth` replay counter, which counts *datagrams* rather than
     /// messages. OpenVPN's first packet carries 1, not 0.
     next_replay_id: u32,
+    /// The same counter in the other direction, as the peer sends it.
+    replay: ReplayWindow,
 }
 
 impl ControlChannel {
@@ -40,6 +43,7 @@ impl ControlChannel {
             send: SendWindow::new(tls_timeout),
             recv: RecvWindow::new(),
             next_replay_id: 1,
+            replay: ReplayWindow::new(),
         }
     }
 
@@ -99,10 +103,15 @@ impl ControlChannel {
 
     /// When [`ControlChannel::poll_transmit`] will next have something.
     ///
-    /// `None` means nothing is outstanding — but an acknowledgement may still
-    /// be owed, so a caller that has just handled a datagram should poll
-    /// before sleeping on this.
+    /// `None` means there is nothing to send and nothing to wait for. It has
+    /// to account for acknowledgements as well as the send window: handling a
+    /// datagram leaves an ack owed without putting anything in flight, and a
+    /// caller that slept on the window alone would sit there while the peer
+    /// retransmitted what we already have.
     pub fn next_wakeup(&self, now: Instant) -> Option<Instant> {
+        if self.recv.owes_acks() {
+            return Some(now);
+        }
         self.send.next_wakeup(now)
     }
 
@@ -112,9 +121,21 @@ impl ControlChannel {
     /// caller is the only thing that can count them, and a peer that is
     /// consistently rejected is worth noticing.
     pub fn handle(&mut self, datagram: &[u8], _now: Instant) -> Result<(), Error> {
-        let (packet, _header) = self.auth.unwrap(datagram)?;
+        let (packet, header) = self.auth.unwrap(datagram)?;
 
-        // Everything is checked before anything is changed. The first
+        // Straight after authentication, and before anything is interpreted —
+        // which is where OpenVPN checks it too. A captured datagram stays
+        // authentic forever; this is the only thing that stops it being
+        // replayed into a later session.
+        //
+        // The window is updated for a packet we may still reject below. That
+        // is deliberate: the id was genuinely used, and a rejection on other
+        // grounds does not hand it back.
+        if !self.replay.accept(header.packet_id, header.net_time) {
+            return Err(Error::Replayed);
+        }
+
+        // Everything else is checked before anything is changed. The first
         // authentic packet settles who the peer is, so a packet we are about
         // to reject must not settle it first — that would lock the channel
         // onto a peer it has just refused, and the real server would then be
