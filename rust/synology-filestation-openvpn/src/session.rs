@@ -208,12 +208,6 @@ impl Session {
 
     /// The next datagram to send.
     pub fn poll_transmit(&mut self, now: Instant, net_time: u32) -> Option<Vec<u8>> {
-        // A failure to build our own message is fatal to the session, but
-        // this returns a datagram rather than a result. The session stays put
-        // and `handle` reports it the next time the peer says anything, which
-        // it will: it is waiting for the message we could not send.
-        let _ = self.send_our_key_material();
-
         // Take whatever TLS has produced, then hand the channel as much of it
         // as its window will hold.
         while self.tls.wants_write() {
@@ -261,6 +255,12 @@ impl Session {
             }
         }
 
+        // Both of these belong here rather than in `poll_transmit`, and not
+        // only because they can fail: the TLS handshake finishes while
+        // *reading*, so this is the moment our key material becomes sendable.
+        // Putting them where the result can be returned means a failure is
+        // reported rather than dropped.
+        self.send_our_key_material()?;
         self.receive_their_key_material()
     }
 
@@ -271,7 +271,7 @@ impl Session {
 
     /// Send our half of the key material, once TLS will carry it.
     ///
-    /// Exactly once: the phase moves whether or not the write succeeds,
+    /// Exactly once: the phase moves as soon as the message is written,
     /// because rustls buffers it and a second copy would be read as a second
     /// message.
     fn send_our_key_material(&mut self) -> Result<(), Error> {
@@ -294,9 +294,10 @@ impl Session {
         }
         .encode()?;
 
-        // A failure here is a closed session, which the next poll reports
-        // through the ordinary path rather than by panicking in a setter.
-        let _ = self.tls.writer().write_all(&message);
+        self.tls
+            .writer()
+            .write_all(&message)
+            .map_err(|error| Error::Tls(error.to_string()))?;
         self.phase = Phase::AwaitingKeys;
         Ok(())
     }
