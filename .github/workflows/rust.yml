@@ -13,11 +13,12 @@ jobs:
   lint:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
     - uses: actions/checkout@v7
     - name: Install Dependencies
-      run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      uses: ./.github/actions/install-fuse-deps
     - name: Rust formatting (cargo fmt)
       run: cargo fmt --all -- --check
     - name: Set up .NET 10
@@ -30,22 +31,23 @@ jobs:
   build-linux:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v7
     - name: Install Dependencies
-      run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      uses: ./.github/actions/install-fuse-deps
     # We restrict Rust CI to the FUSE crate + its `core` library dependency.
     # The Python crate (`python/synology_filestation`) has its own workflow
     # (`python.yml` / `maturin.yml`) and pulling it in here would require
     # Python development headers on macOS/Windows runners just to compile
     # an extension we don't ship via this pipeline.
     - name: Clippy
-      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --all-targets --all-features -- -D warnings
+      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi -p synology-filestation-smb -p synology-filestation-connect -p synology-filestation-openvpn --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
+      run: cargo build -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi -p synology-filestation-smb -p synology-filestation-connect -p synology-filestation-openvpn --verbose
     - name: Run Rust tests
-      run: cargo test -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
+      run: cargo test -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi -p synology-filestation-smb -p synology-filestation-connect -p synology-filestation-openvpn --verbose
     - name: Build release (required for installer)
       run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
@@ -66,9 +68,35 @@ jobs:
         name: SynologyFuse-linux-deb
         path: synologyfuse-*.deb
 
+  # The SMB write paths against a real SMB server. Everything else in that
+  # crate is mocked or pure, because SMB has no useful in-process fake — and
+  # the operations most worth testing (a replacing rename, set-end-of-file,
+  # closing a handle nothing was written to) are exactly the ones whose value
+  # lies in what the *server* does with them. A mock asserting we sent the
+  # right bytes proves the less interesting half.
+  #
+  # The containers ship inside the smb2 crate for consumers to use, so this
+  # needs no fixtures of ours. Linux only: GitHub's macOS and Windows runners
+  # have no Docker daemon.
+  smb-live:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@v7
+    - name: Start Samba containers and run the ignored SMB tests
+      # Serial: every test asks for the same compose project, and concurrent
+      # `compose up` calls race each other.
+      run: cargo test -p synology-filestation-smb --test samba -- --ignored --test-threads=1 --nocapture
+    - name: Container logs on failure
+      if: failure()
+      run: docker compose ls && docker ps -a
+
   build-macos:
 
     runs-on: macos-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v7
@@ -78,11 +106,11 @@ jobs:
     # Python development headers on macOS/Windows runners just to compile
     # an extension we don't ship via this pipeline.
     - name: Clippy
-      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --all-targets --all-features -- -D warnings
+      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi -p synology-filestation-smb -p synology-filestation-connect -p synology-filestation-openvpn --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
+      run: cargo build -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi -p synology-filestation-smb -p synology-filestation-connect -p synology-filestation-openvpn --verbose
     - name: Run Rust tests
-      run: cargo test -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
+      run: cargo test -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi -p synology-filestation-smb -p synology-filestation-connect -p synology-filestation-openvpn --verbose
     - name: Build release (required for installer)
       run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10
@@ -106,6 +134,7 @@ jobs:
   build-windows:
 
     runs-on: windows-latest
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v7
@@ -119,11 +148,11 @@ jobs:
     # Python development headers on macOS/Windows runners just to compile
     # an extension we don't ship via this pipeline.
     - name: Clippy
-      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --all-targets --all-features -- -D warnings
+      run: cargo clippy -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi -p synology-filestation-smb -p synology-filestation-connect -p synology-filestation-openvpn --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
+      run: cargo build -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi -p synology-filestation-smb -p synology-filestation-connect -p synology-filestation-openvpn --verbose
     - name: Run Rust tests
-      run: cargo test -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi --verbose
+      run: cargo test -p synology-filestation-fuse -p synology-filestation-core -p synology-filestation-ffi -p synology-filestation-smb -p synology-filestation-connect -p synology-filestation-openvpn --verbose
     - name: Build release (required for installer)
       run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi --verbose
     - name: Set up .NET 10

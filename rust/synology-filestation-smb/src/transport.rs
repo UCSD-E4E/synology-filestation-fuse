@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use smb2::{ClientConfig, SmbClient, Tree};
+use smb2::{ClientConfig, RenameOptions, SmbClient, Tree};
 use synology_filestation_core::{
     MetadataTransport, OpenWriteTransport, ReadTransport, StreamReadTransport,
     StreamWriteTransport, SynoAdditional, SynoFileInfo, SynoFsError, SynoTime, SynologyClient,
@@ -206,12 +206,35 @@ impl SmbConfig {
 /// * `SYNOLOGY_FS_SMB_PORT` — override the SMB port (default 445).
 /// * `SYNOLOGY_FS_SMB_TIMEOUT_MS` — probe timeout (default 2000).
 pub async fn auto_connect(host: &str, username: &str, password: &str) -> Option<Arc<SmbTransport>> {
+    auto_connect_as(host, username, password, None).await
+}
+
+/// [`auto_connect`] with the domain chosen by the caller.
+///
+/// An explicit domain wins over `SYNOLOGY_FS_SMB_DOMAIN`, which wins over
+/// none. The environment variable predates the flag and stays supported: it is
+/// how existing mounts are configured, and breaking them to tidy a precedence
+/// list would be a poor trade.
+pub async fn auto_connect_as(
+    host: &str,
+    username: &str,
+    password: &str,
+    domain: Option<&str>,
+) -> Option<Arc<SmbTransport>> {
     if std::env::var_os("SYNOLOGY_FS_SMB_DISABLE").is_some() {
         return None;
     }
     let mut cfg = SmbConfig::from_login(host, username, password);
-    if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
-        cfg.domain = domain;
+    // `Some("")` is an explicit answer, not an absent one: an empty domain is
+    // how a local DSM user is named, so it has to be able to override an
+    // environment variable back to none.
+    match domain {
+        Some(domain) => cfg.domain = domain.to_string(),
+        None => {
+            if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
+                cfg.domain = domain;
+            }
+        }
     }
     if let Some(port) = std::env::var("SYNOLOGY_FS_SMB_PORT")
         .ok()
@@ -250,13 +273,29 @@ pub async fn auto_attach(
     username: &str,
     password: &str,
 ) -> SynologyClient {
-    match auto_connect(host, username, password).await {
+    auto_attach_as(client, host, username, password, None).await
+}
+
+/// [`auto_attach`] with the SMB host and domain chosen by the caller.
+///
+/// The host is separate from the one used for HTTP because inside the tunnel
+/// they differ: the NAS answers SMB at a private address its public name does
+/// not resolve to.
+pub async fn auto_attach_as(
+    client: SynologyClient,
+    host: &str,
+    username: &str,
+    password: &str,
+    domain: Option<&str>,
+) -> SynologyClient {
+    match auto_connect_as(host, username, password, domain).await {
         Some(smb) => client
             .with_read_transport(smb.clone())
             .with_write_transport(smb.clone())
             .with_stream_write_transport(smb.clone())
             .with_stream_read_transport(smb.clone())
-            .with_metadata_transport(smb),
+            .with_metadata_transport(smb.clone())
+            .with_open_write_transport(smb),
         None => client,
     }
 }
@@ -362,29 +401,33 @@ impl SmbTransport {
         tree: &mut Tree,
         tmp: &str,
         target: &str,
-        seq: u64,
+        _seq: u64,
     ) -> Result<(), SynoFsError> {
-        match client.rename(tree, tmp, target).await {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == smb2::ErrorKind::AlreadyExists => {} // replace below
+        // One operation, performed by the server. The old-or-new guarantee is
+        // now the server's to keep: there is no moment when the name resolves
+        // to nothing, and nothing left half-done if this process dies here.
+        //
+        // What this replaces: rename, and on a name collision move the old
+        // file aside, rename again, delete the backup, restoring the old file
+        // if the second rename failed. Four operations, three of them
+        // recovery, and a window in the middle where a reader looking for the
+        // target found neither copy. That dance existed only because the SMB
+        // library hardcoded ReplaceIfExists=false; our fork sends it.
+        match client
+            .rename_with_options(
+                tree,
+                tmp,
+                target,
+                RenameOptions {
+                    replace_if_exists: true,
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
             Err(e) => {
+                // The temp file is ours and now has no name anyone wants.
                 self.note_cleanup(client.delete_file(tree, tmp).await);
-                return Err(self.mark_and_map(&e));
-            }
-        }
-        // Move the old file aside so no step ever deletes the only copy.
-        let backup = part_name(&format!("{target}.bak"), seq);
-        if let Err(e) = client.rename(tree, target, &backup).await {
-            self.note_cleanup(client.delete_file(tree, tmp).await);
-            return Err(self.mark_and_map(&e));
-        }
-        match client.rename(tree, tmp, target).await {
-            Ok(()) => {
-                self.note_cleanup(client.delete_file(tree, &backup).await); // best-effort
-                Ok(())
-            }
-            Err(e) => {
-                self.note_cleanup(client.rename(tree, &backup, target).await); // restore old
                 Err(self.mark_and_map(&e))
             }
         }
@@ -1064,6 +1107,21 @@ impl MetadataTransport for SmbTransport {
         };
         done.map_err(|e| self.mark_and_map(&e))
     }
+
+    async fn truncate(&self, path: &str, size: u64) -> Result<(), SynoFsError> {
+        let loc = SmbPath::from_logical(path)?;
+        let mut guard = self.inner.lock().await;
+        let Inner { client, trees } = &mut *guard;
+        self.ensure_ready(client, trees, &loc.share).await?;
+        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        // SET_INFO with FileEndOfFileInformation: the file's length is a
+        // number the server sets, so the bytes past it are never read and
+        // never rewritten — regardless of how many there are.
+        client
+            .set_end_of_file(tree, &loc.path, size)
+            .await
+            .map_err(|e| self.mark_and_map(&e))
+    }
 }
 
 #[cfg(test)]
@@ -1180,6 +1238,13 @@ impl WriteHandle for SmbWriteHandle {
     }
 
     async fn close(&mut self) -> Result<(), SynoFsError> {
+        // A handle opened and never written still names a file the caller
+        // expects to exist — `touch` is precisely that sequence. Opening at 0
+        // here is what creates it; without this, closing an untouched handle
+        // would report success over a file that was never made.
+        if self.writer.is_none() && self.next == 0 {
+            self.reopen_at(0).await?;
+        }
         self.finish_writer().await
     }
 }

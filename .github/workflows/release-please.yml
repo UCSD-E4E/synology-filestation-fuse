@@ -25,6 +25,7 @@ jobs:
   release-please:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       # Each linked-versions component gets its own outputs, namespaced with
       # the package path. The FUSE crate drives the .deb / .pkg / .msi
@@ -53,6 +54,7 @@ jobs:
         (github.event_name == 'workflow_dispatch' && inputs.fuse_tag != '')
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Resolve release tag/version
@@ -61,7 +63,7 @@ jobs:
           echo "FUSE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "FUSE_VERSION=${TAG##*-v}" >> "$GITHUB_ENV"
       - name: Install Dependencies
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+        uses: ./.github/actions/install-fuse-deps
       - name: Build release CLI + FFI library
         run: cargo build --release -p synology-filestation-fuse -p synology-filestation-ffi
       - name: Set up .NET 10
@@ -88,6 +90,7 @@ jobs:
         (github.event_name == 'workflow_dispatch' && inputs.fuse_tag != '')
       )
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: Resolve release tag/version
@@ -121,6 +124,7 @@ jobs:
         (github.event_name == 'workflow_dispatch' && inputs.fuse_tag != '')
       )
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Resolve release tag/version
@@ -165,6 +169,7 @@ jobs:
         (github.event_name == 'workflow_dispatch' && inputs.python_tag != '')
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: Build wheel

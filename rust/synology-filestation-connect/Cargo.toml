@@ -13,9 +13,13 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "time", "net", "macros"] }
+tokio = { version = "1", features = ["rt", "time", "net", "macros", "fs"] }
 tracing = "0.1"
 async-trait = "0.1"
+# The tunnel profile is fetched over the same authenticated session the rest
+# of the chain uses, so this crate speaks to the NAS as well as about it.
+synology-filestation-core = { path = "../synology-filestation-core" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"

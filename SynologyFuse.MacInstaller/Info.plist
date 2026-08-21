@@ -18,7 +18,7 @@
     <string>SynologyFuse</string>
 
     <key>CFBundleDisplayName</key>
-    <string>Synology NAS Mount</string>
+    <string>NAS Folder Access</string>
 
     <key>CFBundleVersion</key>
     <string>__VERSION__</string>

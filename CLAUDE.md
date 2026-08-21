@@ -207,8 +207,9 @@ Who enables it:
 MVVM pattern (Avalonia). The GUI calls the Rust core **directly via the FFI cdylib** (no subprocess):
 - `Interop/NativeMethods.cs` — `[LibraryImport]` P/Invoke declarations (UTF-8 strings, blittable `NativeError`) + a `NativeLibrary` resolver that finds `lib*synology_filestation_ffi*` beside the GUI, in `target/{release,debug}`, or via the `SYNOFS_NATIVE_DIR` override.
 - `Services/SynoClient.cs` — managed wrapper translating status codes to `SynoException`/`OtpRequiredException` and JSON to `SynoFileInfo`.
-- `Services/MountService.cs` — connect + mount + test orchestration; surfaces native log lines via `OutputReceived`.
-- `ViewModels/MainWindowViewModel.cs` — `IsConnecting` spinner, **Test Connection**, typed OTP retry (login once, reused for the mount).
+- `Services/MountService.cs` — connect + mount + test orchestration; surfaces native log lines via `OutputReceived`. A failure *after* a successful login is retagged `MountFailedException` so the UI advises on the mount point, not the credentials.
+- `Services/ErrorPresenter.cs` — the last step of the error path: maps a `SynoException`'s `SynoStatus` (and, for a rejected login, the raw **`SYNO.API.Auth`** code — a different table from FileStation's, which is why the native layer reports `LoginFailed` separately) to an `ErrorReport` of *title / remedy / detail*. A pure function, so the wording is unit-tested without a NAS or the cdylib.
+- `ViewModels/MainWindowViewModel.cs` — `IsConnecting` spinner, **Test Connection**, typed OTP retry (login once, reused for the mount), and `Report(ex)` → the `ErrorBannerViewModel` banner (cause + remedy + copyable raw detail). Errors used to reach the user as the word "Error" plus a log line, which never said what to fix.
 - `ViewModels/FileBrowserViewModel.cs` + `Views/FileBrowserWindow.axaml` — pre-mount NAS browser (list/download/upload/delete/mkdir) with transfer progress.
 
 `SettingsService.cs` persists config to platform-specific app-data directories.
