@@ -230,7 +230,9 @@ MVVM pattern (Avalonia). The GUI calls the Rust core **directly via the FFI cdyl
 
 ## Release Process
 
-Uses [release-please](https://github.com/googleapis/release-please-action) on the `main` branch. Commit messages follow **Conventional Commits** (`fix:` → patch, `feat:` → minor, `feat!:` → major).
+Uses [release-please](https://github.com/googleapis/release-please-action) on the `main` branch. Commit messages follow **Conventional Commits**: while the project is pre-1.0, `fix:` → patch, `feat:` → minor, and `feat!:` → minor (`bump-minor-pre-major` holds 1.0.0 back until we mean it). `bump-patch-for-minor-pre-major` is deliberately **off** — leaving it on demoted every feature to a patch bump, which is how a release full of `feat:` commits came out as 0.3.2 instead of 0.4.0.
+
+**Merge commits and the changelog.** PRs land as merge commits, so the branch's own commits reach `main` alongside the merge. The repo's `merge_commit_message` is therefore set to `BLANK`: with GitHub's default `PR_TITLE` the merge commit body repeated the PR's conventional-commit line, release-please parsed it *and* the underlying commit, and every changelog entry appeared twice. The merge subject (`Merge pull request #N from …`) is still unparseable — release-please logs `commit could not be parsed` for each one and skips it. That noise is expected and harmless; the changelog comes from the individual commits.
 
 The repo has **four release-please packages** linked together via the `linked-versions` plugin (so they always bump to the same version, but each ships its own changelog and tag):
 

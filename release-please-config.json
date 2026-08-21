@@ -20,7 +20,7 @@
       "package-name": "synology-filestation-gui",
       "changelog-path": "SynologyFuse.Gui/CHANGELOG.md",
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": false,
       "exclude-paths": [
         "rust",
         "python",
@@ -38,19 +38,19 @@
       "release-type": "rust",
       "package-name": "synology-filestation-core",
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true
+      "bump-patch-for-minor-pre-major": false
     },
     "rust/synology-filestation-fuse": {
       "release-type": "rust",
       "package-name": "synology-filestation-fuse",
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true
+      "bump-patch-for-minor-pre-major": false
     },
     "python/synology_filestation": {
       "release-type": "rust",
       "package-name": "synology_filestation",
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true
+      "bump-patch-for-minor-pre-major": false
     }
   }
 }
