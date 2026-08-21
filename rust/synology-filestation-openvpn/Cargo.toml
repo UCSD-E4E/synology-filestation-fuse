@@ -12,14 +12,16 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-# SHA512 is what the server is configured with (`auth SHA512` in the published
-# .ovpn); the HMAC construction is generic over it so a different digest is a
-# parameter, not a rewrite.
+# SHA-512 is what the server is configured with (`auth SHA512` in the published
+# .ovpn). See `tls_auth.rs` for why that is a constant here and not a knob.
 hmac = "0.12"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 thiserror = "2"
-tracing = "0.1"
 
 [dev-dependencies]
 hex = "0.4"
+# The tests build a few packets the library's own types refuse to represent,
+# so they sign them themselves.
+hmac = "0.12"
+sha2 = "0.10"

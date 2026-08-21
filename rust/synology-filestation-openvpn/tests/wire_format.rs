@@ -21,7 +21,7 @@
 //! key anyone should care about.
 
 use synology_filestation_openvpn::{
-    Acks, ControlPacket, KeyDirection, Opcode, SessionId, StaticKey, TlsAuth,
+    Acks, ControlPacket, KeyDirection, KeyId, Opcode, SessionId, StaticKey, TlsAuth,
 };
 
 /// The 2048-bit static key the capture was made with, in the order the file
@@ -89,7 +89,7 @@ fn a_captured_hard_reset_decodes_to_its_fields() {
         .expect("a packet openvpn itself emitted must authenticate");
 
     assert_eq!(packet.opcode, Opcode::ControlHardResetClientV2);
-    assert_eq!(packet.key_id, 0);
+    assert_eq!(packet.key_id, KeyId::FIRST);
     assert_eq!(
         packet.session_id,
         SessionId::from_bytes([0xd9, 0x6e, 0x11, 0xba, 0x3a, 0x75, 0xca, 0xd1])
@@ -163,12 +163,9 @@ fn an_ack_carries_acknowledged_ids_and_no_message_id() {
     let remote = SessionId::from_bytes([9, 10, 11, 12, 13, 14, 15, 16]);
     let ack = ControlPacket {
         opcode: Opcode::AckV1,
-        key_id: 0,
+        key_id: KeyId::FIRST,
         session_id: session,
-        acks: Some(Acks {
-            ids: vec![0, 1],
-            session_id: remote,
-        }),
+        acks: Some(Acks::new(vec![0, 1], remote).expect("two acks fit")),
         packet_id: None,
         payload: Vec::new(),
     };
@@ -186,12 +183,15 @@ fn a_control_packet_round_trips_with_its_tls_payload() {
     let auth = client_auth();
     let packet = ControlPacket {
         opcode: Opcode::ControlV1,
-        key_id: 0,
+        key_id: KeyId::FIRST,
         session_id: SessionId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8]),
-        acks: Some(Acks {
-            ids: vec![0],
-            session_id: SessionId::from_bytes([9, 10, 11, 12, 13, 14, 15, 16]),
-        }),
+        acks: Some(
+            Acks::new(
+                vec![0],
+                SessionId::from_bytes([9, 10, 11, 12, 13, 14, 15, 16]),
+            )
+            .expect("one ack fits"),
+        ),
         packet_id: Some(1),
         payload: b"\x16\x03\x01 a ClientHello would live here".to_vec(),
     };

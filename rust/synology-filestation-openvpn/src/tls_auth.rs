@@ -22,6 +22,7 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
+use zeroize::Zeroizing;
 
 use crate::packet::{ControlPacket, SessionId};
 use crate::static_key::{KeyDirection, StaticKey};
@@ -57,8 +58,11 @@ pub struct TlsAuthHeader {
 /// the reliability layer that is also tracking ids — putting a second,
 /// disagreeing notion of "seen" here would be worse than having none.
 pub struct TlsAuth {
-    out_key: Vec<u8>,
-    in_key: Vec<u8>,
+    /// Copied out of the [`StaticKey`], and zeroized on drop for the same
+    /// reason it is: a key that outlives its owner in freed memory is still a
+    /// key.
+    out_key: Zeroizing<Vec<u8>>,
+    in_key: Zeroizing<Vec<u8>>,
 }
 
 impl TlsAuth {
@@ -66,8 +70,8 @@ impl TlsAuth {
     /// for a client whose config says `key-direction 1`.
     pub fn new(key: &StaticKey, direction: KeyDirection) -> Self {
         Self {
-            out_key: key.out_hmac(direction).to_vec(),
-            in_key: key.in_hmac(direction).to_vec(),
+            out_key: Zeroizing::new(key.out_hmac(direction).to_vec()),
+            in_key: Zeroizing::new(key.in_hmac(direction).to_vec()),
         }
     }
 

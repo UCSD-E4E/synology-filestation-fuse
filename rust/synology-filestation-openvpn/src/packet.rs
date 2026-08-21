@@ -84,6 +84,44 @@ impl Opcode {
     }
 }
 
+/// Which key generation a packet belongs to.
+///
+/// Three bits, sharing the first byte with the opcode. A wider value has
+/// nowhere to go, and masking one down would put a key id on the wire that the
+/// caller did not ask for — answered, like every other malformed packet, with
+/// silence. So the type simply cannot hold one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeyId(u8);
+
+impl KeyId {
+    /// The original key of a session. Zero means *first*, which is why
+    /// [`KeyId::next`] never returns here.
+    pub const FIRST: KeyId = KeyId(0);
+
+    /// `None` if the value does not fit in three bits.
+    pub fn new(value: u8) -> Option<Self> {
+        (value <= KEY_ID_MASK).then_some(Self(value))
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
+    }
+
+    /// The next generation, as a renegotiation would number it.
+    ///
+    /// Counts up to 7 and then recycles to **1**, not to 0: both ends use a
+    /// key id of 0 to recognise the original key, so reusing it after a
+    /// renegotiation would make a fresh key indistinguishable from the first
+    /// one. A tunnel that outlives `reneg-sec` — any large copy — walks this
+    /// cycle for real.
+    pub fn next(self) -> Self {
+        match (self.0 + 1) & KEY_ID_MASK {
+            0 => Self(1),
+            next => Self(next),
+        }
+    }
+}
+
 /// Acknowledgements, and the session they belong to.
 ///
 /// The two travel together on the wire — the peer's session id is written only
@@ -92,19 +130,41 @@ impl Opcode {
 /// which is not a thing that exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Acks {
-    /// Message ids being acknowledged.
-    pub ids: Vec<u32>,
+    ids: Vec<u32>,
+    session_id: SessionId,
+}
+
+impl Acks {
+    /// A packet carries at most this many acknowledgements
+    /// (`RELIABLE_ACK_SIZE`). The count is one byte, so a longer list would
+    /// not merely be rejected — past 255 it would wrap and describe a packet
+    /// that is not the one being sent.
+    pub const MAX: usize = 8;
+
+    pub fn new(ids: Vec<u32>, session_id: SessionId) -> Result<Self, Error> {
+        if ids.len() > Self::MAX {
+            return Err(Error::TooManyAcks { count: ids.len() });
+        }
+        Ok(Self { ids, session_id })
+    }
+
+    /// Message ids being acknowledged. Never longer than [`Acks::MAX`].
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+
     /// The session those ids were seen on: the peer's.
-    pub session_id: SessionId,
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
 }
 
 /// A decoded control packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPacket {
     pub opcode: Opcode,
-    /// Which key generation this belongs to — 0 for the first, then bumped by
-    /// each renegotiation.
-    pub key_id: u8,
+    /// Which key generation this belongs to.
+    pub key_id: KeyId,
     /// The sender's session id.
     pub session_id: SessionId,
     /// Acknowledgements riding along on this packet, if any.
@@ -120,7 +180,7 @@ impl ControlPacket {
     /// has to put in front of the HMAC even though the HMAC covers them.
     pub(crate) fn encode_prefix(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + SessionId::LEN);
-        out.push((self.opcode as u8) << OPCODE_SHIFT | (self.key_id & KEY_ID_MASK));
+        out.push(((self.opcode as u8) << OPCODE_SHIFT) | self.key_id.get());
         out.extend_from_slice(self.session_id.as_bytes());
         out
     }
@@ -130,6 +190,7 @@ impl ControlPacket {
         let mut out = Vec::with_capacity(1 + SessionId::LEN + 4 + self.payload.len());
         match &self.acks {
             Some(acks) => {
+                // `Acks` cannot be longer than `Acks::MAX`, which is 8.
                 out.push(acks.ids.len() as u8);
                 for id in &acks.ids {
                     out.extend_from_slice(&id.to_be_bytes());
@@ -150,7 +211,7 @@ impl ControlPacket {
             context: "an opcode",
         })?;
         let opcode = Opcode::from_u8(header >> OPCODE_SHIFT)?;
-        let key_id = header & KEY_ID_MASK;
+        let key_id = KeyId::new(header & KEY_ID_MASK).expect("three masked bits fit in a KeyId");
 
         let session_id = prefix.get(1..1 + SessionId::LEN).ok_or(Error::Truncated {
             context: "a session id",
@@ -168,10 +229,10 @@ impl ControlPacket {
             for _ in 0..count {
                 ids.push(cursor.u32("an acknowledged packet id")?);
             }
-            Some(Acks {
-                ids,
-                session_id: cursor.session_id()?,
-            })
+            // `Acks::new` is what refuses an oversized array, and it refuses
+            // it for the same reason OpenVPN's own reader does: a peer that
+            // sends nine acks is not a peer we understand.
+            Some(Acks::new(ids, cursor.session_id()?)?)
         } else {
             None
         };

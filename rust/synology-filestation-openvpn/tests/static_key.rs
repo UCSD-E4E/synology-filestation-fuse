@@ -99,12 +99,14 @@ fn a_key_never_prints_itself() {
 
 /// Sign a fixed packet so two keys can be compared by what they do.
 fn signature_with(key: &StaticKey) -> Vec<u8> {
-    use synology_filestation_openvpn::{ControlPacket, KeyDirection, Opcode, SessionId, TlsAuth};
+    use synology_filestation_openvpn::{
+        ControlPacket, KeyDirection, KeyId, Opcode, SessionId, TlsAuth,
+    };
 
     TlsAuth::new(key, KeyDirection::Inverse).wrap(
         &ControlPacket {
             opcode: Opcode::ControlHardResetClientV2,
-            key_id: 0,
+            key_id: KeyId::FIRST,
             session_id: SessionId::from_bytes([0; 8]),
             acks: None,
             packet_id: Some(0),

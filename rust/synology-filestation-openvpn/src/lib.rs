@@ -21,7 +21,7 @@ mod packet;
 mod static_key;
 mod tls_auth;
 
-pub use packet::{Acks, ControlPacket, Opcode, SessionId};
+pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 pub use static_key::{KeyDirection, StaticKey, STATIC_KEY_LEN};
 pub use tls_auth::{TlsAuth, TlsAuthHeader};
 
@@ -39,6 +39,12 @@ pub enum Error {
 
     #[error("unknown packet opcode {0}")]
     UnknownOpcode(u8),
+
+    #[error("a packet carries at most {max} acknowledgements; this one claims {count}", max = crate::Acks::MAX)]
+    TooManyAcks {
+        /// How many the packet claimed to carry.
+        count: usize,
+    },
 
     #[error("packet is not authentic: the tls-auth HMAC does not match")]
     BadHmac,
