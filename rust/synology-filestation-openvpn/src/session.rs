@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 use std::io::{Read, Write};
 
 use crate::channel::ControlChannel;
-use crate::key_method::{ClientKeyMethod2, ServerKeyMethod2};
+use crate::key_method::{ClientKeyMethod2, ServerMessage};
 use crate::packet::SessionId;
 use crate::prf::{key_expansion, KeySource2};
 use crate::static_key::{KeyDirection, StaticKey};
@@ -311,9 +311,12 @@ impl Session {
         let mut buffer = Zeroizing::new([0u8; 2048]);
         loop {
             match self.tls.reader().read(buffer.as_mut()) {
-                Ok(0) => break,
-                Ok(read) => self.inbound.extend_from_slice(&buffer[..read]),
-                // Nothing more to read right now, which is the ordinary case.
+                Ok(read) if read > 0 => self.inbound.extend_from_slice(&buffer[..read]),
+                // A clean close, which is not the same as "nothing right now".
+                // Treating it as the latter would leave us waiting for the
+                // rest of a message from a peer that has finished talking.
+                Ok(_) => return Err(Error::PeerClosed),
+                // Nothing more to read at the moment: the ordinary case.
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 // Anything else is the session failing, and swallowing it
                 // would leave us decoding a buffer that will never grow again.
@@ -321,11 +324,23 @@ impl Session {
             }
         }
 
-        match ServerKeyMethod2::decode(&self.inbound) {
+        match ServerMessage::decode(&self.inbound) {
             // Not all of it is here yet. TLS is a stream, so this is ordinary.
             Err(Error::Truncated { .. }) => Ok(()),
             Err(error) => Err(error),
-            Ok(reply) => {
+
+            // Authentication is the likeliest thing to go wrong, and the
+            // server says so in words rather than by failing the exchange.
+            // Reading it as key material would report the first letters of
+            // "AUTH_FAILED" as a key method number.
+            Ok((ServerMessage::Control(message), _)) => {
+                Err(match message.strip_prefix("AUTH_FAILED") {
+                    Some(detail) => Error::AuthFailed(detail.to_string()),
+                    None => Error::UnexpectedControlMessage(message),
+                })
+            }
+
+            Ok((ServerMessage::KeyMethod2(reply), used)) => {
                 self.source.server_random1 = reply.random1;
                 self.source.server_random2 = reply.random2;
 
@@ -338,11 +353,18 @@ impl Session {
                     self.channel.local_session(),
                     server_session,
                 ));
-                // Replaced rather than cleared: `Vec::clear` sets the
-                // length to zero and leaves the bytes in the allocation, so
-                // the peer's key material would survive in memory that now
-                // looks empty. Dropping the old buffer zeroizes it.
-                self.inbound = Zeroizing::new(Vec::new());
+
+                // Only what the message used. A flight can carry more behind
+                // it — a push reply arrives this way — and dropping the
+                // remainder would lose bytes that rustls has already handed
+                // over and will not hand over again.
+                //
+                // Rebuilt rather than drained in place, because `Vec::drain`
+                // leaves the moved-down bytes in the tail of the same
+                // allocation, where the key material we just consumed would
+                // sit uncleared.
+                let rest = Zeroizing::new(self.inbound[used..].to_vec());
+                self.inbound = rest;
                 self.phase = Phase::Established;
                 Ok(())
             }

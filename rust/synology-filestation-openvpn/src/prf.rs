@@ -79,7 +79,10 @@ pub fn key_expansion(
     // First the master secret, from the pre-master and the *first* randoms.
     // The seed carries material that came out of the TLS session, so it is
     // cleared with everything else rather than left in a freed allocation.
-    let mut seed = Zeroizing::new(Vec::new());
+    // Sized up front for the same reason the message is: growing the buffer
+    // reallocates, and the copy left behind by a reallocation is freed
+    // without being cleared, which would make the `Zeroizing` decorative.
+    let mut seed = Zeroizing::new(Vec::with_capacity(LABEL_PREFIX.len() + 13 + 32 + 32));
     seed.extend_from_slice(LABEL_PREFIX.as_bytes());
     seed.extend_from_slice(b"master secret");
     seed.extend_from_slice(&source.client_random1);
@@ -91,7 +94,9 @@ pub fn key_expansion(
     // Then the keys, from the master and the *second* randoms — plus both
     // session ids, which is what stops two sessions between the same pair
     // deriving the same keys.
-    let mut seed = Zeroizing::new(Vec::new());
+    let mut seed = Zeroizing::new(Vec::with_capacity(
+        LABEL_PREFIX.len() + 13 + 32 + 32 + 2 * SessionId::LEN,
+    ));
     seed.extend_from_slice(LABEL_PREFIX.as_bytes());
     seed.extend_from_slice(b"key expansion");
     seed.extend_from_slice(&source.client_random2);

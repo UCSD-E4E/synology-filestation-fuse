@@ -5,7 +5,9 @@
 //! property that matters: the reader is a real OpenVPN, and it says nothing at
 //! all when a field is a byte out of place.
 
-use synology_filestation_openvpn::{ClientKeyMethod2, Error, KeySource2, ServerKeyMethod2};
+use synology_filestation_openvpn::{
+    ClientKeyMethod2, Error, KeySource2, ServerKeyMethod2, ServerMessage,
+};
 use zeroize::Zeroizing;
 
 fn source() -> KeySource2 {
@@ -92,11 +94,17 @@ fn server_reply(options: &str) -> Vec<u8> {
 
 #[test]
 fn the_server_reply_carries_two_randoms_and_no_pre_master() {
-    let decoded = ServerKeyMethod2::decode(&server_reply("V4,cipher AES-256-CBC")).expect("valid");
+    let (decoded, used) =
+        ServerKeyMethod2::decode(&server_reply("V4,cipher AES-256-CBC")).expect("valid");
 
     assert_eq!(decoded.random1, [0xd4; 32]);
     assert_eq!(decoded.random2, [0xe5; 32]);
     assert_eq!(decoded.options, "V4,cipher AES-256-CBC");
+    assert_eq!(
+        used,
+        server_reply("V4,cipher AES-256-CBC").len(),
+        "all of it"
+    );
 }
 
 #[test]
@@ -135,7 +143,10 @@ fn an_empty_options_string_is_read_as_empty() {
     reply.extend_from_slice(&[0xe5; 32]);
     reply.extend_from_slice(&[0, 0]);
 
-    assert_eq!(ServerKeyMethod2::decode(&reply).expect("valid").options, "");
+    assert_eq!(
+        ServerKeyMethod2::decode(&reply).expect("valid").0.options,
+        ""
+    );
 }
 
 #[test]
@@ -177,4 +188,51 @@ fn a_field_too_long_to_describe_is_refused_rather_than_truncated() {
         },
         "and it says which field, so a caller knows what to shorten"
     );
+}
+
+#[test]
+fn a_refusal_is_read_as_words_rather_than_as_key_material() {
+    // The likeliest thing to go wrong is a mistyped password, and the server
+    // answers that in English rather than by failing the exchange. Decoding it
+    // as a key method reads "AUTH" as the leading zero and the underscore as
+    // the method number, so the person at the keyboard is told the peer
+    // offered key method 95.
+    let mut message = b"AUTH_FAILED,session expired".to_vec();
+    message.push(0);
+
+    let (decoded, used) = ServerMessage::decode(&message).expect("readable");
+
+    assert_eq!(
+        decoded,
+        ServerMessage::Control("AUTH_FAILED,session expired".to_string())
+    );
+    assert_eq!(used, message.len(), "the NUL is part of the message");
+}
+
+#[test]
+fn key_material_and_control_messages_are_told_apart_by_their_first_bytes() {
+    // A key method begins with four zero bytes; a control message begins with
+    // text. Nothing else is needed to tell them apart, which is what makes the
+    // check cheap enough to do before every decode.
+    let reply = server_reply("V4");
+    let (decoded, used) = ServerMessage::decode(&reply).expect("readable");
+
+    assert!(matches!(decoded, ServerMessage::KeyMethod2(_)));
+    assert_eq!(used, reply.len());
+}
+
+#[test]
+fn what_follows_a_reply_in_the_same_flight_is_left_alone() {
+    // The server can put more behind its key material — a push reply arrives
+    // this way. The consumed length is what lets a caller keep the rest
+    // instead of throwing away bytes TLS will not hand over twice.
+    let mut flight = server_reply("V4");
+    let reply_len = flight.len();
+    flight.extend_from_slice(b"PUSH_REPLY,route 10.90.24.0\0");
+
+    let (_, used) = ServerMessage::decode(&flight).expect("readable");
+
+    assert_eq!(used, reply_len, "only the key method was consumed");
+    let (next, _) = ServerMessage::decode(&flight[used..]).expect("and the rest still reads");
+    assert!(matches!(next, ServerMessage::Control(_)));
 }

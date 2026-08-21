@@ -48,7 +48,23 @@ pub struct ClientKeyMethod2<'a> {
 
 impl ClientKeyMethod2<'_> {
     pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
-        let mut out = Vec::new();
+        // Sized up front, before a single secret byte goes in. A growing
+        // `Vec` reallocates, and each reallocation copies the pre-master and
+        // the password into a new block and frees the old one without
+        // clearing it — so wrapping the finished buffer in `Zeroizing` would
+        // protect the one copy that is easiest to find.
+        let mut out = Vec::with_capacity(
+            4 + 1
+                + 48
+                + 32
+                + 32
+                + 2 * 4
+                + self.options.len()
+                + self.username.len()
+                + self.password.len()
+                + self.peer_info.len()
+                + 4,
+        );
         out.extend_from_slice(&0u32.to_be_bytes());
         out.push(KEY_METHOD_2);
         out.extend_from_slice(&self.source.pre_master);
@@ -59,6 +75,51 @@ impl ClientKeyMethod2<'_> {
         write_string(&mut out, self.password, "the password")?;
         write_string(&mut out, self.peer_info, "the peer info")?;
         Ok(Zeroizing::new(out))
+    }
+}
+
+/// Whatever the server sent us over the TLS session.
+///
+/// It is not always key material. If authentication fails — the likeliest
+/// outcome of a mistyped password, and the one a user will actually meet —
+/// the server sends `AUTH_FAILED` as text instead. Reading that as a key
+/// method turns "wrong password" into "peer offered key method 95", which
+/// tells the person at the keyboard nothing.
+///
+/// The two are easy to tell apart: a key method begins with four zero bytes,
+/// and a control message begins with printable text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerMessage {
+    KeyMethod2(ServerKeyMethod2),
+    /// A NUL-terminated control message, such as `AUTH_FAILED`.
+    Control(String),
+}
+
+impl ServerMessage {
+    /// Decode one message, and say how many bytes it used.
+    ///
+    /// The length matters: a flight can carry more than one message, and a
+    /// caller that keeps the remainder needs to know where to resume.
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
+        if bytes.len() < 4 {
+            return Err(Error::Truncated {
+                context: "a message header",
+            });
+        }
+
+        if bytes[..4] != [0, 0, 0, 0] {
+            let end = bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or(Error::Truncated {
+                    context: "a control message",
+                })?;
+            let text = String::from_utf8_lossy(&bytes[..end]).into_owned();
+            return Ok((Self::Control(text), end + 1));
+        }
+
+        let (key_method, used) = ServerKeyMethod2::decode(bytes)?;
+        Ok((Self::KeyMethod2(key_method), used))
     }
 }
 
@@ -79,7 +140,7 @@ impl ServerKeyMethod2 {
     /// [`Error::Truncated`] means "not yet": TLS delivers a stream, so a
     /// caller that has not read the whole message must be able to tell that
     /// apart from a message it will never be able to read.
-    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), Error> {
         let mut reader = Reader::new(bytes);
 
         reader.take(4, "the leading zero")?;
@@ -92,11 +153,14 @@ impl ServerKeyMethod2 {
         let random2 = reader.array("the server's second random")?;
         let options = reader.string("the options string")?;
 
-        Ok(Self {
-            random1,
-            random2,
-            options,
-        })
+        Ok((
+            Self {
+                random1,
+                random2,
+                options,
+            },
+            reader.at,
+        ))
     }
 }
 
