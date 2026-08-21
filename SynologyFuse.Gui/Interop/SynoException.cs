@@ -10,8 +10,9 @@ namespace SynologyFuse.Gui.Interop;
 /// </summary>
 public class SynoException : Exception
 {
-    internal SynoException(NativeMethods.SynoStatus status, uint dsmCode, string message)
-        : base(message)
+    internal SynoException(NativeMethods.SynoStatus status, uint dsmCode, string message,
+        Exception? inner = null)
+        : base(message, inner)
     {
         Status = status;
         DsmCode = dsmCode;
@@ -38,7 +39,7 @@ public sealed class OtpRequiredException : SynoException
 /// <summary>
 /// Raised when the NAS's TLS certificate could not be verified. Distinct from a
 /// generic <see cref="SynoException"/> because it has a specific remedy: trust
-/// the certificate, or tick "Accept self-signed certificate". A DSM appliance
+/// the certificate, or untick "Verify the NAS TLS certificate". A DSM appliance
 /// ships self-signed, so this is the expected first-connect experience for many
 /// users and the message needs to say what to do about it.
 /// </summary>
@@ -58,12 +59,12 @@ public sealed class TlsVerificationException : SynoException
 /// </summary>
 public sealed class MountFailedException : SynoException
 {
+    /// <param name="inner">The failure the native mount call reported. Its
+    /// status, code and message are copied onto this exception so callers can
+    /// read them directly, and it is also chained as <see cref="Exception.InnerException"/>
+    /// so logging and the debugger still see the original stack trace.</param>
     internal MountFailedException(SynoException inner)
-        : base(inner.Status, inner.DsmCode, inner.Message)
+        : base(inner.Status, inner.DsmCode, inner.Message, inner)
     {
-        InnerSynoException = inner;
     }
-
-    /// <summary>The underlying failure, as reported by the native mount call.</summary>
-    internal SynoException InnerSynoException { get; }
 }

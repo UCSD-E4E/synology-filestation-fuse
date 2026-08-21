@@ -163,6 +163,19 @@ public class ErrorPresenterTests
         Assert.DoesNotContain("password", r.Remedy, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public void MountFailure_ChainsTheUnderlyingFailureAsInnerException()
+    {
+        // Generic logging and the debugger both walk InnerException; leaving the
+        // cause only on a bespoke property would drop the original stack trace.
+        var inner = new SynoException(SynoStatus.Io, 0, "mkdir /mnt/nas: permission denied");
+
+        var wrapped = new MountFailedException(inner);
+
+        Assert.Same(inner, wrapped.InnerException);
+        Assert.Equal(inner.DsmCode, wrapped.DsmCode);
+    }
+
     // ── Fallbacks and invariants ──────────────────────────────────────────────
 
     [Fact]

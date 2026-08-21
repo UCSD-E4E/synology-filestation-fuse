@@ -37,7 +37,9 @@ public static class ErrorPresenter
                 "The NAS accepted your credentials — it is the local mount that failed. "
                 + "Check that the mount point exists, is empty and is writable, and that "
                 + "the filesystem driver is installed (FUSE on Linux, WinFsp on Windows).",
-                Detail(mount.InnerSynoException));
+                // The wrapper copies the underlying status, code and message, so
+                // this is the mount call's own failure, not a login one.
+                Detail(mount));
         }
 
         if (ex is not SynoException syno)
