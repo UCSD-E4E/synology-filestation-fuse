@@ -1,0 +1,40 @@
+name: Install FUSE build dependencies
+description: >-
+  Install libfuse3-dev, bounding every apt call so a stalled Ubuntu mirror
+  fails in minutes instead of hanging the job to GitHub's 6-hour ceiling.
+
+runs:
+  using: composite
+  steps:
+    - name: Install libfuse3-dev
+      shell: bash
+      # On 2026-08-19 the Azure apt mirror stopped responding mid-`update`.
+      # Bare `apt-get update` has no default timeout, so five jobs across the
+      # Dependabot PRs sat in the fetch loop until the runner was killed at
+      # 6h00m — burning ~30 CPU-hours and reporting as a dependency failure.
+      #
+      # Two belts: apt's own acquire timeouts so a dead mirror is abandoned
+      # rather than waited on, and an outer `timeout` in case apt wedges
+      # somewhere the acquire settings don't cover.
+      run: |
+        set -uo pipefail
+
+        apt_opts=(
+          -o Acquire::Retries=3
+          -o Acquire::http::Timeout=30
+          -o Acquire::https::Timeout=30
+        )
+
+        for attempt in 1 2 3; do
+          if sudo timeout -k 10 120 apt-get update "${apt_opts[@]}" \
+            && sudo timeout -k 10 120 apt-get install -y "${apt_opts[@]}" libfuse3-dev; then
+            exit 0
+          fi
+          if [ "${attempt}" -eq 3 ]; then break; fi
+          backoff=$((attempt * 15))
+          echo "::warning::apt attempt ${attempt}/3 failed; retrying in ${backoff}s"
+          sleep "${backoff}"
+        done
+
+        echo "::error::apt-get failed after 3 attempts - likely an Ubuntu mirror outage"
+        exit 1

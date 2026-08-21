@@ -10,9 +10,19 @@ jobs:
   flake-check:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      # Needed only by the "push refreshed nix/deps.json" step below, and only
+      # on same-repo pull requests. Dependabot-triggered runs start read-only;
+      # declaring it here is what raises them.
+      contents: write
 
     steps:
     - uses: actions/checkout@v7
+      with:
+        # The NuGet-manifest diff below needs the base branch present.
+        fetch-depth: 0
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
     # Caches /nix/store across runs (keyed on the flake lockfile) so the heavy
@@ -22,7 +32,66 @@ jobs:
       with:
         primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/deps.json') }}
         restore-prefixes-first-match: nix-${{ runner.os }}-
+
+    # ── Keep nix/deps.json in step with the .csproj files ─────────────────
+    # Dependabot bumps a <PackageReference> but has no idea that nix/deps.json
+    # pins the same packages for buildDotnetModule's fixed-output NuGet fetch.
+    # The mismatch surfaced as a bare NU1102 buried in the nix build log on
+    # PRs #174/#175. Regenerating *before* the check means the flake is tested
+    # against the correct lockfile and the branch is repaired in the same run —
+    # a commit pushed with GITHUB_TOKEN does not start a new run, so a
+    # fix-then-rerun design would still need someone to click the button.
+    - name: Detect NuGet manifest changes
+      id: nuget
+      if: github.event_name == 'pull_request'
+      # Branch names reach the shell only through the environment — they are
+      # attacker-controllable and must never be interpolated into a script.
+      env:
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -q '\.csproj$'; then
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Refresh nix/deps.json
+      if: steps.nuget.outputs.changed == 'true'
+      run: |
+        script=$(nix build .#synologyfuse-gui.fetch-deps --no-link --print-out-paths)
+        "$script" "${PWD}/nix/deps.json"
+        git --no-pager diff --stat -- nix/deps.json
+
     # Runs the CLI build, clippy (-D warnings), rustfmt, and the GUI build +
     # test suite — i.e. every `checks.x86_64-linux.*` output in the flake.
     - name: nix flake check
       run: nix flake check -L
+
+    - name: Push refreshed nix/deps.json
+      # Fork PRs are excluded deliberately: they must never see a write token.
+      if: >-
+        steps.nuget.outputs.changed == 'true'
+        && github.event.pull_request.head.repo.full_name == github.repository
+      env:
+        HEAD_REF: ${{ github.head_ref }}
+      run: |
+        if git diff --quiet -- nix/deps.json; then
+          echo "nix/deps.json was already current; nothing to push."
+          exit 0
+        fi
+
+        # checkout@v7 leaves us on the PR *merge* commit. Carry just the one
+        # file over to the real head branch so the push doesn't drag the base
+        # branch's commits along with it.
+        cp nix/deps.json "${RUNNER_TEMP}/deps.json"
+        git checkout -- nix/deps.json
+        git fetch origin "+refs/heads/${HEAD_REF}:refs/remotes/origin/${HEAD_REF}"
+        git checkout -B "${HEAD_REF}" "refs/remotes/origin/${HEAD_REF}"
+        cp "${RUNNER_TEMP}/deps.json" nix/deps.json
+
+        if git diff --quiet -- nix/deps.json; then
+          echo "Head branch already carries the refreshed deps.json."
+          exit 0
+        fi
+
+        git config user.name 'github-actions[bot]'
+        git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        git commit -m 'build(nix): regenerate deps.json for the NuGet bump' -- nix/deps.json
+        git push origin "${HEAD_REF}"

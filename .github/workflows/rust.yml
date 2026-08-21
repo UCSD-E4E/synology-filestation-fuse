@@ -13,11 +13,12 @@ jobs:
   lint:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
     - uses: actions/checkout@v7
     - name: Install Dependencies
-      run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      uses: ./.github/actions/install-fuse-deps
     - name: Rust formatting (cargo fmt)
       run: cargo fmt --all -- --check
     - name: Set up .NET 10
@@ -30,11 +31,12 @@ jobs:
   build-linux:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v7
     - name: Install Dependencies
-      run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      uses: ./.github/actions/install-fuse-deps
     # We restrict Rust CI to the FUSE crate + its `core` library dependency.
     # The Python crate (`python/synology_filestation`) has its own workflow
     # (`python.yml` / `maturin.yml`) and pulling it in here would require
@@ -94,6 +96,7 @@ jobs:
   build-macos:
 
     runs-on: macos-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v7
@@ -131,6 +134,7 @@ jobs:
   build-windows:
 
     runs-on: windows-latest
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v7
