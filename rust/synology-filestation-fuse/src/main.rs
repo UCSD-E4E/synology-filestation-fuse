@@ -129,6 +129,29 @@ struct Args {
     smb_domain: Option<String>,
 }
 
+/// Predates `--disable-smb`; mounts in the field are configured with it.
+const SMB_DISABLE_ENV: &str = "SYNOLOGY_FS_SMB_DISABLE";
+/// Predates the chain, and governed the SMB connect. It governs the probe too,
+/// so one knob still means one thing.
+const SMB_TIMEOUT_ENV: &str = "SYNOLOGY_FS_SMB_TIMEOUT_MS";
+
+/// Whether SMB may be tried at all.
+///
+/// The environment variable has to reach the *policy*, not just the SMB
+/// connect: the chain probes first, so a mount that set it would otherwise pay
+/// the connect timeout it was trying to avoid and then report a transport it
+/// is not using.
+fn smb_disabled(flag: bool, env: Option<std::ffi::OsString>) -> bool {
+    flag || env.is_some()
+}
+
+/// How long the probe waits for port 445.
+fn probe_timeout(env: Option<String>) -> Duration {
+    env.and_then(|s| s.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(2))
+}
+
 /// Parse a umask the way `umask(1)` and every mount helper do: octal, with no
 /// `0o` prefix required. Base 10 would silently turn the near-universal `022`
 /// into 0o026.
@@ -240,9 +263,12 @@ fn main() -> anyhow::Result<()> {
     // Which way to reach the NAS: SMB, SMB through a tunnel, or the HTTP API.
     // The chain decides once and the mount lives with it; `--disable-*` says
     // which legs it may consider at all.
-    let policy =
-        TransportPolicy::from_flags(args.disable_smb, args.disable_vpn, args.disable_https)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let policy = TransportPolicy::from_flags(
+        smb_disabled(args.disable_smb, std::env::var_os(SMB_DISABLE_ENV)),
+        args.disable_vpn,
+        args.disable_https,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let endpoints = match &args.vpn_host {
         Some(inside) => Endpoints::with_tunnel(&args.host, inside),
         None => Endpoints::public_only(&args.host),
@@ -250,7 +276,9 @@ fn main() -> anyhow::Result<()> {
     let chain = Chain::new(
         policy,
         endpoints,
-        Box::new(TcpProber::new(Duration::from_secs(2))),
+        Box::new(TcpProber::new(probe_timeout(
+            std::env::var(SMB_TIMEOUT_ENV).ok(),
+        ))),
         // Driving OpenVPN needs a privileged component per platform and is not
         // built yet, so an escalation is currently something a user arranges
         // themselves — the probe then finds SMB at `--vpn-host` and this mount
@@ -300,7 +328,8 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_umask;
+    use super::{parse_umask, probe_timeout, smb_disabled};
+    use std::time::Duration;
 
     /// `--umask 022` must mean 0o022. Parsed as decimal it would be 0o026,
     /// quietly stripping group/other permissions the user never asked to drop.
@@ -341,5 +370,37 @@ mod tests {
         // Nothing left to carry the data: refused at startup rather than
         // mounting something that cannot answer a read.
         assert!(TransportPolicy::from_flags(true, false, true).is_err());
+    }
+
+    /// The environment variable that predates `--disable-smb` has to reach the
+    /// policy, not just the SMB connect. The chain probes first, so a mount
+    /// that set it would otherwise pay the connect timeout it was avoiding —
+    /// and then log a transport it is not using.
+    ///
+    /// Pure, so the suite never mutates the process environment: that is
+    /// global state shared with every other test.
+    #[test]
+    fn the_old_disable_variable_still_turns_smb_off() {
+        use std::ffi::OsString;
+
+        assert!(!smb_disabled(false, None));
+        assert!(smb_disabled(true, None), "the flag alone");
+        assert!(
+            smb_disabled(false, Some(OsString::from("1"))),
+            "the variable alone"
+        );
+        // Its value never mattered; being set is the signal.
+        assert!(smb_disabled(false, Some(OsString::from(""))));
+    }
+
+    #[test]
+    fn the_probe_waits_as_long_as_the_smb_connect_would() {
+        assert_eq!(probe_timeout(None), Duration::from_secs(2));
+        assert_eq!(
+            probe_timeout(Some("500".into())),
+            Duration::from_millis(500)
+        );
+        // Nonsense falls back rather than failing the mount over a typo.
+        assert_eq!(probe_timeout(Some("soon".into())), Duration::from_secs(2));
     }
 }

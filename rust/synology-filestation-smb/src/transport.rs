@@ -225,10 +225,16 @@ pub async fn auto_connect_as(
         return None;
     }
     let mut cfg = SmbConfig::from_login(host, username, password);
-    if let Some(domain) = domain.filter(|d| !d.is_empty()) {
-        cfg.domain = domain.to_string();
-    } else if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
-        cfg.domain = domain;
+    // `Some("")` is an explicit answer, not an absent one: an empty domain is
+    // how a local DSM user is named, so it has to be able to override an
+    // environment variable back to none.
+    match domain {
+        Some(domain) => cfg.domain = domain.to_string(),
+        None => {
+            if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
+                cfg.domain = domain;
+            }
+        }
     }
     if let Some(port) = std::env::var("SYNOLOGY_FS_SMB_PORT")
         .ok()
