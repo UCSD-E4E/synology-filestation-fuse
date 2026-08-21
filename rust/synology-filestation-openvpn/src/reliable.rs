@@ -229,7 +229,11 @@ pub struct RecvWindow {
     buffered: BTreeMap<u32, (Opcode, Vec<u8>)>,
     /// The id we are waiting for; everything below it has been delivered.
     next_expected: u32,
+    /// Ids that have not been acknowledged to the peer yet.
     pending_acks: Vec<u32>,
+    /// Ids acknowledged recently, newest first, kept so they can be
+    /// acknowledged *again* — see [`RecvWindow::take_acks`].
+    recent_acks: Vec<u32>,
 }
 
 impl RecvWindow {
@@ -238,11 +242,16 @@ impl RecvWindow {
     /// OpenVPN refuses in order to avoid a deadlock — so do we.
     pub const CAPACITY: usize = 12;
 
+    /// How many already-sent acknowledgements to keep for re-sending, which is
+    /// the size of OpenVPN's `ack_mru` (`RELIABLE_ACK_SIZE`).
+    const RECENT_ACKS: usize = 8;
+
     pub fn new() -> Self {
         Self {
             buffered: BTreeMap::new(),
             next_expected: 0,
             pending_acks: Vec::new(),
+            recent_acks: Vec::new(),
         }
     }
 
@@ -285,13 +294,24 @@ impl RecvWindow {
         !self.pending_acks.is_empty()
     }
 
-    /// Up to `max` ids to acknowledge, oldest first, removed as they are taken.
+    /// Up to `max` ids to put on the next outgoing packet.
+    ///
+    /// Not a drain. An acknowledgement travels inside a datagram, and that
+    /// datagram can be lost like any other — so ids already acknowledged are
+    /// kept and sent again whenever there is room, which is what OpenVPN's
+    /// `ack_mru` is for (`copy_acks_to_mru`). Draining instead means one lost
+    /// datagram silently withdraws an acknowledgement, and the peer
+    /// retransmits a message we have had all along.
     ///
     /// `max` is the caller's, because how many fit depends on the packet they
     /// are riding on — see [`crate::Acks::MAX`].
     pub fn take_acks(&mut self, max: usize) -> Vec<u32> {
-        let taken = self.pending_acks.len().min(max);
-        self.pending_acks.drain(..taken).collect()
+        let taking = self.pending_acks.len().min(max);
+        for id in self.pending_acks.drain(..taking).rev() {
+            self.recent_acks.insert(0, id);
+        }
+        self.recent_acks.truncate(Self::RECENT_ACKS);
+        self.recent_acks.iter().take(max).copied().collect()
     }
 
     /// Only the *upper* bound is checked, matching `reliable_pid_in_range2`:

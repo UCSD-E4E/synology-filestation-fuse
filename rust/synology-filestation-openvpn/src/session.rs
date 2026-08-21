@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use zeroize::Zeroizing;
 
 use crate::channel::ControlChannel;
 use crate::packet::SessionId;
@@ -72,7 +73,10 @@ pub struct SessionConfig {
 /// A certificate chain and its key, for a server that asks.
 pub struct ClientAuth {
     pub cert_chain_pem: String,
-    pub private_key_pem: String,
+    /// Zeroized on drop, like every other key in this crate. rustls keeps its
+    /// own copy of the parsed key and that one is out of our hands, so this
+    /// removes one copy rather than all of them.
+    pub private_key_pem: Zeroizing<String>,
 }
 
 impl SessionConfig {
@@ -160,7 +164,11 @@ impl Session {
     /// caller sleeping on the window alone would stall the handshake it is
     /// trying to drive.
     pub fn next_wakeup(&self, now: Instant) -> Option<Instant> {
-        if self.tls.wants_write() || !self.outbox.is_empty() {
+        // Only when the channel could actually take the bytes. Bytes held back
+        // by a full window are a reason to wait for an acknowledgement, not a
+        // reason to be woken immediately — a caller told otherwise would call
+        // `poll_transmit`, get nothing, and come straight back.
+        if self.channel.can_send() && (self.tls.wants_write() || !self.outbox.is_empty()) {
             return Some(now);
         }
         self.channel.next_wakeup(now)
@@ -320,6 +328,28 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(session.next_wakeup(now), Some(now));
+    }
+
+    #[test]
+    fn a_full_send_window_is_a_reason_to_wait_rather_than_spin() {
+        // Bytes held back by a full window are not work that can be done now.
+        // Reporting them as due would have an event loop call `poll_transmit`,
+        // get nothing, and come straight back — a busy wait dressed as a
+        // wakeup.
+        let mut session = test_session();
+        let now = Instant::now();
+        session
+            .outbox
+            .push(&vec![0u8; MAX_TLS_FRAGMENT * (SendWindow::CAPACITY + 1)]);
+        session.outbox.drain_into(&mut session.channel);
+        while session.channel.poll_transmit(now, 0).is_some() {}
+
+        assert!(!session.outbox.is_empty(), "a fragment is still waiting");
+        let wakeup = session.next_wakeup(now).expect("the window will move");
+        assert!(
+            wakeup > now,
+            "wait for an acknowledgement rather than spinning on a full window"
+        );
     }
 
     #[test]

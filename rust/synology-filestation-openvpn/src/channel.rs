@@ -31,6 +31,9 @@ pub struct ControlChannel {
     next_replay_id: u32,
     /// The same counter in the other direction, as the peer sends it.
     replay: ReplayWindow,
+    /// Whether we opened this session, which decides how strict we are about
+    /// the first packet back.
+    opened: bool,
 }
 
 impl ControlChannel {
@@ -44,11 +47,17 @@ impl ControlChannel {
             recv: RecvWindow::new(),
             next_replay_id: 1,
             replay: ReplayWindow::new(),
+            opened: false,
         }
     }
 
     /// Begin a session by queueing the opening reset.
+    ///
+    /// This also decides what we will accept back. Having opened a session, the
+    /// only packet that can legitimately be its first answer is the server
+    /// reset that acknowledges it — see [`ControlChannel::handle`].
     pub fn open(&mut self) {
+        self.opened = true;
         self.send
             .queue(Opcode::ControlHardResetClientV2, Vec::new());
     }
@@ -67,14 +76,31 @@ impl ControlChannel {
         self.remote_session
     }
 
+    /// Whether the send window has room for another message.
+    ///
+    /// A caller deciding when to wake needs this: bytes waiting for a full
+    /// window are not a reason to be polled now, they are a reason to wait for
+    /// the window to move.
+    pub fn can_send(&self) -> bool {
+        !self.send.is_full()
+    }
+
     /// The next datagram to put on the wire, if there is one.
     ///
     /// `net_time` is what goes in the packet's replay header: the sender's
     /// clock in seconds since the epoch, truncated to 32 bits.
     pub fn poll_transmit(&mut self, now: Instant, net_time: u32) -> Option<Vec<u8>> {
+        // Decide whether there is anything to send *before* collecting
+        // acknowledgements. `take_acks` also offers ids already sent, so
+        // asking it first would make every call look like it had something to
+        // say, and a caller polling until `None` would never stop.
+        let due = self.send.next_due(now);
+        if due.is_none() && !self.recv.owes_acks() {
+            return None;
+        }
         let acks = self.take_acks();
 
-        let packet = match self.send.next_due(now) {
+        let packet = match due {
             Some(outgoing) => ControlPacket {
                 opcode: outgoing.opcode,
                 key_id: self.key_id,
@@ -140,10 +166,39 @@ impl ControlChannel {
         // to reject must not settle it first — that would lock the channel
         // onto a peer it has just refused, and the real server would then be
         // turned away as an impostor for the rest of the session.
-        if let Some(known) = self.remote_session {
-            if known != packet.session_id {
-                return Err(Error::WrongSession);
+        match self.remote_session {
+            Some(known) if known != packet.session_id => return Err(Error::WrongSession),
+            Some(_) => {}
+            // Nothing is known about the peer yet, so this packet is about to
+            // decide it — which makes it the one worth being strict about. We
+            // are always the side that opens a session, so the only thing that
+            // can legitimately answer is a server reset acknowledging ours.
+            //
+            // Without this, a datagram captured from an *earlier* session is
+            // still authentic and still passes a replay window that was
+            // created along with this channel, and it would latch us onto a
+            // peer that is not there — after which the real server is refused
+            // as an impostor. Requiring the acknowledgement is what makes the
+            // rule bite: a captured reset acknowledges a session id we no
+            // longer have, and ours is random.
+            None if self.opened => {
+                // Two conditions, and the acknowledgement is the one doing
+                // the work: our session id is random, so a packet captured
+                // from an earlier session acknowledges an id we no longer
+                // have. Requiring a *reset* on top of that means the first
+                // packet has to be one that opens a session at all, rather
+                // than a stray control packet that happens to carry acks.
+                let answers_our_open = matches!(
+                    packet.opcode,
+                    Opcode::ControlHardResetServerV2 | Opcode::ControlHardResetClientV2
+                ) && packet.acks.is_some();
+                if !answers_our_open {
+                    return Err(Error::UnexpectedFirstPacket);
+                }
             }
+            // A channel that has not opened anything has no expectation to
+            // hold the first packet to.
+            None => {}
         }
         if let Some(acks) = &packet.acks {
             if acks.session_id() != self.local_session {

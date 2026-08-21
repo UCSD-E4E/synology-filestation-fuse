@@ -183,6 +183,25 @@ fn an_owed_acknowledgement_asks_to_be_sent_now() {
 }
 
 #[test]
+fn an_acknowledgement_already_sent_is_not_a_reason_to_send_again() {
+    // Recent acknowledgements are offered again when a packet is going out
+    // anyway, which is not the same as being worth a packet of their own. Get
+    // that wrong and every call has something to say: a caller polling until
+    // `None` never stops, and the peer is buried in bare acks.
+    let now = Instant::now();
+    let (mut client, _) = handshaken(now);
+
+    client
+        .poll_transmit(now, 0)
+        .expect("the ack we owe the server");
+
+    assert!(
+        client.poll_transmit(now, 0).is_none(),
+        "and then there is nothing left to say"
+    );
+}
+
+#[test]
 fn acknowledgements_ride_along_on_the_next_real_packet() {
     // A bare ack costs a datagram. If there is something to say anyway, the
     // acks belong on it — which is why the ack block sits inside every control
@@ -259,21 +278,21 @@ fn a_packet_from_a_different_session_is_refused() {
 fn an_acknowledgement_addressed_to_another_session_is_refused() {
     // The ack block names the session whose messages are being acknowledged.
     // Accepting one addressed elsewhere would let a stray packet clear
-    // messages that are still in flight.
+    // messages of ours that are still in flight.
     let now = Instant::now();
-    let mut client = client();
-    client.open();
-    client.poll_transmit(now, 0).expect("our reset");
+    let (mut client, _) = handshaken(now);
+    client.send_control(b"in flight".to_vec());
+    client.poll_transmit(now, 0).expect("sent");
 
     let elsewhere = ControlPacket {
         opcode: Opcode::AckV1,
         key_id: KeyId::FIRST,
         session_id: SERVER_SESSION,
-        acks: Some(Acks::new(vec![0], SessionId::from_bytes([0xaa; 8])).expect("one ack fits")),
+        acks: Some(Acks::new(vec![1], SessionId::from_bytes([0xaa; 8])).expect("one ack fits")),
         packet_id: None,
         payload: Vec::new(),
     };
-    let datagram = TlsAuth::new(&key(), KeyDirection::Normal).wrap(&elsewhere, 1, 0);
+    let datagram = TlsAuth::new(&key(), KeyDirection::Normal).wrap(&elsewhere, 2, 0);
 
     assert_eq!(
         client.handle(&datagram, now).unwrap_err(),
@@ -282,7 +301,7 @@ fn an_acknowledgement_addressed_to_another_session_is_refused() {
     );
     assert!(
         client.poll_transmit(now + TLS_TIMEOUT, 0).is_some(),
-        "our reset is still outstanding, because that ack was not ours"
+        "our message is still outstanding, because that ack was not ours"
     );
 }
 
@@ -305,6 +324,61 @@ fn each_datagram_gets_its_own_tls_auth_packet_id() {
         "OpenVPN starts this count at one"
     );
     assert_eq!(read(&again).1.packet_id, 2);
+}
+
+#[test]
+fn only_a_server_reset_answering_ours_can_open_a_session() {
+    // The replay window is created with the channel, so it knows nothing about
+    // what a previous session saw. A datagram captured then is still
+    // authentic, still passes that window, and would otherwise latch us onto a
+    // peer that is not there — after which the real server is refused as an
+    // impostor.
+    //
+    // We are always the side that opens, so there is exactly one thing that
+    // can legitimately arrive first.
+    let now = Instant::now();
+    let signer = TlsAuth::new(&key(), KeyDirection::Normal);
+
+    let from_an_old_session = ControlPacket {
+        opcode: Opcode::ControlV1,
+        key_id: KeyId::FIRST,
+        session_id: SessionId::from_bytes([0xda; 8]),
+        acks: None,
+        packet_id: Some(0),
+        payload: b"bytes from a session that has ended".to_vec(),
+    };
+
+    let mut opened = client();
+    opened.open();
+    opened.poll_transmit(now, 0).expect("our reset");
+    assert_eq!(
+        opened
+            .handle(&signer.wrap(&from_an_old_session, 1, 0), now)
+            .unwrap_err(),
+        Error::UnexpectedFirstPacket
+    );
+    assert_eq!(opened.remote_session(), None, "so it decided nothing");
+
+    // Even a reset is not enough on its own: the one that belongs to *this*
+    // session is the one that acknowledges the reset we just sent, and a
+    // captured one acknowledges a session id we no longer have.
+    let unsolicited_reset = ControlPacket {
+        opcode: Opcode::ControlHardResetServerV2,
+        acks: None,
+        payload: Vec::new(),
+        ..from_an_old_session
+    };
+
+    let mut opened = client();
+    opened.open();
+    opened.poll_transmit(now, 0).expect("our reset");
+    assert_eq!(
+        opened
+            .handle(&signer.wrap(&unsolicited_reset, 1, 0), now)
+            .unwrap_err(),
+        Error::UnexpectedFirstPacket
+    );
+    assert_eq!(opened.remote_session(), None);
 }
 
 #[test]

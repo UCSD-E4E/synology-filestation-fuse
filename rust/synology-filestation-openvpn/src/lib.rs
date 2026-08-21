@@ -66,6 +66,9 @@ pub enum Error {
     #[error("packet has already been seen, or is too old to prove otherwise")]
     Replayed,
 
+    #[error("the first packet of a session must be a server reset acknowledging ours")]
+    UnexpectedFirstPacket,
+
     #[error("TLS: {0}")]
     Tls(String),
 

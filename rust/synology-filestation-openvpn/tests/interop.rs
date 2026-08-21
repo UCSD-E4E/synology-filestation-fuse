@@ -297,7 +297,7 @@ fn a_tls_handshake_completes_over_the_control_channel() {
     // deployment's.
     config.client_auth = Some(ClientAuth {
         cert_chain_pem: server.pki.client_cert_pem.clone(),
-        private_key_pem: server.pki.client_key_pem.clone(),
+        private_key_pem: zeroize::Zeroizing::new(server.pki.client_key_pem.clone()),
     });
 
     let mut session = Session::new(config).expect("a client");
@@ -309,7 +309,11 @@ fn a_tls_handshake_completes_over_the_control_channel() {
     while Instant::now() < deadline && session.is_handshaking() {
         let now = Instant::now();
         while let Some(datagram) = session.poll_transmit(now, net_time()) {
-            socket.send(&datagram).expect("send");
+            // A refusal here means the peer is gone, and why it went is in its
+            // log rather than in the errno.
+            socket
+                .send(&datagram)
+                .unwrap_or_else(|error| panic!("{error}\n--- openvpn log ---\n{}", server.log()));
         }
 
         match socket.recv(&mut buf) {

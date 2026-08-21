@@ -310,15 +310,37 @@ fn a_message_too_far_ahead_is_dropped_without_acknowledgement() {
 }
 
 #[test]
-fn acknowledgements_are_handed_out_in_packet_sized_batches() {
+fn acknowledgements_are_repeated_rather_than_spent() {
+    // An acknowledgement rides inside a datagram, and that datagram can be
+    // lost like any other. Handing each id out once means a single loss
+    // silently withdraws an acknowledgement, and the peer goes on
+    // retransmitting a message we have had all along — so ids already sent are
+    // kept and offered again whenever there is room. This is OpenVPN's
+    // `ack_mru`, newest first.
     let mut window = RecvWindow::new();
     for id in 0..5 {
         window.accept(id, Opcode::ControlV1, payload(id as u8));
     }
 
-    assert_eq!(window.take_acks(3), vec![0, 1, 2], "oldest first");
-    assert_eq!(window.take_acks(3), vec![3, 4]);
-    assert_eq!(window.take_acks(3), Vec::<u32>::new(), "and then nothing");
+    assert_eq!(
+        window.take_acks(3),
+        vec![0, 1, 2],
+        "the oldest three, in order"
+    );
+    assert_eq!(
+        window.take_acks(3),
+        vec![3, 4, 0],
+        "the two still waiting, and room for one already sent"
+    );
+    assert_eq!(
+        window.take_acks(3),
+        vec![3, 4, 0],
+        "with nothing new to say, it says the recent ones again"
+    );
+    assert!(
+        !window.owes_acks(),
+        "though repeating them is not a reason to send a packet of its own"
+    );
 }
 
 #[test]
