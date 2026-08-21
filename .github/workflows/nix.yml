@@ -6,13 +6,31 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# flake-check builds untrusted code and gets nothing but read. Only the
+# push-back job below raises itself to write.
+permissions:
+  contents: read
+
 jobs:
   flake-check:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    outputs:
+      deps-changed: ${{ steps.regen.outputs.changed }}
 
     steps:
     - uses: actions/checkout@v7
+      with:
+        # The NuGet-manifest diff below needs the base branch present.
+        fetch-depth: 0
+        # `nix flake check` builds this tree *and* its third-party
+        # dependencies, which run arbitrary code at build time (MSBuild
+        # targets, build.rs). A token left in .git/config is readable by all
+        # of it, which is how a poisoned dependency turns into a push. Nothing
+        # in this job needs to authenticate to git.
+        persist-credentials: false
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
     # Caches /nix/store across runs (keyed on the flake lockfile) so the heavy
@@ -22,7 +40,88 @@ jobs:
       with:
         primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/deps.json') }}
         restore-prefixes-first-match: nix-${{ runner.os }}-
+
+    # ── Keep nix/deps.json in step with the .csproj files ─────────────────
+    # Dependabot bumps a <PackageReference> but has no idea that nix/deps.json
+    # pins the same packages for buildDotnetModule's fixed-output NuGet fetch.
+    # The mismatch surfaced as a bare NU1102 buried in the nix build log on
+    # PRs #174/#175. Regenerating *before* the check means the flake is tested
+    # against the correct lockfile and the branch is repaired in the same run —
+    # a commit pushed with GITHUB_TOKEN does not start a new run, so a
+    # fix-then-rerun design would still need someone to click the button.
+    - name: Detect NuGet manifest changes
+      id: nuget
+      if: github.event_name == 'pull_request'
+      # Branch names reach the shell only through the environment — they are
+      # attacker-controllable and must never be interpolated into a script.
+      env:
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -q '\.csproj$'; then
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Refresh nix/deps.json
+      id: regen
+      if: steps.nuget.outputs.changed == 'true'
+      run: |
+        script=$(nix build .#synologyfuse-gui.fetch-deps --no-link --print-out-paths)
+        "$script" "${PWD}/nix/deps.json"
+        if git diff --quiet -- nix/deps.json; then
+          echo "nix/deps.json was already current."
+        else
+          git --no-pager diff --stat -- nix/deps.json
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+        fi
+
     # Runs the CLI build, clippy (-D warnings), rustfmt, and the GUI build +
     # test suite — i.e. every `checks.x86_64-linux.*` output in the flake.
     - name: nix flake check
       run: nix flake check -L
+
+    - name: Upload refreshed nix/deps.json
+      if: steps.regen.outputs.changed == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: nix-deps-json
+        path: nix/deps.json
+        retention-days: 1
+
+  # Split out so the write token never exists in the environment that built the
+  # PR's code: this job runs no part of the tree, and the only thing crossing
+  # the boundary is a JSON lockfile.
+  push-deps:
+
+    needs: flake-check
+    # Fork PRs are excluded deliberately: they must never see a write token.
+    # (GitHub already forces their token read-only, but the intent belongs in
+    # the workflow rather than resting on that.)
+    if: >-
+      needs.flake-check.outputs.deps-changed == 'true'
+      && github.event.pull_request.head.repo.full_name == github.repository
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ github.head_ref }}
+    - uses: actions/download-artifact@v7
+      with:
+        name: nix-deps-json
+        path: nix/
+    - name: Commit refreshed nix/deps.json
+      env:
+        HEAD_REF: ${{ github.head_ref }}
+      run: |
+        if git diff --quiet -- nix/deps.json; then
+          echo "Head branch already carries the refreshed deps.json."
+          exit 0
+        fi
+        git config user.name 'github-actions[bot]'
+        git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        git commit -m 'build(nix): regenerate deps.json for the NuGet bump' -- nix/deps.json
+        git push origin "HEAD:refs/heads/${HEAD_REF}"
