@@ -1,6 +1,11 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+use synology_filestation_connect::{
+    Chain, Endpoints, NoTunnel, TcpProber, TransportPolicy, DEFAULT_RECHECK,
+};
 
 use clap::Parser;
 use tracing::info;
@@ -94,6 +99,34 @@ struct Args {
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Never try SMB. Disabling means *not probing*: on a network that
+    /// black-holes port 445 this also saves the connect timeout. It implies
+    /// `--disable-vpn`, since a tunnel exists to make SMB reachable
+    #[arg(long)]
+    disable_smb: bool,
+
+    /// Never bring up the tunnel. SMB is still tried directly, so a mount on
+    /// campus is unaffected; off campus this falls straight to HTTPS with no
+    /// tunnel prompt
+    #[arg(long)]
+    disable_vpn: bool,
+
+    /// Never fall back to the HTTP FileStation API. With SMB unreachable the
+    /// mount then fails loudly instead of quietly using a transport that
+    /// cannot resume an interrupted transfer
+    #[arg(long)]
+    disable_https: bool,
+
+    /// The NAS's address *inside* the tunnel, which its public name does not
+    /// resolve to (the tunnel pushes no DNS). On e4e-nas this is 10.90.24.1
+    #[arg(long)]
+    vpn_host: Option<String>,
+
+    /// NetBIOS domain for SMB, e.g. `KRG` for an AD account. Falls back to
+    /// `SYNOLOGY_FS_SMB_DOMAIN`, then to none for a local DSM user
+    #[arg(long, env = "SYNOLOGY_FS_SMB_DOMAIN")]
+    smb_domain: Option<String>,
 }
 
 /// Parse a umask the way `umask(1)` and every mount helper do: octal, with no
@@ -204,15 +237,44 @@ fn main() -> anyhow::Result<()> {
 
     info!("Logged in successfully");
 
-    // Transparently prefer SMB for the mount's reads/writes when the NAS's SMB
-    // service is reachable — this bypasses synoscgi entirely. Silently HTTP-only
-    // otherwise. Injected before the client is shared, since it consumes it.
-    let client = Arc::new(rt.block_on(synology_filestation_smb::auto_attach(
-        client,
-        &args.host,
-        &args.username,
-        &password,
-    )));
+    // Which way to reach the NAS: SMB, SMB through a tunnel, or the HTTP API.
+    // The chain decides once and the mount lives with it; `--disable-*` says
+    // which legs it may consider at all.
+    let policy =
+        TransportPolicy::from_flags(args.disable_smb, args.disable_vpn, args.disable_https)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let endpoints = match &args.vpn_host {
+        Some(inside) => Endpoints::with_tunnel(&args.host, inside),
+        None => Endpoints::public_only(&args.host),
+    };
+    let chain = Chain::new(
+        policy,
+        endpoints,
+        Box::new(TcpProber::new(Duration::from_secs(2))),
+        // Driving OpenVPN needs a privileged component per platform and is not
+        // built yet, so an escalation is currently something a user arranges
+        // themselves — the probe then finds SMB at `--vpn-host` and this mount
+        // uses it.
+        Box::new(NoTunnel),
+        DEFAULT_RECHECK,
+    );
+    let route = rt
+        .block_on(chain.route())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    info!("Transport: {}", route.transport);
+
+    // SMB is attached only when the route says so, and at the address the route
+    // gives — inside the tunnel that is not the host the user typed.
+    let client = Arc::new(match &route.smb_host {
+        Some(smb_host) => rt.block_on(synology_filestation_smb::auto_attach_as(
+            client,
+            smb_host,
+            &args.username,
+            &password,
+            args.smb_domain.as_deref(),
+        )),
+        None => client,
+    });
 
     let opts = MountOptions {
         cache_ttl: args.cache_ttl,
@@ -255,5 +317,29 @@ mod tests {
         assert!(parse_umask("1777").is_err());
         assert!(parse_umask("088").is_err(), "8 is not an octal digit");
         assert!(parse_umask("rwx").is_err());
+    }
+
+    /// The three `--disable-*` flags map onto the chain's policy, including
+    /// the implication that matters: without SMB there is nothing for a tunnel
+    /// to reach, so it is not dialled either.
+    #[test]
+    fn the_disable_flags_describe_which_legs_may_be_tried() {
+        use synology_filestation_connect::TransportPolicy;
+
+        let all = TransportPolicy::from_flags(false, false, false).unwrap();
+        assert!(all.allows_smb() && all.allows_vpn() && all.allows_https());
+
+        let no_smb = TransportPolicy::from_flags(true, false, false).unwrap();
+        assert!(!no_smb.allows_smb());
+        assert!(!no_smb.allows_vpn(), "a tunnel exists to reach SMB");
+        assert!(no_smb.allows_https());
+
+        let no_vpn = TransportPolicy::from_flags(false, true, false).unwrap();
+        assert!(no_vpn.allows_smb(), "on campus this is unaffected");
+        assert!(!no_vpn.allows_vpn());
+
+        // Nothing left to carry the data: refused at startup rather than
+        // mounting something that cannot answer a read.
+        assert!(TransportPolicy::from_flags(true, false, true).is_err());
     }
 }

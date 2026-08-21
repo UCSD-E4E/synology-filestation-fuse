@@ -2399,6 +2399,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "synology-filestation-connect",
  "synology-filestation-core",
  "synology-filestation-smb",
  "tokio",
