@@ -48,6 +48,42 @@
     <ScrollViewer>
       <StackPanel Margin="20" Spacing="4">
 
+        <!-- Error banner. Sits above the form, next to the fields it talks
+             about: the headline names the cause, the line under it names the
+             fix, and the small print carries the raw message for a bug report. -->
+        <Border IsVisible="{Binding ErrorBanner.IsVisible}"
+                Background="#F8D7DA"
+                BorderBrush="#F1AEB5"
+                BorderThickness="1"
+                CornerRadius="4"
+                Padding="12,8"
+                Margin="0,0,0,10">
+          <Grid ColumnDefinitions="*,Auto">
+            <StackPanel Grid.Column="0" VerticalAlignment="Center" Spacing="2">
+              <TextBlock Text="{Binding ErrorBanner.Title}"
+                         FontWeight="SemiBold"
+                         Foreground="#721C24"
+                         TextWrapping="Wrap" />
+              <TextBlock Text="{Binding ErrorBanner.Remedy}"
+                         Foreground="#721C24"
+                         TextWrapping="Wrap" />
+              <!-- Selectable so the raw message can be copied into an issue. -->
+              <SelectableTextBlock Text="{Binding ErrorBanner.Detail}"
+                                   IsVisible="{Binding ErrorBanner.HasDetail}"
+                                   Foreground="#721C24"
+                                   Opacity="0.75"
+                                   FontSize="11"
+                                   TextWrapping="Wrap"
+                                   Margin="0,2,0,0" />
+            </StackPanel>
+            <Button Grid.Column="1"
+                    Content="Dismiss"
+                    Command="{Binding ErrorBanner.DismissCommand}"
+                    VerticalAlignment="Top"
+                    Margin="8,0,0,0" />
+          </Grid>
+        </Border>
+
         <!-- Update available banner -->
         <Border IsVisible="{Binding ShowUpdateBanner}"
                 Background="#D1ECF1"
