@@ -20,12 +20,14 @@
 mod channel;
 mod packet;
 mod reliable;
+mod session;
 mod static_key;
 mod tls_auth;
 
 pub use channel::ControlChannel;
 pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 pub use reliable::{Delivery, Outgoing, RecvWindow, SendWindow};
+pub use session::{ClientAuth, Session, SessionConfig, MAX_TLS_FRAGMENT};
 pub use static_key::{KeyDirection, StaticKey, STATIC_KEY_LEN};
 pub use tls_auth::{TlsAuth, TlsAuthHeader};
 
@@ -58,6 +60,9 @@ pub enum Error {
 
     #[error("packet acknowledges messages of a different session")]
     AckForAnotherSession,
+
+    #[error("TLS: {0}")]
+    Tls(String),
 
     #[error("a static key is {STATIC_KEY_LEN} bytes; this one is {actual}")]
     KeyLength {

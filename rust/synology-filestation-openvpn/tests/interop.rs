@@ -21,10 +21,12 @@ use std::io::ErrorKind;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use synology_filestation_openvpn::{
-    ControlChannel, KeyDirection, Opcode, SessionId, StaticKey, TlsAuth,
+    ClientAuth, ControlChannel, KeyDirection, Opcode, Session, SessionConfig, SessionId, StaticKey,
+    TlsAuth,
 };
 
 /// The same throwaway key the other tests use. It is a test vector, not a
@@ -140,20 +142,26 @@ struct OpenVpnServer {
     child: Child,
     port: u16,
     dir: PathBuf,
+    pki: Pki,
 }
 
 impl OpenVpnServer {
     fn start() -> Self {
-        let dir = std::env::temp_dir().join(format!("openvpn-interop-{}", std::process::id()));
+        // Per instance, not per process: the tests in this file run in
+        // parallel by default, and two servers sharing a directory means one
+        // of them deletes the other's certificates on the way out.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "openvpn-interop-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).expect("a working directory");
 
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("a certificate");
-        // One self-signed certificate serving as its own CA. The client half of
-        // that trust decision is ours to make and we are not making it here:
-        // this test is about the control channel, not about who the peer is.
-        write(&dir.join("ca.crt"), &cert.cert.pem());
-        write(&dir.join("server.key"), &cert.signing_key.serialize_pem());
+        let pki = Pki::generate();
+        write(&dir.join("ca.crt"), &pki.ca_pem);
+        write(&dir.join("server.crt"), &pki.server_cert_pem);
+        write(&dir.join("server.key"), &pki.server_key_pem);
         write(&dir.join("ta.key"), &static_key_file());
 
         let port = free_port();
@@ -163,7 +171,14 @@ impl OpenVpnServer {
         let child = Command::new(&binary)
             .args(["--tls-server", "--dev", "null", "--proto", "udp"])
             .args(["--lport", &port.to_string()])
-            .args(["--ca", "ca.crt", "--cert", "ca.crt", "--key", "server.key"])
+            .args([
+                "--ca",
+                "ca.crt",
+                "--cert",
+                "server.crt",
+                "--key",
+                "server.key",
+            ])
             .args(["--dh", "none"])
             .args(["--tls-auth", "ta.key", "0"])
             .args(["--auth", "SHA512", "--data-ciphers", "AES-256-CBC"])
@@ -176,7 +191,12 @@ impl OpenVpnServer {
                 panic!("could not run `{binary}`: {error}. Set OPENVPN_BIN if it is elsewhere.")
             });
 
-        let server = Self { child, port, dir };
+        let server = Self {
+            child,
+            port,
+            dir,
+            pki,
+        };
         server.wait_until_listening(&log);
         server
     }
@@ -247,4 +267,125 @@ fn static_key_file() -> String {
         "#\n# 2048 bit OpenVPN static key\n#\n-----BEGIN OpenVPN Static key V1-----\n{}\n-----END OpenVPN Static key V1-----\n",
         body.join("\n")
     )
+}
+
+#[test]
+#[ignore = "spawns a real openvpn process"]
+fn a_tls_handshake_completes_over_the_control_channel() {
+    // The whole stack at once: `tls-auth`, framing, retransmission, and now an
+    // ordinary TLS session running inside OpenVPN's control messages. If the
+    // fragmentation is wrong by one byte in either direction this does not
+    // degrade, it fails to decrypt.
+    let server = OpenVpnServer::start();
+
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("a local socket");
+    socket
+        .connect(("127.0.0.1", server.port))
+        .expect("point it at the server");
+    socket
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("so the loop can drive retransmission");
+
+    let mut config = SessionConfig::new(
+        server.pki.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    // A point-to-point OpenVPN always asks for a client certificate. e4e-nas
+    // does not — it runs `verify-client-cert none` and takes an AD username
+    // and password instead — so this is the test's shape, not the
+    // deployment's.
+    config.client_auth = Some(ClientAuth {
+        cert_chain_pem: server.pki.client_cert_pem.clone(),
+        private_key_pem: server.pki.client_key_pem.clone(),
+    });
+
+    let mut session = Session::new(config).expect("a client");
+    session.open();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut buf = [0u8; 4096];
+
+    while Instant::now() < deadline && session.is_handshaking() {
+        let now = Instant::now();
+        while let Some(datagram) = session.poll_transmit(now, net_time()) {
+            socket.send(&datagram).expect("send");
+        }
+
+        match socket.recv(&mut buf) {
+            Ok(len) => session
+                .handle(&buf[..len], Instant::now())
+                .unwrap_or_else(|error| panic!("{error}\n--- openvpn log ---\n{}", server.log())),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == ErrorKind::TimedOut => {}
+            Err(error) => panic!("recv failed: {error}"),
+        }
+    }
+
+    assert!(
+        !session.is_handshaking(),
+        "the handshake did not finish.\n--- openvpn log ---\n{}",
+        server.log()
+    );
+    assert!(
+        session.remote_session().is_some(),
+        "and it finished with the peer we opened against"
+    );
+}
+
+/// A throwaway certificate authority and the two certificates it issues.
+///
+/// A real hierarchy rather than one self-signed certificate used everywhere,
+/// because both ends check more than the signature: OpenVPN rejects a client
+/// certificate without the client-authentication purpose, and the extended key
+/// usage is the sort of thing a shortcut here would quietly skip and the NAS
+/// would not.
+struct Pki {
+    ca_pem: String,
+    server_cert_pem: String,
+    server_key_pem: String,
+    client_cert_pem: String,
+    client_key_pem: String,
+}
+
+impl Pki {
+    fn generate() -> Self {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+            KeyPair,
+        };
+
+        let ca_key = KeyPair::generate().expect("a key");
+        let mut ca_params = CertificateParams::new(Vec::new()).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "openvpn-interop-ca");
+        let ca = ca_params.self_signed(&ca_key).expect("a self-signed ca");
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+
+        let server_key = KeyPair::generate().expect("a key");
+        let mut server_params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server = server_params
+            .signed_by(&server_key, &issuer)
+            .expect("a server certificate");
+
+        let client_key = KeyPair::generate().expect("a key");
+        let mut client_params =
+            CertificateParams::new(vec!["client".to_string()]).expect("client params");
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client = client_params
+            .signed_by(&client_key, &issuer)
+            .expect("a client certificate");
+
+        Self {
+            ca_pem: ca.pem(),
+            server_cert_pem: server.pem(),
+            server_key_pem: server_key.serialize_pem(),
+            client_cert_pem: client.pem(),
+            client_key_pem: client_key.serialize_pem(),
+        }
+    }
 }

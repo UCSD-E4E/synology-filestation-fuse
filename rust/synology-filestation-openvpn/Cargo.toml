@@ -17,6 +17,14 @@ path = "src/lib.rs"
 hmac = "0.12"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
+# The control channel carries an ordinary TLS session, so an ordinary TLS
+# implementation runs on it. `ring` rather than the default provider, matching
+# the rest of the workspace: aws-lc-rs wants a C toolchain that the Windows and
+# manylinux builds do not have.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+# Session ids have to be unpredictable, not merely distinct.
+rand = "0.9"
 thiserror = "2"
 
 [dev-dependencies]
