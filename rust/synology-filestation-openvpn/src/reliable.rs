@@ -307,7 +307,14 @@ impl RecvWindow {
     /// are riding on — see [`crate::Acks::MAX`].
     pub fn take_acks(&mut self, max: usize) -> Vec<u32> {
         let taking = self.pending_acks.len().min(max);
-        for id in self.pending_acks.drain(..taking).rev() {
+        let promoting: Vec<u32> = self.pending_acks.drain(..taking).collect();
+        for id in promoting.into_iter().rev() {
+            // A retransmitted message is acknowledged again, and its id may
+            // already be in here. Moving it to the front rather than adding a
+            // second copy — otherwise repeated retransmissions fill the list
+            // with one id and push out the others, so the acknowledgements
+            // that most need repeating are the ones that stop being repeated.
+            self.recent_acks.retain(|&recent| recent != id);
             self.recent_acks.insert(0, id);
         }
         self.recent_acks.truncate(Self::RECENT_ACKS);

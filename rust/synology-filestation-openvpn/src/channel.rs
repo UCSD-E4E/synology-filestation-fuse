@@ -51,6 +51,10 @@ impl ControlChannel {
         }
     }
 
+    /// The message id of the reset that opens a session. It is the first
+    /// message we send, so it is always zero.
+    const OPENING_MESSAGE_ID: u32 = 0;
+
     /// Begin a session by queueing the opening reset.
     ///
     /// This also decides what we will accept back. Having opened a session, the
@@ -182,16 +186,17 @@ impl ControlChannel {
             // rule bite: a captured reset acknowledges a session id we no
             // longer have, and ours is random.
             None if self.opened => {
-                // Two conditions, and the acknowledgement is the one doing
-                // the work: our session id is random, so a packet captured
-                // from an earlier session acknowledges an id we no longer
-                // have. Requiring a *reset* on top of that means the first
-                // packet has to be one that opens a session at all, rather
-                // than a stray control packet that happens to carry acks.
-                let answers_our_open = matches!(
-                    packet.opcode,
-                    Opcode::ControlHardResetServerV2 | Opcode::ControlHardResetClientV2
-                ) && packet.acks.is_some();
+                // Three conditions, and together they say "this is the
+                // answer to what we just sent" rather than merely "this is
+                // well formed". The acknowledgement carries most of the
+                // weight: it has to name our session id, which is random, and
+                // it has to acknowledge the opening message itself. A packet
+                // captured from an earlier session satisfies neither.
+                let answers_our_open = packet.opcode == Opcode::ControlHardResetServerV2
+                    && packet
+                        .acks
+                        .as_ref()
+                        .is_some_and(|acks| acks.ids().contains(&Self::OPENING_MESSAGE_ID));
                 if !answers_our_open {
                     return Err(Error::UnexpectedFirstPacket);
                 }

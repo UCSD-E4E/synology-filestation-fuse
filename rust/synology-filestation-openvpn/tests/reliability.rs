@@ -344,6 +344,27 @@ fn acknowledgements_are_repeated_rather_than_spent() {
 }
 
 #[test]
+fn repeating_an_acknowledgement_moves_it_rather_than_duplicating_it() {
+    // A retransmitted message is acknowledged again, and its id is already in
+    // the recent list. Adding a second copy would let one id fill the eight
+    // slots and push out the others — so the acknowledgements that most need
+    // repeating would be the ones that stopped being repeated.
+    let mut window = RecvWindow::new();
+    window.accept(0, Opcode::ControlV1, payload(0));
+    window.accept(1, Opcode::ControlV1, payload(1));
+    assert_eq!(window.take_acks(8), vec![0, 1]);
+
+    // The peer did not hear us, and sends message 0 again.
+    window.accept(0, Opcode::ControlV1, payload(0));
+
+    assert_eq!(
+        window.take_acks(8),
+        vec![0, 1],
+        "0 moves back to the front; it does not appear twice"
+    );
+}
+
+#[test]
 fn an_out_of_window_message_leaves_nothing_to_acknowledge() {
     let mut window = RecvWindow::new();
     window.accept(RecvWindow::CAPACITY as u32, Opcode::ControlV1, payload(9));

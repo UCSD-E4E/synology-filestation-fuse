@@ -65,6 +65,24 @@ fn read(datagram: &[u8]) -> (ControlPacket, TlsAuthHeader) {
         .expect("the peer must accept what we send")
 }
 
+/// The answer a server sends to an opening reset, built rather than produced.
+///
+/// `ControlChannel` is a client — `open()` sends a *client* reset — so a peer
+/// made from one cannot say what a server says. Since what a session accepts
+/// first is exactly what is under test in places, the harness has to be able
+/// to send the real thing, and to send things that are nearly it.
+fn server_reset(replay_id: u32, acking: Vec<u32>, session_id: SessionId) -> Vec<u8> {
+    let packet = ControlPacket {
+        opcode: Opcode::ControlHardResetServerV2,
+        key_id: KeyId::FIRST,
+        session_id: SERVER_SESSION,
+        acks: Some(Acks::new(acking, session_id).expect("acks fit")),
+        packet_id: Some(0),
+        payload: Vec::new(),
+    };
+    TlsAuth::new(&key(), KeyDirection::Normal).wrap(&packet, replay_id, 0)
+}
+
 /// Bring both ends up to the point where each knows the other's session id.
 fn handshaken(now: Instant) -> (ControlChannel, ControlChannel) {
     let mut client = client();
@@ -74,8 +92,7 @@ fn handshaken(now: Instant) -> (ControlChannel, ControlChannel) {
     let hello = client.poll_transmit(now, 0).expect("client reset");
     server.handle(&hello, now).expect("the peer accepts it");
 
-    server.open();
-    let reply = server.poll_transmit(now, 0).expect("server reset");
+    let reply = server_reset(1, vec![0], CLIENT_SESSION);
     client.handle(&reply, now).expect("a valid reply");
 
     (client, server)
@@ -253,17 +270,16 @@ fn a_packet_from_a_different_session_is_refused() {
     let now = Instant::now();
     let (mut client, _) = handshaken(now);
 
-    // Built by hand for one reason: the replay id. The real server's reset
-    // already spent 1, so an impostor reusing it is refused by the replay
-    // window before the session check gets a look — a correct refusal, but not
-    // the one under test here.
+    // Replay id 2, because the real server's reset already spent 1 — an
+    // impostor reusing it would be refused by the replay window before the
+    // session check got a look, which is a correct refusal but not this one.
     let impostor = ControlPacket {
-        opcode: Opcode::ControlHardResetServerV2,
+        opcode: Opcode::ControlV1,
         key_id: KeyId::FIRST,
         session_id: SessionId::from_bytes([0xff; 8]),
         acks: None,
-        packet_id: Some(0),
-        payload: Vec::new(),
+        packet_id: Some(1),
+        payload: b"from somewhere else".to_vec(),
     };
     let datagram = TlsAuth::new(&key(), KeyDirection::Normal).wrap(&impostor, 2, 0);
 
@@ -382,6 +398,32 @@ fn only_a_server_reset_answering_ours_can_open_a_session() {
 }
 
 #[test]
+fn a_reset_that_answers_some_other_message_does_not_open_our_session() {
+    // Carrying *an* acknowledgement is not the same as answering what we sent.
+    // A reset acking some other id would otherwise latch the peer, after which
+    // the real server's answer is refused as an impostor and the handshake is
+    // stuck for good.
+    let now = Instant::now();
+    let mut client = client();
+    client.open();
+    client.poll_transmit(now, 0).expect("our reset, message 0");
+
+    assert_eq!(
+        client
+            .handle(&server_reset(1, vec![7], CLIENT_SESSION), now)
+            .unwrap_err(),
+        Error::UnexpectedFirstPacket,
+        "we have no message 7 outstanding; this answers something else"
+    );
+    assert_eq!(client.remote_session(), None);
+
+    client
+        .handle(&server_reset(2, vec![0], CLIENT_SESSION), now)
+        .expect("the one that answers message 0 is accepted");
+    assert_eq!(client.remote_session(), Some(SERVER_SESSION));
+}
+
+#[test]
 fn a_rejected_packet_does_not_get_to_decide_who_the_peer_is() {
     // The first authentic packet settles the peer's session id, so a packet
     // that is about to be *rejected* must not settle anything. Otherwise one
@@ -413,29 +455,20 @@ fn a_rejected_packet_does_not_get_to_decide_who_the_peer_is() {
         "we rejected it, so it decided nothing"
     );
 
-    // And the real server is still able to introduce itself, once our reset
-    // goes again — it was never acknowledged, because that packet was refused.
-    let retry = now + TLS_TIMEOUT;
-    let mut server = server();
-    server
-        .handle(
-            &client.poll_transmit(retry, 0).expect("our reset again"),
-            retry,
-        )
-        .expect("valid");
-    server.open();
+    // And the real server is still able to introduce itself. Its first
+    // datagram carries replay id 1, which the refused packet already spent, so
+    // it is dropped — the cost of the replay window, OpenVPN's behaviour too,
+    // and the session recovers on the retransmission rather than stalling.
+    assert_eq!(
+        client
+            .handle(&server_reset(1, vec![0], CLIENT_SESSION), now)
+            .unwrap_err(),
+        Error::Replayed
+    );
 
-    // The refused packet spent replay id 1, so the server's first datagram —
-    // which also carries 1 — is dropped. That is the cost of the replay
-    // window, it is OpenVPN's behaviour too, and the session recovers on the
-    // retransmission rather than stalling.
-    let first = server.poll_transmit(retry, 0).expect("server reset");
-    assert_eq!(client.handle(&first, retry).unwrap_err(), Error::Replayed);
-
-    let later = retry + TLS_TIMEOUT;
-    let again = server.poll_transmit(later, 0).expect("its retransmission");
+    let later = now + TLS_TIMEOUT;
     client
-        .handle(&again, later)
+        .handle(&server_reset(2, vec![0], CLIENT_SESSION), later)
         .expect("the channel is not locked onto the impostor");
 
     assert_eq!(client.remote_session(), Some(SERVER_SESSION));
