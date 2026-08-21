@@ -147,16 +147,17 @@ public class ErrorPresenterTests
         Assert.Contains("upload failed", r.Detail);
     }
 
-    // ── Mount failures (connected, but the mount itself failed) ───────────────
+    // ── Volume failures (connected, but the volume itself failed to open) ─────
 
     [Fact]
-    public void MountFailure_PointsAtTheMountPointRatherThanTheLogin()
+    public void VolumeFailure_PointsAtTheVolumeLocationRatherThanTheLogin()
     {
         var inner = new SynoException(SynoStatus.Io, 0, "mkdir /mnt/nas: permission denied");
         var r = ErrorPresenter.Describe(new MountFailedException(inner));
 
-        Assert.Contains("mount", r.Title, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("mount point", r.Remedy, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("volume", r.Title, StringComparison.OrdinalIgnoreCase);
+        // Names the field the user has to fix, in the words the form uses for it.
+        Assert.Contains("volume location", r.Remedy, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("mkdir /mnt/nas", r.Detail);
         // The credentials were accepted — saying "check your password" here would
         // send the user to the wrong field.
@@ -164,7 +165,7 @@ public class ErrorPresenterTests
     }
 
     [Fact]
-    public void MountFailure_ChainsTheUnderlyingFailureAsInnerException()
+    public void VolumeFailure_ChainsTheUnderlyingFailureAsInnerException()
     {
         // Generic logging and the debugger both walk InnerException; leaving the
         // cause only on a bespoke property would drop the original stack trace.
