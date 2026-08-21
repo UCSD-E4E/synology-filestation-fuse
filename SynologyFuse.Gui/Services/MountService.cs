@@ -53,6 +53,14 @@ public sealed class MountService : IDisposable
             {
                 c.Mount(mountpoint, config.CacheTtl, config.ReadCacheMb);
             }
+            catch (SynoException ex)
+            {
+                c.Dispose();
+                // The login already succeeded, so this is a mount-side failure —
+                // retag it so the UI advises on the mount point instead of the
+                // credentials.
+                throw new MountFailedException(ex);
+            }
             catch
             {
                 c.Dispose();

@@ -125,7 +125,10 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex)
         {
-            Status = $"Error: {ex.Message}";
+            // Same classification the main window's error banner uses, so a
+            // failed browse-window login reads like a sentence rather than a
+            // native error string.
+            Status = ErrorPresenter.Describe(ex).Title;
         }
         finally
         {

@@ -273,7 +273,7 @@ public sealed class SynoClient : IDisposable
             // rustls objected to, which is not what the user needs to know.
             SynoStatus.TlsError => new TlsVerificationException(
                 "The NAS's TLS certificate could not be verified. If this NAS uses "
-                + "a self-signed certificate, tick \"Accept self-signed certificate\" "
+                + "a self-signed certificate, untick \"Verify the NAS TLS certificate\" "
                 + "and try again — the connection will be encrypted but not "
                 + $"authenticated. ({message})"),
             _ => new SynoException(status, dsm, message),

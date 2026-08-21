@@ -157,8 +157,8 @@
   <Fragment>
     <Component Id="ShortcutComponent" Directory="ApplicationProgramsFolder" Guid="*">
       <Shortcut Id="AppStartMenuShortcut"
-                Name="Synology NAS Mount"
-                Description="Mount a Synology FileStation share as a local drive"
+                Name="NAS Folder Access"
+                Description="Open a Synology NAS folder as a local volume"
                 Target="[INSTALLFOLDER]SynologyFuse.Gui.exe"
                 WorkingDirectory="INSTALLFOLDER"
                 Icon="AppIcon" />

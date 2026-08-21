@@ -24,3 +24,7 @@ synology-filestation-core = { path = "../synology-filestation-core" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# `testing` ships Samba containers built for consumers of this crate, which is
+# how the SMB paths get exercised against a real server instead of a mock. The
+# tests that use it are #[ignore]d — they need Docker, CI has none.
+smb2 = { version = "0.18", features = ["testing"] }

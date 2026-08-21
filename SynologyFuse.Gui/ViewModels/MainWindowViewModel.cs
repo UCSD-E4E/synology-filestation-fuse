@@ -142,6 +142,13 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [NotifyCanExecuteChangedFor(nameof(SubmitOtpCommand))]
     private string _pendingOtp = "";
 
+    // ── Error banner ──────────────────────────────────────────────────────────
+
+    /// <summary>What went wrong and what to do about it. Filled in by any
+    /// connect / mount / disconnect failure and cleared when the next attempt
+    /// starts, so a stale failure never sits next to a fresh success.</summary>
+    public ErrorBannerViewModel ErrorBanner { get; } = new();
+
     // ── Update banner ─────────────────────────────────────────────────────────
 
     [ObservableProperty]
@@ -197,6 +204,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     private async Task RunConnectAsync(PendingAction action, MountConfig config, string? otp)
     {
         ShowOtpPrompt = false;
+        ErrorBanner.Clear();
         IsConnecting = true;
         StatusText = action == PendingAction.Test ? "Testing connection…" : "Connecting…";
         AppendLog(action == PendingAction.Test
@@ -216,8 +224,8 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
             {
                 await _mountService.ConnectAndMountAsync(config, otp);
                 IsConnected = true;
-                StatusText = $"Mounted at {config.Mountpoint}";
-                AppendLog("Mounted.");
+                StatusText = $"Volume ready at {config.Mountpoint}";
+                AppendLog("Volume ready.");
                 _pending = PendingAction.None;
             }
         }
@@ -229,17 +237,10 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
             StatusText = "2FA code required";
             AppendLog("[2FA] Two-factor authentication code required.");
         }
-        catch (SynoException ex)
-        {
-            StatusText = "Error";
-            IsConnected = false;
-            AppendLog(ex.DsmCode != 0 ? $"Error (DSM {ex.DsmCode}): {ex.Message}" : $"Error: {ex.Message}");
-        }
         catch (Exception ex)
         {
-            StatusText = "Error";
             IsConnected = false;
-            AppendLog($"Error: {ex.Message}");
+            Report(ex);
         }
         finally
         {
@@ -260,6 +261,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         AppendLog("Disconnecting…");
         StatusText = "Disconnecting…";
         ShowOtpPrompt = false;
+        ErrorBanner.Clear();
         IsConnecting = true;
         try
         {
@@ -268,12 +270,11 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
             await Task.Run(() => _mountService.Stop());
             IsConnected = false;
             StatusText = "Disconnected";
-            AppendLog("Unmounted.");
+            AppendLog("Volume closed.");
         }
         catch (Exception ex)
         {
-            StatusText = "Error";
-            AppendLog($"Error during disconnect: {ex.Message}");
+            Report(ex);
         }
         finally
         {
@@ -338,6 +339,19 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 
     private void OnOutput(string line) =>
         Dispatcher.UIThread.Post(() => AppendLog(line));
+
+    /// <summary>Surface a failure everywhere it belongs: the banner carries the
+    /// cause and the remedy, the status bar the headline, the log pane the raw
+    /// message. Previously a failure was only ever the word "Error" plus a log
+    /// line, which never said what to fix.</summary>
+    private void Report(Exception ex)
+    {
+        ErrorBanner.Show(ex);
+        StatusText = ErrorBanner.Title;
+        AppendLog(ErrorBanner.HasDetail
+            ? $"Error: {ErrorBanner.Title} — {ErrorBanner.Detail}"
+            : $"Error: {ErrorBanner.Title}");
+    }
 
     private void AppendLog(string line)
     {
