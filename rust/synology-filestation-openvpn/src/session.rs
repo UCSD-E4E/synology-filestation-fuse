@@ -338,7 +338,11 @@ impl Session {
                     self.channel.local_session(),
                     server_session,
                 ));
-                self.inbound.clear();
+                // Replaced rather than cleared: `Vec::clear` sets the
+                // length to zero and leaves the bytes in the allocation, so
+                // the peer's key material would survive in memory that now
+                // looks empty. Dropping the old buffer zeroizes it.
+                self.inbound = Zeroizing::new(Vec::new());
                 self.phase = Phase::Established;
                 Ok(())
             }

@@ -77,8 +77,11 @@ pub fn key_expansion(
     server_session: SessionId,
 ) -> Zeroizing<Vec<u8>> {
     // First the master secret, from the pre-master and the *first* randoms.
-    let mut seed = Vec::new();
-    seed.extend_from_slice(format!("{LABEL_PREFIX}master secret").as_bytes());
+    // The seed carries material that came out of the TLS session, so it is
+    // cleared with everything else rather than left in a freed allocation.
+    let mut seed = Zeroizing::new(Vec::new());
+    seed.extend_from_slice(LABEL_PREFIX.as_bytes());
+    seed.extend_from_slice(b"master secret");
     seed.extend_from_slice(&source.client_random1);
     seed.extend_from_slice(&source.server_random1);
 
@@ -88,8 +91,9 @@ pub fn key_expansion(
     // Then the keys, from the master and the *second* randoms — plus both
     // session ids, which is what stops two sessions between the same pair
     // deriving the same keys.
-    let mut seed = Vec::new();
-    seed.extend_from_slice(format!("{LABEL_PREFIX}key expansion").as_bytes());
+    let mut seed = Zeroizing::new(Vec::new());
+    seed.extend_from_slice(LABEL_PREFIX.as_bytes());
+    seed.extend_from_slice(b"key expansion");
     seed.extend_from_slice(&source.client_random2);
     seed.extend_from_slice(&source.server_random2);
     seed.extend_from_slice(client_session.as_bytes());

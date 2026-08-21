@@ -59,9 +59,9 @@ fn the_client_message_has_the_layout_openvpn_reads() {
 
 #[test]
 fn an_absent_credential_is_a_zero_length_not_a_lone_nul() {
-    // `write_empty_string` writes a length of zero and stops. Writing a length
-    // of one and a NUL would be the obvious alternative and would shift every
-    // field after it.
+    // OpenVPN writes these through `write_empty_string`, which puts a length
+    // of zero and stops. A length of one and a NUL is the obvious alternative
+    // and would shift every field after it.
     let source = source();
     let empty = Zeroizing::new(String::new());
     let encoded = ClientKeyMethod2 {

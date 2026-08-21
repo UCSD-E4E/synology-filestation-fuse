@@ -102,8 +102,9 @@ impl ServerKeyMethod2 {
 
 /// A `u16` length — counting the trailing NUL — and then the bytes.
 ///
-/// An empty string is a zero length and nothing else, which is what
-/// `write_empty_string` does.
+/// An empty string is a zero length and nothing else — OpenVPN writes those
+/// through a separate `write_empty_string`, which is why the two cases do not
+/// look alike on the wire.
 fn write_string(out: &mut Vec<u8>, value: &str, context: &'static str) -> Result<(), Error> {
     if value.is_empty() {
         out.extend_from_slice(&0u16.to_be_bytes());
