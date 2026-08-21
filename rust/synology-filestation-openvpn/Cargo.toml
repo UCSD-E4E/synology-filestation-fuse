@@ -1,0 +1,25 @@
+[package]
+name = "synology-filestation-openvpn"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "An in-process OpenVPN client: enough of the protocol to carry SMB to a NAS that terminates the tunnel itself."
+repository = "https://github.com/UCSD-E4E/synology-filestation"
+# Internal. Nothing outside this workspace speaks this protocol on our behalf.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# SHA512 is what the server is configured with (`auth SHA512` in the published
+# .ovpn); the HMAC construction is generic over it so a different digest is a
+# parameter, not a rewrite.
+hmac = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+hex = "0.4"
