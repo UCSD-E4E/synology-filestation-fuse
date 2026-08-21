@@ -4,7 +4,7 @@
         x:Class="SynologyFuse.Gui.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/app.ico"
-        Title="Synology FileStation Mount"
+        Title="NAS Folder Access"
         Width="520"
         MinWidth="400"
         SizeToContent="Height"
@@ -176,14 +176,15 @@
           </StackPanel>
         </Grid>
 
-        <!-- Mount section -->
-        <TextBlock Text="Mount"
+        <!-- Volume section. "Mount" is what the driver does; "volume" is what
+             the user ends up with, and it is the word the rest of the UI uses. -->
+        <TextBlock Text="Volume"
                    FontWeight="SemiBold"
                    FontSize="14"
                    Margin="0,12,0,4" />
 
         <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
-          <TextBlock Grid.Column="0" Text="Mountpoint" VerticalAlignment="Center" />
+          <TextBlock Grid.Column="0" Text="Volume location" VerticalAlignment="Center" />
           <TextBox   Grid.Column="1" Text="{Binding Mountpoint}"
                      PlaceholderText="/mnt/nas  •  /Volumes/nas  •  Z:\"
                      IsEnabled="{Binding IsDisconnected}" />

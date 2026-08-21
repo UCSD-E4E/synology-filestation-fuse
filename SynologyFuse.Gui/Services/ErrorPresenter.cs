@@ -28,15 +28,15 @@ public static class ErrorPresenter
 {
     public static ErrorReport Describe(Exception ex)
     {
-        // Mount failures come after a successful login, so none of the
+        // Volume failures come after a successful login, so none of the
         // credential advice applies — check before the status switch.
         if (ex is MountFailedException mount)
         {
             return new ErrorReport(
-                "Signed in, but the mount failed",
-                "The NAS accepted your credentials — it is the local mount that failed. "
-                + "Check that the mount point exists, is empty and is writable, and that "
-                + "the filesystem driver is installed (FUSE on Linux, WinFsp on Windows).",
+                "Signed in, but the volume could not be opened",
+                "The NAS accepted your credentials — it is the local volume that failed. "
+                + "Check that the volume location exists, is empty and is writable, and "
+                + "that the filesystem driver is installed (FUSE on Linux, WinFsp on Windows).",
                 // The wrapper copies the underlying status, code and message, so
                 // this is the mount call's own failure, not a login one.
                 Detail(mount));

@@ -198,13 +198,13 @@ install -Dm644 /dev/stdin \
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=SynologyFuse
-Comment=Mount a Synology FileStation share as a local directory
+Name=NAS Folder Access
+Comment=Open a Synology NAS folder as a local volume
 Exec=/opt/SynologyFuse/${GUI_BINARY}
 Icon=synologyfuse
 Terminal=false
 Categories=Network;FileManager;
-Keywords=synology;nas;fuse;mount;
+Keywords=synology;nas;fuse;mount;volume;
 StartupWMClass=${GUI_BINARY}
 EOF
 

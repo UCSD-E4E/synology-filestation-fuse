@@ -224,8 +224,8 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
             {
                 await _mountService.ConnectAndMountAsync(config, otp);
                 IsConnected = true;
-                StatusText = $"Mounted at {config.Mountpoint}";
-                AppendLog("Mounted.");
+                StatusText = $"Volume ready at {config.Mountpoint}";
+                AppendLog("Volume ready.");
                 _pending = PendingAction.None;
             }
         }
@@ -270,7 +270,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
             await Task.Run(() => _mountService.Stop());
             IsConnected = false;
             StatusText = "Disconnected";
-            AppendLog("Unmounted.");
+            AppendLog("Volume closed.");
         }
         catch (Exception ex)
         {
