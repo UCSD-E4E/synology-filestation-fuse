@@ -56,6 +56,9 @@ pub enum Error {
     #[error("packet belongs to a different session")]
     WrongSession,
 
+    #[error("packet acknowledges messages of a different session")]
+    AckForAnotherSession,
+
     #[error("a static key is {STATIC_KEY_LEN} bytes; this one is {actual}")]
     KeyLength {
         /// How many bytes were actually decoded.

@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use synology_filestation_openvpn::{
-    Acks, ControlChannel, ControlPacket, KeyDirection, KeyId, Opcode, SessionId, StaticKey,
+    Acks, ControlChannel, ControlPacket, Error, KeyDirection, KeyId, Opcode, SessionId, StaticKey,
     TlsAuth, TlsAuthHeader,
 };
 
@@ -224,8 +224,9 @@ fn a_packet_from_a_different_session_is_refused() {
         .poll_transmit(now, 0)
         .expect("a correctly signed packet");
 
-    assert!(
-        client.handle(&datagram, now).is_err(),
+    assert_eq!(
+        client.handle(&datagram, now).unwrap_err(),
+        Error::WrongSession,
         "correctly signed, wrong session"
     );
 }
@@ -250,7 +251,11 @@ fn an_acknowledgement_addressed_to_another_session_is_refused() {
     };
     let datagram = TlsAuth::new(&key(), KeyDirection::Normal).wrap(&elsewhere, 1, 0);
 
-    assert!(client.handle(&datagram, now).is_err());
+    assert_eq!(
+        client.handle(&datagram, now).unwrap_err(),
+        Error::AckForAnotherSession,
+        "a distinct failure from the packet itself being misaddressed"
+    );
     assert!(
         client.poll_transmit(now + TLS_TIMEOUT, 0).is_some(),
         "our reset is still outstanding, because that ack was not ours"
@@ -276,6 +281,59 @@ fn each_datagram_gets_its_own_tls_auth_packet_id() {
         "OpenVPN starts this count at one"
     );
     assert_eq!(read(&again).1.packet_id, 2);
+}
+
+#[test]
+fn a_rejected_packet_does_not_get_to_decide_who_the_peer_is() {
+    // The first authentic packet settles the peer's session id, so a packet
+    // that is about to be *rejected* must not settle anything. Otherwise one
+    // bad datagram — from a stale session, or from anyone who has the shared
+    // key — locks the channel onto a peer it has already refused to talk to,
+    // and every later packet from the real server is refused as an impostor.
+    let now = Instant::now();
+    let mut client = client();
+    client.open();
+    client.poll_transmit(now, 0).expect("our reset");
+
+    let misaddressed = ControlPacket {
+        opcode: Opcode::ControlHardResetServerV2,
+        key_id: KeyId::FIRST,
+        session_id: SessionId::from_bytes([0xbb; 8]),
+        acks: Some(Acks::new(vec![0], SessionId::from_bytes([0xaa; 8])).expect("one ack fits")),
+        packet_id: Some(0),
+        payload: Vec::new(),
+    };
+    let datagram = TlsAuth::new(&key(), KeyDirection::Normal).wrap(&misaddressed, 1, 0);
+
+    assert_eq!(
+        client.handle(&datagram, now).unwrap_err(),
+        Error::AckForAnotherSession
+    );
+    assert_eq!(
+        client.remote_session(),
+        None,
+        "we rejected it, so it decided nothing"
+    );
+
+    // And the real server is still able to introduce itself, once our reset
+    // goes again — it was never acknowledged, because that packet was refused.
+    let retry = now + TLS_TIMEOUT;
+    let mut server = server();
+    server
+        .handle(
+            &client.poll_transmit(retry, 0).expect("our reset again"),
+            retry,
+        )
+        .expect("valid");
+    server.open();
+    client
+        .handle(
+            &server.poll_transmit(retry, 0).expect("server reset"),
+            retry,
+        )
+        .expect("the channel is not locked onto the impostor");
+
+    assert_eq!(client.remote_session(), Some(SERVER_SESSION));
 }
 
 #[test]

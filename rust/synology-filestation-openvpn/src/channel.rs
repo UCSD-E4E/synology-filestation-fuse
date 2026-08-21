@@ -114,25 +114,28 @@ impl ControlChannel {
     pub fn handle(&mut self, datagram: &[u8], _now: Instant) -> Result<(), Error> {
         let (packet, _header) = self.auth.unwrap(datagram)?;
 
-        match self.remote_session {
-            // The first authentic packet decides who we are talking to. Only
-            // one can: after this, a packet from anywhere else is refused.
-            None => self.remote_session = Some(packet.session_id),
-            Some(known) if known != packet.session_id => {
+        // Everything is checked before anything is changed. The first
+        // authentic packet settles who the peer is, so a packet we are about
+        // to reject must not settle it first — that would lock the channel
+        // onto a peer it has just refused, and the real server would then be
+        // turned away as an impostor for the rest of the session.
+        if let Some(known) = self.remote_session {
+            if known != packet.session_id {
                 return Err(Error::WrongSession);
             }
-            Some(_) => {}
         }
-
         if let Some(acks) = &packet.acks {
             if acks.session_id() != self.local_session {
                 // Acknowledgements for a session that is not ours would clear
                 // messages of ours that are still in flight.
-                return Err(Error::WrongSession);
+                return Err(Error::AckForAnotherSession);
             }
-            self.send.acknowledge(acks.ids());
         }
 
+        self.remote_session.get_or_insert(packet.session_id);
+        if let Some(acks) = &packet.acks {
+            self.send.acknowledge(acks.ids());
+        }
         // A `P_ACK_V1` carries no message id and nothing to deliver.
         if let Some(packet_id) = packet.packet_id {
             self.recv.accept(packet_id, packet.opcode, packet.payload);
