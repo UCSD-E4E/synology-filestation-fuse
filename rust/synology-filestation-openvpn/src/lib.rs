@@ -76,6 +76,12 @@ pub enum Error {
     #[error("peer offered key method {0}; only 2 exists")]
     UnsupportedKeyMethod(u8),
 
+    #[error("{context} is longer than the protocol can describe")]
+    FieldTooLong {
+        /// Which field, so the caller knows what to shorten.
+        context: &'static str,
+    },
+
     #[error("TLS: {0}")]
     Tls(String),
 

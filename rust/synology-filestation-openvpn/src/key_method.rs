@@ -47,18 +47,18 @@ pub struct ClientKeyMethod2<'a> {
 }
 
 impl ClientKeyMethod2<'_> {
-    pub fn encode(&self) -> Zeroizing<Vec<u8>> {
+    pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
         let mut out = Vec::new();
         out.extend_from_slice(&0u32.to_be_bytes());
         out.push(KEY_METHOD_2);
         out.extend_from_slice(&self.source.pre_master);
         out.extend_from_slice(&self.source.client_random1);
         out.extend_from_slice(&self.source.client_random2);
-        write_string(&mut out, self.options);
-        write_string(&mut out, self.username);
-        write_string(&mut out, self.password);
-        write_string(&mut out, self.peer_info);
-        Zeroizing::new(out)
+        write_string(&mut out, self.options, "the options string")?;
+        write_string(&mut out, self.username, "the username")?;
+        write_string(&mut out, self.password, "the password")?;
+        write_string(&mut out, self.peer_info, "the peer info")?;
+        Ok(Zeroizing::new(out))
     }
 }
 
@@ -104,15 +104,19 @@ impl ServerKeyMethod2 {
 ///
 /// An empty string is a zero length and nothing else, which is what
 /// `write_empty_string` does.
-fn write_string(out: &mut Vec<u8>, value: &str) {
+fn write_string(out: &mut Vec<u8>, value: &str, context: &'static str) -> Result<(), Error> {
     if value.is_empty() {
         out.extend_from_slice(&0u16.to_be_bytes());
-        return;
+        return Ok(());
     }
-    let len = value.len() + 1;
-    out.extend_from_slice(&(len as u16).to_be_bytes());
+    // The length is a `u16`, so a longer value cannot be described. Truncating
+    // it would produce a message that parses and means something else, which
+    // is worse than refusing to send one.
+    let len = u16::try_from(value.len() + 1).map_err(|_| Error::FieldTooLong { context })?;
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(value.as_bytes());
     out.push(0);
+    Ok(())
 }
 
 struct Reader<'a> {

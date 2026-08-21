@@ -15,7 +15,7 @@ use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use sha1::Sha1;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::packet::SessionId;
 
@@ -24,7 +24,7 @@ use crate::packet::SessionId;
 /// The client sends the pre-master and its two randoms; the server answers
 /// with two randoms of its own and no pre-master. Both sides then hold all of
 /// it and derive the same keys without either having sent a key.
-#[derive(Clone, Zeroize)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct KeySource2 {
     pub pre_master: [u8; 48],
     pub client_random1: [u8; 32],
@@ -75,7 +75,7 @@ pub fn key_expansion(
     source: &KeySource2,
     client_session: SessionId,
     server_session: SessionId,
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     // First the master secret, from the pre-master and the *first* randoms.
     let mut seed = Vec::new();
     seed.extend_from_slice(format!("{LABEL_PREFIX}master secret").as_bytes());
@@ -95,7 +95,7 @@ pub fn key_expansion(
     seed.extend_from_slice(client_session.as_bytes());
     seed.extend_from_slice(server_session.as_bytes());
 
-    let mut keys = vec![0u8; 256];
+    let mut keys = Zeroizing::new(vec![0u8; 256]);
     tls1_prf(&master, &seed, &mut keys);
 
     master.zeroize();
@@ -114,24 +114,26 @@ pub fn tls1_prf(secret: &[u8], seed: &[u8], out: &mut [u8]) {
 
     p_hash::<Hmac<Md5>>(s1, seed, out);
 
-    let mut sha1_out = vec![0u8; out.len()];
+    let mut sha1_out = Zeroizing::new(vec![0u8; out.len()]);
     p_hash::<Hmac<Sha1>>(s2, seed, &mut sha1_out);
 
     for (byte, sha1) in out.iter_mut().zip(sha1_out.iter()) {
         *byte ^= sha1;
     }
-    sha1_out.zeroize();
 }
 
 /// `P_hash` from RFC 2246: `HMAC(secret, A(i) + seed)` concatenated, where
 /// `A(0) = seed` and `A(i) = HMAC(secret, A(i-1))`.
 fn p_hash<M: Mac + KeyInit>(secret: &[u8], seed: &[u8], out: &mut [u8]) {
-    let mac = |data: &[&[u8]]| -> Vec<u8> {
+    // Every intermediate here is key material. `Zeroizing` rather than a
+    // final `zeroize()` call, because the loop replaces `a` each round and
+    // only the last one would otherwise be cleared.
+    let mac = |data: &[&[u8]]| -> Zeroizing<Vec<u8>> {
         let mut hmac = <M as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
         for part in data {
             hmac.update(part);
         }
-        hmac.finalize().into_bytes().to_vec()
+        Zeroizing::new(hmac.finalize().into_bytes().to_vec())
     };
 
     let mut a = mac(&[seed]);
@@ -145,5 +147,4 @@ fn p_hash<M: Mac + KeyInit>(secret: &[u8], seed: &[u8], out: &mut [u8]) {
 
         a = mac(&[&a]);
     }
-    a.zeroize();
 }

@@ -109,6 +109,7 @@ fn key_expansion_produces_four_keys_from_both_ends_material() {
     let server_sid = SessionId::from_bytes([7; 8]);
 
     let keys = key_expansion(&source, client_sid, server_sid);
+    let keys = keys.as_slice();
 
     assert_eq!(keys.len(), 256, "four 64-byte keys");
     assert_ne!(
@@ -134,34 +135,50 @@ fn every_input_changes_the_keys() {
     let client_sid = SessionId::from_bytes([6; 8]);
     let server_sid = SessionId::from_bytes([7; 8]);
     let expected = key_expansion(&base, client_sid, server_sid);
+    let expected = expected.as_slice();
 
     let mut changed = base.clone();
     changed.pre_master[0] ^= 1;
-    assert_ne!(key_expansion(&changed, client_sid, server_sid), expected);
+    assert_ne!(
+        key_expansion(&changed, client_sid, server_sid).as_slice(),
+        expected
+    );
 
     let mut changed = base.clone();
     changed.client_random1[0] ^= 1;
-    assert_ne!(key_expansion(&changed, client_sid, server_sid), expected);
+    assert_ne!(
+        key_expansion(&changed, client_sid, server_sid).as_slice(),
+        expected
+    );
 
     let mut changed = base.clone();
     changed.server_random1[0] ^= 1;
-    assert_ne!(key_expansion(&changed, client_sid, server_sid), expected);
+    assert_ne!(
+        key_expansion(&changed, client_sid, server_sid).as_slice(),
+        expected
+    );
 
     let mut changed = base.clone();
     changed.client_random2[0] ^= 1;
-    assert_ne!(key_expansion(&changed, client_sid, server_sid), expected);
+    assert_ne!(
+        key_expansion(&changed, client_sid, server_sid).as_slice(),
+        expected
+    );
 
     let mut changed = base.clone();
     changed.server_random2[0] ^= 1;
-    assert_ne!(key_expansion(&changed, client_sid, server_sid), expected);
+    assert_ne!(
+        key_expansion(&changed, client_sid, server_sid).as_slice(),
+        expected
+    );
 
     assert_ne!(
-        key_expansion(&base, SessionId::from_bytes([9; 8]), server_sid),
+        key_expansion(&base, SessionId::from_bytes([9; 8]), server_sid).as_slice(),
         expected,
         "the client session id is in the seed"
     );
     assert_ne!(
-        key_expansion(&base, client_sid, SessionId::from_bytes([9; 8])),
+        key_expansion(&base, client_sid, SessionId::from_bytes([9; 8])).as_slice(),
         expected,
         "and so is the server's"
     );
@@ -183,7 +200,7 @@ fn the_session_ids_are_not_interchangeable() {
     let server_sid = SessionId::from_bytes([7; 8]);
 
     assert_ne!(
-        key_expansion(&source, client_sid, server_sid),
-        key_expansion(&source, server_sid, client_sid)
+        key_expansion(&source, client_sid, server_sid).as_slice(),
+        key_expansion(&source, server_sid, client_sid).as_slice()
     );
 }

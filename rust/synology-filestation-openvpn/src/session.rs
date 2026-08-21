@@ -144,8 +144,10 @@ pub struct Session {
     phase: Phase,
     source: KeySource2,
     credentials: Option<Credentials>,
-    /// Plaintext read out of TLS, which arrives in pieces.
-    inbound: Vec<u8>,
+    /// Plaintext read out of TLS, which arrives in pieces. It holds the
+    /// peer's key material until it has all arrived, so it is cleared rather
+    /// than merely dropped.
+    inbound: Zeroizing<Vec<u8>>,
     keys: Option<Zeroizing<Vec<u8>>>,
 }
 
@@ -174,7 +176,7 @@ impl Session {
             phase: Phase::Tls,
             source: KeySource2::new_client(),
             credentials: config.credentials,
-            inbound: Vec::new(),
+            inbound: Zeroizing::new(Vec::new()),
             keys: None,
         };
         // Opened here rather than by a separate call. rustls has a
@@ -206,7 +208,11 @@ impl Session {
 
     /// The next datagram to send.
     pub fn poll_transmit(&mut self, now: Instant, net_time: u32) -> Option<Vec<u8>> {
-        self.send_our_key_material();
+        // A failure to build our own message is fatal to the session, but
+        // this returns a datagram rather than a result. The session stays put
+        // and `handle` reports it the next time the peer says anything, which
+        // it will: it is waiting for the message we could not send.
+        let _ = self.send_our_key_material();
 
         // Take whatever TLS has produced, then hand the channel as much of it
         // as its window will hold.
@@ -268,9 +274,9 @@ impl Session {
     /// Exactly once: the phase moves whether or not the write succeeds,
     /// because rustls buffers it and a second copy would be read as a second
     /// message.
-    fn send_our_key_material(&mut self) {
+    fn send_our_key_material(&mut self) -> Result<(), Error> {
         if self.phase != Phase::Tls || self.tls.is_handshaking() {
-            return;
+            return Ok(());
         }
 
         let empty = Zeroizing::new(String::new());
@@ -286,12 +292,13 @@ impl Session {
             password,
             peer_info: PEER_INFO,
         }
-        .encode();
+        .encode()?;
 
         // A failure here is a closed session, which the next poll reports
         // through the ordinary path rather than by panicking in a setter.
         let _ = self.tls.writer().write_all(&message);
         self.phase = Phase::AwaitingKeys;
+        Ok(())
     }
 
     /// Take the peer's key material if all of it has arrived.
@@ -300,12 +307,17 @@ impl Session {
             return Ok(());
         }
 
-        let mut buffer = [0u8; 2048];
-        while let Ok(read) = self.tls.reader().read(&mut buffer) {
-            if read == 0 {
-                break;
+        let mut buffer = Zeroizing::new([0u8; 2048]);
+        loop {
+            match self.tls.reader().read(buffer.as_mut()) {
+                Ok(0) => break,
+                Ok(read) => self.inbound.extend_from_slice(&buffer[..read]),
+                // Nothing more to read right now, which is the ordinary case.
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                // Anything else is the session failing, and swallowing it
+                // would leave us decoding a buffer that will never grow again.
+                Err(error) => return Err(Error::Tls(error.to_string())),
             }
-            self.inbound.extend_from_slice(&buffer[..read]);
         }
 
         match ServerKeyMethod2::decode(&self.inbound) {
@@ -320,11 +332,11 @@ impl Session {
                     .channel
                     .remote_session()
                     .ok_or_else(|| Error::Tls("key material before a session id".into()))?;
-                self.keys = Some(Zeroizing::new(key_expansion(
+                self.keys = Some(key_expansion(
                     &self.source,
                     self.channel.local_session(),
                     server_session,
-                )));
+                ));
                 self.inbound.clear();
                 self.phase = Phase::Established;
                 Ok(())

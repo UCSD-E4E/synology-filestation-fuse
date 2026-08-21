@@ -33,7 +33,8 @@ fn the_client_message_has_the_layout_openvpn_reads() {
         password: &password,
         peer_info: "IV_VER=2.5.11\n",
     }
-    .encode();
+    .encode()
+    .expect("every field fits");
 
     assert_eq!(&encoded[0..4], &[0, 0, 0, 0], "a literal zero first");
     assert_eq!(encoded[4], 2, "key method 2");
@@ -70,7 +71,8 @@ fn an_absent_credential_is_a_zero_length_not_a_lone_nul() {
         password: &empty,
         peer_info: "",
     }
-    .encode();
+    .encode()
+    .expect("every field fits");
 
     assert_eq!(encoded.len(), 4 + 1 + 48 + 32 + 32 + 2 * 4);
     assert_eq!(&encoded[117..], &[0, 0, 0, 0, 0, 0, 0, 0]);
@@ -146,4 +148,33 @@ fn trailing_bytes_are_left_for_the_fields_we_do_not_read() {
     reply.extend_from_slice(b"IV_X\0");
 
     assert!(ServerKeyMethod2::decode(&reply).is_ok());
+}
+
+#[test]
+fn a_field_too_long_to_describe_is_refused_rather_than_truncated() {
+    // The length is a `u16`. Casting a longer one would wrap, and the message
+    // would then parse into something else entirely — every field after the
+    // wrapped one shifted, and no complaint from either end until the session
+    // failed for an unrelated-looking reason.
+    let source = source();
+    let password = password();
+    let enormous = "x".repeat(u16::MAX as usize);
+
+    let error = ClientKeyMethod2 {
+        source: &source,
+        options: "V4",
+        username: &enormous,
+        password: &password,
+        peer_info: "",
+    }
+    .encode()
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        Error::FieldTooLong {
+            context: "the username"
+        },
+        "and it says which field, so a caller knows what to shorten"
+    );
 }
