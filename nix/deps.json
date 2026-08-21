@@ -60,6 +60,11 @@
     "hash": "sha256-YnRV5nn276iYP7PfbX+u9K3xpD3RX4jN80K3rvHEbbQ="
   },
   {
+    "pname": "Avalonia.Wayland",
+    "version": "12.1.1",
+    "hash": "sha256-kibFk1KgWdGv/sCI0dGGOxL68ZFrlMt49PpufwJfpgE="
+  },
+  {
     "pname": "Avalonia.Win32",
     "version": "12.1.1",
     "hash": "sha256-4jzrk/5p3/WF6/ZyaI07TL4O4HM8NnjaHk71H7H6GUw="
@@ -123,6 +128,11 @@
     "pname": "Microsoft.TestPlatform.TestHost",
     "version": "18.8.1",
     "hash": "sha256-eHXYN82NoknHgXty6XYEUy9SUfmvm1cQWeOus/obAJM="
+  },
+  {
+    "pname": "NWayland",
+    "version": "0.11.0",
+    "hash": "sha256-6I5F9aYQCP7JWsNMCkvUCYvsp20Gn+eYNO2ySuKUuhY="
   },
   {
     "pname": "SkiaSharp",
