@@ -132,10 +132,22 @@ impl SendWindow {
     /// that has never been sent is due immediately, and saying so requires
     /// naming a moment. Reading the clock to do it would put the one piece of
     /// hidden time back into a layer built to have none.
+    ///
+    /// It has to agree with [`SendWindow::next_due`] about what "due" means,
+    /// fast retransmit included. Reporting a backoff deadline for a message
+    /// that three later acknowledgements have already condemned would have the
+    /// caller sleep straight through it, which is worse than not having the
+    /// optimisation at all.
     pub fn next_wakeup(&self, now: Instant) -> Option<Instant> {
         self.in_flight
             .values()
-            .map(|entry| entry.next_try.unwrap_or(now))
+            .map(|entry| {
+                if entry.is_due(now, Self::FAST_RETRANSMIT_AFTER) {
+                    now
+                } else {
+                    entry.next_try.unwrap_or(now)
+                }
+            })
             .min()
     }
 

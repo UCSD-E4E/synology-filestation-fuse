@@ -166,6 +166,28 @@ fn three_acks_for_later_messages_resend_this_one_early() {
 }
 
 #[test]
+fn a_message_due_for_fast_retransmit_wakes_the_caller_now() {
+    // `next_wakeup` is what a caller sleeps on. If it reports the old backoff
+    // deadline for a message that fast retransmit has already made due, the
+    // caller sleeps through it and the optimisation does nothing at all —
+    // worse than not having it, because the code claims otherwise.
+    let start = Instant::now();
+    let mut window = send_window();
+    for tag in 0..4 {
+        window.queue(Opcode::ControlV1, payload(tag));
+        window.next_due(start).expect("sent");
+    }
+
+    window.acknowledge(&[1, 2, 3]);
+
+    assert_eq!(
+        window.next_wakeup(start),
+        Some(start),
+        "message 0 is due now, not when its timeout would have expired"
+    );
+}
+
+#[test]
 fn an_ack_for_an_unknown_id_is_ignored() {
     let start = Instant::now();
     let mut window = send_window();
