@@ -72,11 +72,13 @@ To build the installer yourself, see [Building the installer](#building-the-inst
 
 The repository ships a flake exposing both binaries as packages:
 
-| Output | Contents |
-|---|---|
-| `synology-filestation-fuse` (also `default`) | The Rust CLI |
-| `synology-filestation-ffi` | The native C ABI library (cdylib) the GUI loads |
-| `synologyfuse-gui` | The .NET 10 / Avalonia desktop GUI |
+| Output | Installs the command | Contents |
+|---|---|---|
+| `synology-filestation-fuse` (also `default`) | `synology-filestation-fuse` | The Rust CLI |
+| `synology-filestation-ffi` | *(library only)* | The native C ABI library (cdylib) the GUI loads |
+| `synologyfuse-gui` | **`SynologyFuse.Gui`** | The .NET 10 / Avalonia desktop GUI |
+
+Note the GUI's package name and its command differ: you install `synologyfuse-gui` but you run `SynologyFuse.Gui`.
 
 The GUI calls the Rust core directly through the native library, so the `synologyfuse-gui` package wraps its launcher with `SYNOFS_NATIVE_DIR` pointing at the cdylib (and the CLI on `PATH` too) — installing or running the GUI alone is enough to mount. Install `synology-filestation-fuse` as well if you also want the CLI available directly in your shell.
 
@@ -84,7 +86,7 @@ The GUI calls the Rust core directly through the native library, so the `synolog
 
 ```bash
 nix run github:UCSD-E4E/synology-filestation          # CLI
-nix run github:UCSD-E4E/synology-filestation#gui       # GUI (bundles the CLI)
+nix run github:UCSD-E4E/synology-filestation#gui       # GUI (its wrapper puts the CLI on PATH)
 ```
 
 ### Imperative (user profile)
@@ -94,6 +96,9 @@ nix run github:UCSD-E4E/synology-filestation#gui       # GUI (bundles the CLI)
 nix profile install \
   github:UCSD-E4E/synology-filestation#synologyfuse-gui \
   github:UCSD-E4E/synology-filestation#synology-filestation-fuse
+
+SynologyFuse.Gui            # launch the GUI
+synology-filestation-fuse   # …or the CLI
 ```
 
 ### Declarative (NixOS flake)
@@ -207,6 +212,13 @@ fi
 ```
 
 After saving the file, remount and all users will be able to access the share.
+
+**On NixOS**, `/etc/fuse.conf` is generated and the commands above will not
+stick. Set the option instead:
+
+```nix
+programs.fuse.userAllowOther = true;
+```
 
 ## Building
 
