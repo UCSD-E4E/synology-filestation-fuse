@@ -6,23 +6,31 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# flake-check builds untrusted code and gets nothing but read. Only the
+# push-back job below raises itself to write.
+permissions:
+  contents: read
+
 jobs:
   flake-check:
 
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
-    permissions:
-      # Needed only by the "push refreshed nix/deps.json" step below, and only
-      # on same-repo pull requests. Dependabot-triggered runs start read-only;
-      # declaring it here is what raises them.
-      contents: write
+    outputs:
+      deps-changed: ${{ steps.regen.outputs.changed }}
 
     steps:
     - uses: actions/checkout@v7
       with:
         # The NuGet-manifest diff below needs the base branch present.
         fetch-depth: 0
+        # `nix flake check` builds this tree *and* its third-party
+        # dependencies, which run arbitrary code at build time (MSBuild
+        # targets, build.rs). A token left in .git/config is readable by all
+        # of it, which is how a poisoned dependency turns into a push. Nothing
+        # in this job needs to authenticate to git.
+        persist-credentials: false
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
     # Caches /nix/store across runs (keyed on the flake lockfile) so the heavy
@@ -53,45 +61,67 @@ jobs:
           echo "changed=true" >> "$GITHUB_OUTPUT"
         fi
     - name: Refresh nix/deps.json
+      id: regen
       if: steps.nuget.outputs.changed == 'true'
       run: |
         script=$(nix build .#synologyfuse-gui.fetch-deps --no-link --print-out-paths)
         "$script" "${PWD}/nix/deps.json"
-        git --no-pager diff --stat -- nix/deps.json
+        if git diff --quiet -- nix/deps.json; then
+          echo "nix/deps.json was already current."
+        else
+          git --no-pager diff --stat -- nix/deps.json
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+        fi
 
     # Runs the CLI build, clippy (-D warnings), rustfmt, and the GUI build +
     # test suite — i.e. every `checks.x86_64-linux.*` output in the flake.
     - name: nix flake check
       run: nix flake check -L
 
-    - name: Push refreshed nix/deps.json
-      # Fork PRs are excluded deliberately: they must never see a write token.
-      if: >-
-        steps.nuget.outputs.changed == 'true'
-        && github.event.pull_request.head.repo.full_name == github.repository
+    - name: Upload refreshed nix/deps.json
+      if: steps.regen.outputs.changed == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: nix-deps-json
+        path: nix/deps.json
+        retention-days: 1
+
+  # Split out so the write token never exists in the environment that built the
+  # PR's code: this job runs no part of the tree, and the only thing crossing
+  # the boundary is a JSON lockfile.
+  push-deps:
+
+    needs: flake-check
+    # Fork PRs are excluded deliberately: they must never see a write token.
+    # (GitHub already forces their token read-only, but the intent belongs in
+    # the workflow rather than resting on that.)
+    if: >-
+      needs.flake-check.outputs.deps-changed == 'true'
+      && github.event.pull_request.head.repo.full_name == github.repository
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ github.head_ref }}
+    - uses: actions/download-artifact@v7
+      with:
+        name: nix-deps-json
+        path: nix/
+    - name: Commit refreshed nix/deps.json
       env:
         HEAD_REF: ${{ github.head_ref }}
       run: |
         if git diff --quiet -- nix/deps.json; then
-          echo "nix/deps.json was already current; nothing to push."
-          exit 0
-        fi
-
-        # checkout@v7 leaves us on the PR *merge* commit. Carry just the one
-        # file over to the real head branch so the push doesn't drag the base
-        # branch's commits along with it.
-        cp nix/deps.json "${RUNNER_TEMP}/deps.json"
-        git checkout -- nix/deps.json
-        git fetch origin "+refs/heads/${HEAD_REF}:refs/remotes/origin/${HEAD_REF}"
-        git checkout -B "${HEAD_REF}" "refs/remotes/origin/${HEAD_REF}"
-        cp "${RUNNER_TEMP}/deps.json" nix/deps.json
-
-        if git diff --quiet -- nix/deps.json; then
           echo "Head branch already carries the refreshed deps.json."
           exit 0
         fi
-
         git config user.name 'github-actions[bot]'
         git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
         git commit -m 'build(nix): regenerate deps.json for the NuGet bump' -- nix/deps.json
-        git push origin "${HEAD_REF}"
+        git push origin "HEAD:refs/heads/${HEAD_REF}"
