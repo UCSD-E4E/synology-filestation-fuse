@@ -8,6 +8,17 @@
       </requestedPrivileges>
     </security>
   </trustInfo>
+  <!-- Declare per-monitor DPI awareness in the manifest rather than relying on
+       Avalonia's startup call: the manifest is applied before any of our code
+       runs, so Windows never gets the chance to bitmap-scale the first window
+       on a HiDPI display. PerMonitorV2 matches Avalonia's own default. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
       <!-- Windows 10 / 11 -->

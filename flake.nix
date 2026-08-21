@@ -147,6 +147,15 @@
               libxrandr
               libxcursor
               libxrender
+
+              # Avalonia.Wayland dlopens these. Without them the Wayland
+              # backend fails to initialise and the app silently falls back to
+              # XWayland — which is the blurry-on-HiDPI path we added it to
+              # avoid, so the fix would be a no-op exactly on the desktops that
+              # need it.
+              wayland # libwayland-cursor.so.0, libwayland-egl.so.1
+              libgbm # libgbm.so.1
+              libdrm # libdrm.so.2
             ]
           );
 

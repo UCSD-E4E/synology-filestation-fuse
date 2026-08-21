@@ -31,6 +31,11 @@ class Program
     public static AppBuilder BuildAvaloniaApp() =>
         AppBuilder.Configure<App>()
             .UsePlatformDetect()
+            // Prefer the native Wayland backend over XWayland when a usable
+            // compositor is present: XWayland hands us a bitmap-scaled window
+            // on HiDPI and fractional-scale displays, where Wayland renders at
+            // the real scale factor. No-op on X11, macOS and Windows.
+            .UseWaylandWithFallback()
             .WithInterFont()
             .LogToTrace();
 }
