@@ -22,6 +22,7 @@ mod data;
 mod key_method;
 mod packet;
 mod prf;
+mod push;
 mod reliable;
 mod replay;
 mod session;
@@ -33,6 +34,7 @@ pub use data::{DataChannel, DataKeys, PeerId, PING};
 pub use key_method::{ClientKeyMethod2, ServerKeyMethod2, ServerMessage};
 pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 pub use prf::{key_expansion, tls1_prf, KeySource2};
+pub use push::{PushReply, PUSH_REQUEST, SUPPORTED_CIPHER};
 pub use reliable::{Delivery, Outgoing, RecvWindow, SendWindow};
 pub use replay::ReplayWindow;
 pub use session::{ClientAuth, Credentials, Session, SessionConfig, MAX_TLS_FRAGMENT};
@@ -99,6 +101,12 @@ pub enum Error {
 
     #[error("this key has sent every packet id it has")]
     PacketIdExhausted,
+
+    #[error("the server pushed \"{0}\", which is not something we can act on")]
+    BadPushDirective(String),
+
+    #[error("the server chose cipher {0}; this client speaks only {expected}", expected = crate::SUPPORTED_CIPHER)]
+    UnsupportedCipher(String),
 
     #[error("{context} is longer than the protocol can describe")]
     FieldTooLong {

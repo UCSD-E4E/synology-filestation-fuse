@@ -153,6 +153,23 @@ impl ServerKeyMethod2 {
         let random2 = reader.array("the server's second random")?;
         let options = reader.string("the options string")?;
 
+        // The server writes a username, a password and a peer-info string
+        // after its options, all of them usually empty. We have no use for
+        // them — but they are part of *this* message, and leaving them behind
+        // means the next thing to read the buffer finds three empty strings
+        // and sees six zero bytes where a message header should be. That
+        // looks exactly like a key method numbered zero.
+        //
+        // Required, not tolerated. A message read off a TLS stream has no
+        // frame around it, so "the peer sent fewer fields" and "the rest has
+        // not arrived yet" are the same bytes — and guessing the first would
+        // put the message boundary in the wrong place. Every real OpenVPN
+        // writes all three, empty or not (`key_method_2_write`), so demanding
+        // them costs nothing and removes the ambiguity.
+        for context in ["a username", "a password", "peer info"] {
+            reader.string(context)?;
+        }
+
         Ok((
             Self {
                 random1,

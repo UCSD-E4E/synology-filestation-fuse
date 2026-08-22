@@ -25,6 +25,7 @@ use crate::channel::ControlChannel;
 use crate::key_method::{ClientKeyMethod2, ServerMessage};
 use crate::packet::SessionId;
 use crate::prf::{key_expansion, KeySource2};
+use crate::push::{PushReply, PUSH_REQUEST};
 use crate::static_key::{KeyDirection, StaticKey};
 use crate::tls_auth::TlsAuth;
 use crate::Error;
@@ -134,6 +135,9 @@ enum Phase {
     AwaitingKeys,
     /// Both ends have contributed, and the data-channel keys exist.
     Established,
+    /// We have asked what the server wants us to know, and are waiting. A
+    /// point-to-point peer never answers, so nothing blocks on this.
+    AwaitingPush,
 }
 
 /// A TLS session and the control channel underneath it.
@@ -149,6 +153,7 @@ pub struct Session {
     /// than merely dropped.
     inbound: Zeroizing<Vec<u8>>,
     keys: Option<Zeroizing<Vec<u8>>>,
+    push: Option<PushReply>,
 }
 
 impl Session {
@@ -178,6 +183,7 @@ impl Session {
             credentials: config.credentials,
             inbound: Zeroizing::new(Vec::new()),
             keys: None,
+            push: None,
         };
         // Opened here rather than by a separate call. rustls has a
         // `ClientHello` ready the moment it is built, so a session that could
@@ -197,7 +203,17 @@ impl Session {
     /// Whether both ends have contributed key material and the data-channel
     /// keys exist.
     pub fn is_established(&self) -> bool {
-        self.phase == Phase::Established
+        matches!(self.phase, Phase::Established | Phase::AwaitingPush)
+    }
+
+    /// What the server pushed, once it has.
+    ///
+    /// A `--mode server` peer answers a `PUSH_REQUEST` with the peer id, the
+    /// cipher it chose and the keepalive intervals. A point-to-point peer has
+    /// no push exchange at all, and this stays `None` — which is not a
+    /// failure, it is what that kind of peer looks like.
+    pub fn push_reply(&self) -> Option<&PushReply> {
+        self.push.as_ref()
     }
 
     /// The derived key material: two directions, each a cipher key then an
@@ -261,7 +277,11 @@ impl Session {
         // Putting them where the result can be returned means a failure is
         // reported rather than dropped.
         self.send_our_key_material()?;
-        self.receive_their_key_material()
+        // Once, for whatever phase we are in, before anything tries to read
+        // the buffer.
+        self.drain_plaintext()?;
+        self.receive_their_key_material()?;
+        self.receive_push_reply()
     }
 
     /// The peer's session id, once it has told us.
@@ -302,12 +322,57 @@ impl Session {
         Ok(())
     }
 
-    /// Take the peer's key material if all of it has arrived.
-    fn receive_their_key_material(&mut self) -> Result<(), Error> {
-        if self.phase != Phase::AwaitingKeys {
+    /// Take the push reply, if the server has sent one.
+    fn receive_push_reply(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::AwaitingPush || self.inbound.is_empty() {
             return Ok(());
         }
 
+        let (message, used) = match ServerMessage::decode(&self.inbound) {
+            Ok(decoded) => decoded,
+            // Still arriving.
+            Err(Error::Truncated { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        self.inbound = Zeroizing::new(self.inbound[used..].to_vec());
+
+        let ServerMessage::Control(text) = message else {
+            // Key material where a push reply belongs is a renegotiation,
+            // which is not built yet. Saying so beats treating it as the
+            // answer to a question we did not ask.
+            return Err(Error::UnexpectedControlMessage(
+                "key material after the exchange".into(),
+            ));
+        };
+
+        if let Some(detail) = text.strip_prefix("AUTH_FAILED") {
+            return Err(Error::AuthFailed(detail.to_string()));
+        }
+
+        let reply = PushReply::parse(&text)?;
+        if !reply.cipher_is_supported() {
+            // Refused rather than ignored: encrypting with a cipher the
+            // server did not choose produces packets it drops without a word,
+            // which is indistinguishable from a broken network.
+            return Err(Error::UnsupportedCipher(
+                reply.cipher.clone().unwrap_or_default(),
+            ));
+        }
+        self.push = Some(reply);
+        Ok(())
+    }
+
+    /// Move whatever TLS has decrypted into `inbound`.
+    ///
+    /// Unconditional, and that is the point. This used to live inside the
+    /// key-material step, guarded by its phase — so once the session moved on
+    /// to waiting for a push reply, nothing refilled the buffer and the reply
+    /// was decrypted by rustls and then left there. Everything after it
+    /// silently did not happen: no peer id, so data packets stayed `P_DATA_V1`;
+    /// no cipher check; and an `AUTH_FAILED` arriving late was swallowed whole.
+    ///
+    /// A step that every phase needs does not belong inside one of them.
+    fn drain_plaintext(&mut self) -> Result<(), Error> {
         let mut buffer = Zeroizing::new([0u8; 2048]);
         loop {
             match self.tls.reader().read(buffer.as_mut()) {
@@ -322,6 +387,14 @@ impl Session {
                 // would leave us decoding a buffer that will never grow again.
                 Err(error) => return Err(Error::Tls(error.to_string())),
             }
+        }
+        Ok(())
+    }
+
+    /// Take the peer's key material if all of it has arrived.
+    fn receive_their_key_material(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::AwaitingKeys {
+            return Ok(());
         }
 
         match ServerMessage::decode(&self.inbound) {
@@ -366,7 +439,19 @@ impl Session {
                 let rest = Zeroizing::new(self.inbound[used..].to_vec());
                 self.inbound = rest;
                 self.phase = Phase::Established;
-                Ok(())
+
+                // Ask what else the server wants us to know. Its answer
+                // carries the peer id that makes our data packets
+                // addressable, so against a real server this is not optional.
+                self.tls
+                    .writer()
+                    .write_all(format!("{PUSH_REQUEST}\0").as_bytes())
+                    .map_err(|error| Error::Tls(error.to_string()))?;
+                self.phase = Phase::AwaitingPush;
+
+                // What followed the key material in the same flight may
+                // already be the answer.
+                self.receive_push_reply()
             }
         }
     }
@@ -501,6 +586,57 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(session.next_wakeup(now), Some(now));
+    }
+
+    #[test]
+    fn a_push_reply_waiting_in_the_buffer_is_consumed() {
+        // Narrower than it looks, and worth saying so: this pins that a reply
+        // already in `inbound` is parsed and kept. It does *not* cover how the
+        // reply gets there, which is where the bug was — the drain was gated
+        // on the key-material phase, so after the request went out nothing
+        // ever refilled the buffer. Covering that needs an in-process TLS peer
+        // to produce real plaintext, which does not exist here yet.
+        let mut session = test_session();
+        session.phase = Phase::AwaitingPush;
+        session.inbound = Zeroizing::new(b"PUSH_REPLY,peer-id 9,cipher AES-256-CBC\0".to_vec());
+
+        session.receive_push_reply().expect("a well-formed reply");
+
+        let reply = session.push_reply().expect("kept");
+        assert_eq!(reply.peer_id.map(|id| id.get()), Some(9));
+        assert!(reply.cipher_is_supported());
+        assert!(
+            session.inbound.is_empty(),
+            "and consumed, so the next message starts where it should"
+        );
+    }
+
+    #[test]
+    fn a_cipher_we_cannot_speak_stops_the_session() {
+        let mut session = test_session();
+        session.phase = Phase::AwaitingPush;
+        session.inbound = Zeroizing::new(b"PUSH_REPLY,cipher AES-256-GCM\0".to_vec());
+
+        assert_eq!(
+            session.receive_push_reply().unwrap_err(),
+            Error::UnsupportedCipher("AES-256-GCM".to_string()),
+            "better than encrypting with an algorithm the server did not pick"
+        );
+    }
+
+    #[test]
+    fn a_refusal_arriving_after_the_request_is_still_a_refusal() {
+        // `AUTH_FAILED` can arrive at this point too, and reading it as a push
+        // reply would report it as an unparseable directive rather than as the
+        // wrong password it is.
+        let mut session = test_session();
+        session.phase = Phase::AwaitingPush;
+        session.inbound = Zeroizing::new(b"AUTH_FAILED,expired\0".to_vec());
+
+        assert_eq!(
+            session.receive_push_reply().unwrap_err(),
+            Error::AuthFailed(",expired".to_string())
+        );
     }
 
     #[test]
