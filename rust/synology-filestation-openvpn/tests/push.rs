@@ -133,3 +133,32 @@ fn spacing_between_directives_does_not_change_the_meaning() {
     assert_eq!(reply.peer_id, PeerId::new(2));
     assert_eq!(reply.ping, Some(Duration::from_secs(5)));
 }
+
+#[test]
+fn pushed_compression_is_refused_because_it_changes_the_framing() {
+    // Compression is not a property of the payload: it prepends a byte to
+    // every packet. A client that implements none and ignores the directive
+    // brings a tunnel up and carries corrupt bytes, which is worse than not
+    // coming up.
+    for directive in [
+        "comp-lzo",
+        "comp-lzo yes",
+        "compress lz4",
+        "compress stub-v2",
+    ] {
+        let reply = PushReply::parse(&format!("PUSH_REPLY,{directive}")).expect("well formed");
+        assert!(
+            !reply.compression_is_supported(),
+            "{directive} should be refused"
+        );
+        assert_eq!(reply.compression.as_deref(), Some(directive));
+    }
+}
+
+#[test]
+fn a_server_saying_compression_is_off_asks_nothing_of_us() {
+    let reply = PushReply::parse("PUSH_REPLY,comp-lzo no,peer-id 2").expect("well formed");
+
+    assert!(reply.compression_is_supported());
+    assert_eq!(reply.compression, None);
+}

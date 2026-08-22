@@ -241,6 +241,15 @@ impl DataChannel {
             });
         }
 
+        // A packet for another key is a renegotiation, and saying so beats
+        // reporting it as inauthentic — which is what checking the HMAC with
+        // the wrong key would produce, and which reads as an attack rather
+        // than as the ordinary key rotation it is.
+        let key_id = KeyId::new(datagram[0] & 0x07).expect("three masked bits fit");
+        if key_id != self.key_id {
+            return Err(Error::OtherKeyId(key_id, self.key_id));
+        }
+
         // Authenticate before interpreting anything: the HMAC is the only
         // reason to believe any of the rest.
         let mut mac = <Hmac<Sha512>>::new_from_slice(&self.keys.decrypt_hmac)

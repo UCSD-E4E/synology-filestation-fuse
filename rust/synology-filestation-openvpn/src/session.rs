@@ -44,6 +44,12 @@ const CONTROL_MTU: usize = 1250;
 /// checked.
 const CONTROL_OVERHEAD: usize = 9 + 64 + 8 + 41 + 4;
 
+/// How often to ask again while the server has not answered a `PUSH_REQUEST`.
+///
+/// Real clients retransmit at about this rate. A request sent once is a
+/// request never answered by a server that was not ready when it arrived.
+const PUSH_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The most TLS we can put in one control message.
 pub const MAX_TLS_FRAGMENT: usize = CONTROL_MTU - CONTROL_OVERHEAD;
 
@@ -138,6 +144,9 @@ enum Phase {
     /// We have asked what the server wants us to know, and are waiting. A
     /// point-to-point peer never answers, so nothing blocks on this.
     AwaitingPush,
+    /// The server has told us. Nothing further is expected, though it may
+    /// still say things.
+    Ready,
 }
 
 /// A TLS session and the control channel underneath it.
@@ -154,6 +163,11 @@ pub struct Session {
     inbound: Zeroizing<Vec<u8>>,
     keys: Option<Zeroizing<Vec<u8>>>,
     push: Option<PushReply>,
+    /// When the last `PUSH_REQUEST` went out, so it can go again.
+    push_requested_at: Option<Instant>,
+    /// A failure from a path that cannot return one — see
+    /// [`Session::poll_transmit`].
+    failure: Option<Error>,
 }
 
 impl Session {
@@ -184,6 +198,8 @@ impl Session {
             inbound: Zeroizing::new(Vec::new()),
             keys: None,
             push: None,
+            push_requested_at: None,
+            failure: None,
         };
         // Opened here rather than by a separate call. rustls has a
         // `ClientHello` ready the moment it is built, so a session that could
@@ -203,7 +219,10 @@ impl Session {
     /// Whether both ends have contributed key material and the data-channel
     /// keys exist.
     pub fn is_established(&self) -> bool {
-        matches!(self.phase, Phase::Established | Phase::AwaitingPush)
+        matches!(
+            self.phase,
+            Phase::Established | Phase::AwaitingPush | Phase::Ready
+        )
     }
 
     /// What the server pushed, once it has.
@@ -223,7 +242,26 @@ impl Session {
     }
 
     /// The next datagram to send.
+    /// A failure from a step that had nowhere to report one.
+    ///
+    /// [`Session::poll_transmit`] returns a datagram, not a result, but the
+    /// push request it may resend can fail. Rather than drop that — the
+    /// mistake this crate has already made once — it is kept here, returned
+    /// by the next [`Session::handle`], and stops the session sending
+    /// anything more.
+    pub fn failure(&self) -> Option<&Error> {
+        self.failure.as_ref()
+    }
+
     pub fn poll_transmit(&mut self, now: Instant, net_time: u32) -> Option<Vec<u8>> {
+        if self.failure.is_some() {
+            return None;
+        }
+        if let Err(error) = self.resend_push_request(now) {
+            self.failure = Some(error);
+            return None;
+        }
+
         // Take whatever TLS has produced, then hand the channel as much of it
         // as its window will hold.
         while self.tls.wants_write() {
@@ -257,6 +295,9 @@ impl Session {
 
     /// Take a datagram from the network and feed whatever it carried to TLS.
     pub fn handle(&mut self, datagram: &[u8], now: Instant) -> Result<(), Error> {
+        if let Some(error) = self.failure.take() {
+            return Err(error);
+        }
         self.channel.handle(datagram, now)?;
 
         while let Some(record) = self.channel.poll_control() {
@@ -322,6 +363,32 @@ impl Session {
         Ok(())
     }
 
+    /// Ask again, if the answer has not come.
+    ///
+    /// A server that is not yet ready to answer says nothing at all, and a
+    /// request sent once is then a request never answered — the session would
+    /// sit there established, with no peer id, sending `P_DATA_V1` packets a
+    /// `--mode server` peer drops without a word. Real clients retransmit on
+    /// about this interval for the same reason.
+    fn resend_push_request(&mut self, now: Instant) -> Result<(), Error> {
+        if self.phase != Phase::AwaitingPush {
+            return Ok(());
+        }
+        match self.push_requested_at {
+            Some(sent) if now.duration_since(sent) < PUSH_REQUEST_INTERVAL => Ok(()),
+            _ => self.send_push_request(now),
+        }
+    }
+
+    fn send_push_request(&mut self, now: Instant) -> Result<(), Error> {
+        self.tls
+            .writer()
+            .write_all(format!("{PUSH_REQUEST}\0").as_bytes())
+            .map_err(|error| Error::Tls(error.to_string()))?;
+        self.push_requested_at = Some(now);
+        Ok(())
+    }
+
     /// Take the push reply, if the server has sent one.
     fn receive_push_reply(&mut self) -> Result<(), Error> {
         if self.phase != Phase::AwaitingPush || self.inbound.is_empty() {
@@ -350,6 +417,15 @@ impl Session {
         }
 
         let reply = PushReply::parse(&text)?;
+        if !reply.compression_is_supported() {
+            // Compression prepends a byte to every payload and changes the
+            // framing, exactly as a different cipher would. A tunnel that
+            // came up and carried corrupt bytes would be worse than one that
+            // refused to come up.
+            return Err(Error::UnsupportedCompression(
+                reply.compression.clone().unwrap_or_default(),
+            ));
+        }
         if !reply.cipher_is_supported() {
             // Refused rather than ignored: encrypting with a cipher the
             // server did not choose produces packets it drops without a word,
@@ -359,6 +435,7 @@ impl Session {
             ));
         }
         self.push = Some(reply);
+        self.phase = Phase::Ready;
         Ok(())
     }
 
@@ -443,10 +520,6 @@ impl Session {
                 // Ask what else the server wants us to know. Its answer
                 // carries the peer id that makes our data packets
                 // addressable, so against a real server this is not optional.
-                self.tls
-                    .writer()
-                    .write_all(format!("{PUSH_REQUEST}\0").as_bytes())
-                    .map_err(|error| Error::Tls(error.to_string()))?;
                 self.phase = Phase::AwaitingPush;
 
                 // What followed the key material in the same flight may

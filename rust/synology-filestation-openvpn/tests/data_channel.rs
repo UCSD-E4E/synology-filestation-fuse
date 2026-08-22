@@ -267,3 +267,23 @@ fn every_packet_gets_a_different_iv() {
     let iv = |packet: &[u8]| packet[4 + 64..4 + 64 + 16].to_vec();
     assert_ne!(iv(&first), iv(&second));
 }
+
+#[test]
+fn a_data_packet_for_another_key_says_so_rather_than_crying_forgery() {
+    // After a renegotiation the peer sends under a new key id. Checking the
+    // HMAC with the key we still hold would fail, and "packet is not
+    // authentic" reads as an attack rather than the ordinary key rotation it
+    // is — which is the difference between investigating a break-in and
+    // implementing a feature.
+    let mut client = client();
+    let mut datagram = client
+        .encrypt_with_iv(b"after a rotation", iv(1))
+        .expect("encrypt");
+    datagram[0] = ((Opcode::DataV2 as u8) << 3) | 1;
+
+    let mut server = server();
+    assert_eq!(
+        server.decrypt(&datagram).unwrap_err(),
+        Error::OtherKeyId(KeyId::new(1).expect("one fits"), KeyId::FIRST)
+    );
+}

@@ -90,7 +90,7 @@ pub enum Error {
         String,
     ),
 
-    #[error("the server sent \"{0}\" where key material was expected")]
+    #[error("the server sent \"{0}\", which is not what this stage of the session expects")]
     UnexpectedControlMessage(String),
 
     #[error("the peer closed the TLS session")]
@@ -110,6 +110,9 @@ pub enum Error {
 
     #[error("the server chose cipher {0}; this client speaks only {expected}", expected = crate::SUPPORTED_CIPHER)]
     UnsupportedCipher(String),
+
+    #[error("the server pushed compression ({0}); this client implements none")]
+    UnsupportedCompression(String),
 
     #[error("{context} is longer than the protocol can describe")]
     FieldTooLong {

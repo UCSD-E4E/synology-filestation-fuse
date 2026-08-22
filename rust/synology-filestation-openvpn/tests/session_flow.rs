@@ -145,3 +145,36 @@ fn the_keys_both_ends_derive_are_not_the_ones_either_end_sent() {
         "two sessions, two sets of keys"
     );
 }
+
+#[test]
+fn a_push_request_is_asked_again_until_it_is_answered() {
+    // A server that is not ready to answer says nothing at all. A request
+    // sent once is then a request never answered: the session sits there
+    // established with no peer id, sending the short form of every data
+    // packet, which a `--mode server` peer drops without a word.
+    let mut server = FakeServer::new(Answer::KeyMaterialOnly);
+    let mut session = session_against(&server);
+    let start = Instant::now();
+
+    exchange(&mut session, &mut server, start).expect("silence is not an error");
+    assert_eq!(session.push_reply(), None, "nothing came back");
+
+    // A second later, the client asks again rather than waiting forever.
+    let later = start + Duration::from_secs(2);
+    assert!(
+        session.poll_transmit(later, 0).is_some(),
+        "the request goes out again"
+    );
+}
+
+#[test]
+fn compression_the_server_pushes_stops_the_session() {
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 1,comp-lzo".to_string(),
+    ));
+    let mut session = session_against(&server);
+
+    let error = exchange(&mut session, &mut server, Instant::now()).unwrap_err();
+
+    assert_eq!(error, Error::UnsupportedCompression("comp-lzo".to_string()));
+}
