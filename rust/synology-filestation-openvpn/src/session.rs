@@ -25,6 +25,7 @@ use crate::channel::ControlChannel;
 use crate::key_method::{ClientKeyMethod2, ServerMessage};
 use crate::packet::SessionId;
 use crate::prf::{key_expansion, KeySource2};
+use crate::push::{PushReply, PUSH_REQUEST};
 use crate::static_key::{KeyDirection, StaticKey};
 use crate::tls_auth::TlsAuth;
 use crate::Error;
@@ -134,6 +135,9 @@ enum Phase {
     AwaitingKeys,
     /// Both ends have contributed, and the data-channel keys exist.
     Established,
+    /// We have asked what the server wants us to know, and are waiting. A
+    /// point-to-point peer never answers, so nothing blocks on this.
+    AwaitingPush,
 }
 
 /// A TLS session and the control channel underneath it.
@@ -149,6 +153,7 @@ pub struct Session {
     /// than merely dropped.
     inbound: Zeroizing<Vec<u8>>,
     keys: Option<Zeroizing<Vec<u8>>>,
+    push: Option<PushReply>,
 }
 
 impl Session {
@@ -178,6 +183,7 @@ impl Session {
             credentials: config.credentials,
             inbound: Zeroizing::new(Vec::new()),
             keys: None,
+            push: None,
         };
         // Opened here rather than by a separate call. rustls has a
         // `ClientHello` ready the moment it is built, so a session that could
@@ -197,7 +203,17 @@ impl Session {
     /// Whether both ends have contributed key material and the data-channel
     /// keys exist.
     pub fn is_established(&self) -> bool {
-        self.phase == Phase::Established
+        matches!(self.phase, Phase::Established | Phase::AwaitingPush)
+    }
+
+    /// What the server pushed, once it has.
+    ///
+    /// A `--mode server` peer answers a `PUSH_REQUEST` with the peer id, the
+    /// cipher it chose and the keepalive intervals. A point-to-point peer has
+    /// no push exchange at all, and this stays `None` — which is not a
+    /// failure, it is what that kind of peer looks like.
+    pub fn push_reply(&self) -> Option<&PushReply> {
+        self.push.as_ref()
     }
 
     /// The derived key material: two directions, each a cipher key then an
@@ -261,7 +277,8 @@ impl Session {
         // Putting them where the result can be returned means a failure is
         // reported rather than dropped.
         self.send_our_key_material()?;
-        self.receive_their_key_material()
+        self.receive_their_key_material()?;
+        self.receive_push_reply()
     }
 
     /// The peer's session id, once it has told us.
@@ -299,6 +316,46 @@ impl Session {
             .write_all(&message)
             .map_err(|error| Error::Tls(error.to_string()))?;
         self.phase = Phase::AwaitingKeys;
+        Ok(())
+    }
+
+    /// Take the push reply, if the server has sent one.
+    fn receive_push_reply(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::AwaitingPush || self.inbound.is_empty() {
+            return Ok(());
+        }
+
+        let (message, used) = match ServerMessage::decode(&self.inbound) {
+            Ok(decoded) => decoded,
+            // Still arriving.
+            Err(Error::Truncated { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        self.inbound = Zeroizing::new(self.inbound[used..].to_vec());
+
+        let ServerMessage::Control(text) = message else {
+            // Key material where a push reply belongs is a renegotiation,
+            // which is not built yet. Saying so beats treating it as the
+            // answer to a question we did not ask.
+            return Err(Error::UnexpectedControlMessage(
+                "key material after the exchange".into(),
+            ));
+        };
+
+        if let Some(detail) = text.strip_prefix("AUTH_FAILED") {
+            return Err(Error::AuthFailed(detail.to_string()));
+        }
+
+        let reply = PushReply::parse(&text)?;
+        if !reply.cipher_is_supported() {
+            // Refused rather than ignored: encrypting with a cipher the
+            // server did not choose produces packets it drops without a word,
+            // which is indistinguishable from a broken network.
+            return Err(Error::UnsupportedCipher(
+                reply.cipher.clone().unwrap_or_default(),
+            ));
+        }
+        self.push = Some(reply);
         Ok(())
     }
 
@@ -366,7 +423,19 @@ impl Session {
                 let rest = Zeroizing::new(self.inbound[used..].to_vec());
                 self.inbound = rest;
                 self.phase = Phase::Established;
-                Ok(())
+
+                // Ask what else the server wants us to know. Its answer
+                // carries the peer id that makes our data packets
+                // addressable, so against a real server this is not optional.
+                self.tls
+                    .writer()
+                    .write_all(format!("{PUSH_REQUEST}\0").as_bytes())
+                    .map_err(|error| Error::Tls(error.to_string()))?;
+                self.phase = Phase::AwaitingPush;
+
+                // What followed the key material in the same flight may
+                // already be the answer.
+                self.receive_push_reply()
             }
         }
     }

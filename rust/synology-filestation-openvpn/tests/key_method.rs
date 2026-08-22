@@ -80,8 +80,18 @@ fn an_absent_credential_is_a_zero_length_not_a_lone_nul() {
     assert_eq!(&encoded[117..], &[0, 0, 0, 0, 0, 0, 0, 0]);
 }
 
-/// A server reply, built the way a server builds it: no pre-master.
+/// A server reply, built the way a server builds one: no pre-master, and the
+/// three trailing strings it always writes even when they are empty.
 fn server_reply(options: &str) -> Vec<u8> {
+    let mut out = server_reply_without_trailing_fields(options);
+    out.extend_from_slice(&[0, 0]); // username
+    out.extend_from_slice(&[0, 0]); // password
+    out.extend_from_slice(&[0, 0]); // peer info
+    out
+}
+
+/// The same, stopping after the options — a peer that says less than it might.
+fn server_reply_without_trailing_fields(options: &str) -> Vec<u8> {
     let mut out = vec![0, 0, 0, 0, 2];
     out.extend_from_slice(&[0xd4; 32]);
     out.extend_from_slice(&[0xe5; 32]);
@@ -141,7 +151,10 @@ fn an_empty_options_string_is_read_as_empty() {
     let mut reply = vec![0, 0, 0, 0, 2];
     reply.extend_from_slice(&[0xd4; 32]);
     reply.extend_from_slice(&[0xe5; 32]);
-    reply.extend_from_slice(&[0, 0]);
+    reply.extend_from_slice(&[0, 0]); // no options
+    reply.extend_from_slice(&[0, 0]); // and no username,
+    reply.extend_from_slice(&[0, 0]); // password
+    reply.extend_from_slice(&[0, 0]); // or peer info
 
     assert_eq!(
         ServerKeyMethod2::decode(&reply).expect("valid").0.options,
@@ -150,15 +163,36 @@ fn an_empty_options_string_is_read_as_empty() {
 }
 
 #[test]
-fn trailing_bytes_are_left_for_the_fields_we_do_not_read() {
-    // The server also sends username, password and peer-info fields, all
-    // usually empty. We stop at the options string, so whatever follows must
-    // not make the message look malformed.
-    let mut reply = server_reply("V4");
-    reply.extend_from_slice(&[0, 0, 0, 0, 0, 6]);
-    reply.extend_from_slice(b"IV_X\0");
+fn the_fields_we_do_not_use_are_still_consumed() {
+    // The server writes a username, a password and a peer-info string after
+    // its options. We want none of them, but they belong to this message: a
+    // reader that stops at the options leaves three empty strings behind, and
+    // the next read finds six zero bytes where a header should be — which
+    // looks exactly like a key method numbered zero.
+    let mut reply = server_reply_without_trailing_fields("V4");
+    reply.extend_from_slice(&[0, 0]); // empty username
+    reply.extend_from_slice(&[0, 0]); // empty password
+    reply.extend_from_slice(&[0, 5]);
+    reply.extend_from_slice(b"IV_X\0"); // peer info, five bytes with its NUL
+    let whole = reply.len();
 
-    assert!(ServerKeyMethod2::decode(&reply).is_ok());
+    let (_, used) = ServerKeyMethod2::decode(&reply).expect("valid");
+
+    assert_eq!(used, whole, "all of it, including the fields we ignore");
+}
+
+#[test]
+fn a_message_that_stops_after_its_options_has_not_finished_arriving() {
+    // The tempting reading is "this peer sent fewer fields". On a TLS stream
+    // there is no frame to tell that apart from "the rest is still coming",
+    // and choosing wrongly puts the boundary of the *next* message in the
+    // wrong place. Every real OpenVPN writes all three, so waiting is right.
+    let reply = server_reply_without_trailing_fields("V4");
+
+    assert!(matches!(
+        ServerKeyMethod2::decode(&reply),
+        Err(Error::Truncated { .. })
+    ));
 }
 
 #[test]
