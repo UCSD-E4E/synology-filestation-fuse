@@ -277,6 +277,9 @@ impl Session {
         // Putting them where the result can be returned means a failure is
         // reported rather than dropped.
         self.send_our_key_material()?;
+        // Once, for whatever phase we are in, before anything tries to read
+        // the buffer.
+        self.drain_plaintext()?;
         self.receive_their_key_material()?;
         self.receive_push_reply()
     }
@@ -359,12 +362,17 @@ impl Session {
         Ok(())
     }
 
-    /// Take the peer's key material if all of it has arrived.
-    fn receive_their_key_material(&mut self) -> Result<(), Error> {
-        if self.phase != Phase::AwaitingKeys {
-            return Ok(());
-        }
-
+    /// Move whatever TLS has decrypted into `inbound`.
+    ///
+    /// Unconditional, and that is the point. This used to live inside the
+    /// key-material step, guarded by its phase — so once the session moved on
+    /// to waiting for a push reply, nothing refilled the buffer and the reply
+    /// was decrypted by rustls and then left there. Everything after it
+    /// silently did not happen: no peer id, so data packets stayed `P_DATA_V1`;
+    /// no cipher check; and an `AUTH_FAILED` arriving late was swallowed whole.
+    ///
+    /// A step that every phase needs does not belong inside one of them.
+    fn drain_plaintext(&mut self) -> Result<(), Error> {
         let mut buffer = Zeroizing::new([0u8; 2048]);
         loop {
             match self.tls.reader().read(buffer.as_mut()) {
@@ -379,6 +387,14 @@ impl Session {
                 // would leave us decoding a buffer that will never grow again.
                 Err(error) => return Err(Error::Tls(error.to_string())),
             }
+        }
+        Ok(())
+    }
+
+    /// Take the peer's key material if all of it has arrived.
+    fn receive_their_key_material(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::AwaitingKeys {
+            return Ok(());
         }
 
         match ServerMessage::decode(&self.inbound) {
@@ -570,6 +586,57 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(session.next_wakeup(now), Some(now));
+    }
+
+    #[test]
+    fn a_push_reply_waiting_in_the_buffer_is_consumed() {
+        // Narrower than it looks, and worth saying so: this pins that a reply
+        // already in `inbound` is parsed and kept. It does *not* cover how the
+        // reply gets there, which is where the bug was — the drain was gated
+        // on the key-material phase, so after the request went out nothing
+        // ever refilled the buffer. Covering that needs an in-process TLS peer
+        // to produce real plaintext, which does not exist here yet.
+        let mut session = test_session();
+        session.phase = Phase::AwaitingPush;
+        session.inbound = Zeroizing::new(b"PUSH_REPLY,peer-id 9,cipher AES-256-CBC\0".to_vec());
+
+        session.receive_push_reply().expect("a well-formed reply");
+
+        let reply = session.push_reply().expect("kept");
+        assert_eq!(reply.peer_id.map(|id| id.get()), Some(9));
+        assert!(reply.cipher_is_supported());
+        assert!(
+            session.inbound.is_empty(),
+            "and consumed, so the next message starts where it should"
+        );
+    }
+
+    #[test]
+    fn a_cipher_we_cannot_speak_stops_the_session() {
+        let mut session = test_session();
+        session.phase = Phase::AwaitingPush;
+        session.inbound = Zeroizing::new(b"PUSH_REPLY,cipher AES-256-GCM\0".to_vec());
+
+        assert_eq!(
+            session.receive_push_reply().unwrap_err(),
+            Error::UnsupportedCipher("AES-256-GCM".to_string()),
+            "better than encrypting with an algorithm the server did not pick"
+        );
+    }
+
+    #[test]
+    fn a_refusal_arriving_after_the_request_is_still_a_refusal() {
+        // `AUTH_FAILED` can arrive at this point too, and reading it as a push
+        // reply would report it as an unparseable directive rather than as the
+        // wrong password it is.
+        let mut session = test_session();
+        session.phase = Phase::AwaitingPush;
+        session.inbound = Zeroizing::new(b"AUTH_FAILED,expired\0".to_vec());
+
+        assert_eq!(
+            session.receive_push_reply().unwrap_err(),
+            Error::AuthFailed(",expired".to_string())
+        );
     }
 
     #[test]
