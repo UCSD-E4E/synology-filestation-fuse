@@ -114,6 +114,30 @@ impl std::fmt::Debug for DataKeys {
     }
 }
 
+/// The identifier a server assigns a client, carried by every `P_DATA_V2`
+/// packet.
+///
+/// Twenty-four bits, and a newtype for the same reason [`KeyId`] is one: the
+/// field is narrower than the type that would naturally hold it, and masking
+/// a wider value produces a perfectly valid packet addressed to somebody else
+/// — which the server drops without a word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerId(u32);
+
+impl PeerId {
+    /// The widest value the three bytes can carry.
+    pub const MAX: u32 = 0x00ff_ffff;
+
+    /// `None` if the value does not fit in three bytes.
+    pub fn new(value: u32) -> Option<Self> {
+        (value <= Self::MAX).then_some(Self(value))
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// One direction pair of a tunnel: encrypt outgoing payloads, decrypt
 /// incoming ones.
 pub struct DataChannel {
@@ -122,14 +146,14 @@ pub struct DataChannel {
     /// `--mode server` assigns one and both ends then use `P_DATA_V2`; a
     /// point-to-point peer assigns none and the packets are `P_DATA_V1`,
     /// which is the same thing without the three bytes.
-    peer_id: Option<u32>,
+    peer_id: Option<PeerId>,
     key_id: KeyId,
     next_packet_id: u32,
     replay: ReplayWindow,
 }
 
 impl DataChannel {
-    pub fn new(keys: DataKeys, peer_id: Option<u32>, key_id: KeyId) -> Self {
+    pub fn new(keys: DataKeys, peer_id: Option<PeerId>, key_id: KeyId) -> Self {
         Self {
             keys,
             peer_id,
@@ -142,7 +166,18 @@ impl DataChannel {
     }
 
     /// Wrap a payload into a datagram.
-    pub fn encrypt(&mut self, payload: &[u8], iv: [u8; IV_LEN]) -> Result<Vec<u8>, Error> {
+    ///
+    /// The IV is generated here rather than accepted, because CBC needs one
+    /// that is fresh and unpredictable for every packet and there is no way
+    /// for this type to check that a caller supplied one. See
+    /// [`DataChannel::encrypt_with_iv`] for the form the tests use.
+    pub fn encrypt(&mut self, payload: &[u8]) -> Result<Vec<u8>, Error> {
+        self.encrypt_with_iv(payload, rand::random())
+    }
+
+    /// The same, with the IV supplied — so a test can produce the same bytes
+    /// twice. Nothing outside a test should call it.
+    pub fn encrypt_with_iv(&mut self, payload: &[u8], iv: [u8; IV_LEN]) -> Result<Vec<u8>, Error> {
         let packet_id = self.next_packet_id;
         self.next_packet_id = self
             .next_packet_id
@@ -167,7 +202,7 @@ impl DataChannel {
         match self.peer_id {
             Some(peer_id) => {
                 out.push(((Opcode::DataV2 as u8) << 3) | self.key_id.get());
-                out.extend_from_slice(&peer_id.to_be_bytes()[1..]);
+                out.extend_from_slice(&peer_id.get().to_be_bytes()[1..]);
             }
             None => out.push(((Opcode::DataV1 as u8) << 3) | self.key_id.get()),
         }

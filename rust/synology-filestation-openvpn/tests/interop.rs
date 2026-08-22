@@ -77,6 +77,8 @@ fn a_real_openvpn_answers_our_opening_reset() {
         }
 
         match socket.recv(&mut buf) {
+            // A keepalive is not for the control channel.
+            Ok(len) if is_data(&buf[..len]) => continue,
             Ok(len) => {
                 let datagram = &buf[..len];
                 let (packet, _) = observer
@@ -123,6 +125,24 @@ fn a_real_openvpn_answers_our_opening_reset() {
         OUR_SESSION,
         "addressed to the session we opened, which is how we know it is for us"
     );
+}
+
+/// Whether a datagram belongs to the data channel rather than the control one.
+///
+/// Every loop here needs this. The server sends a keepalive once a second,
+/// and a data packet handed to the control channel fails its `tls-auth`
+/// check — so a loop that does not sort them out fails whenever a keepalive
+/// lands inside it. That is rare enough to pass by luck when the tests are
+/// quick and reliable once they are not, which is the worst shape a test
+/// failure can have.
+fn is_data(datagram: &[u8]) -> bool {
+    match datagram.first() {
+        Some(&first) => {
+            let opcode = first >> 3;
+            opcode == Opcode::DataV1 as u8 || opcode == Opcode::DataV2 as u8
+        }
+        None => false,
+    }
 }
 
 /// A socket pointed at the server, with a read timeout short enough that the
@@ -331,6 +351,8 @@ fn a_tls_handshake_completes_over_the_control_channel() {
         }
 
         match socket.recv(&mut buf) {
+            // A keepalive is not for the control channel.
+            Ok(len) if is_data(&buf[..len]) => continue,
             Ok(len) => session
                 .handle(&buf[..len], Instant::now())
                 .unwrap_or_else(|error| panic!("{error}\n--- openvpn log ---\n{}", server.log())),
@@ -388,6 +410,8 @@ fn the_key_exchange_completes_against_a_real_openvpn() {
         }
 
         match socket.recv(&mut buf) {
+            // A keepalive is not for the control channel.
+            Ok(len) if is_data(&buf[..len]) => continue,
             Ok(len) => session
                 .handle(&buf[..len], Instant::now())
                 .unwrap_or_else(|error| panic!("{error}\n--- openvpn log ---\n{}", server.log())),
@@ -467,8 +491,7 @@ fn a_ping_from_a_real_openvpn_decrypts() {
         // Data packets are the ones the control channel does not want. A
         // point-to-point peer assigns no peer id, so these arrive as
         // `P_DATA_V1`.
-        let opcode = buf[0] >> 3;
-        if opcode == Opcode::DataV1 as u8 || opcode == Opcode::DataV2 as u8 {
+        if is_data(&buf[..len]) {
             let channel = data.get_or_insert_with(|| {
                 DataChannel::new(
                     DataKeys::for_client(session.keys().expect("keys by now")).expect("256 bytes"),

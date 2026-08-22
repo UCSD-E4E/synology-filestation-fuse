@@ -4,7 +4,7 @@
 //! line the other side can see — so every rule here is one that would
 //! otherwise be discovered as "the tunnel is up and nothing goes through it".
 
-use synology_filestation_openvpn::{DataChannel, DataKeys, Error, KeyId, Opcode, PING};
+use synology_filestation_openvpn::{DataChannel, DataKeys, Error, KeyId, Opcode, PeerId, PING};
 
 /// Distinguishable material in each of the four 64-byte slots, so a test that
 /// picks the wrong one produces obviously wrong bytes rather than nearly right
@@ -23,7 +23,7 @@ const PEER_ID: u32 = 0x00_be_ef;
 fn client() -> DataChannel {
     DataChannel::new(
         DataKeys::for_client(&expansion()).expect("256 bytes"),
-        Some(PEER_ID),
+        Some(PeerId::new(PEER_ID).expect("fits in three bytes")),
         KeyId::FIRST,
     )
 }
@@ -31,7 +31,7 @@ fn client() -> DataChannel {
 fn server() -> DataChannel {
     DataChannel::new(
         DataKeys::for_server(&expansion()).expect("256 bytes"),
-        Some(PEER_ID),
+        Some(PeerId::new(PEER_ID).expect("fits in three bytes")),
         KeyId::FIRST,
     )
 }
@@ -46,7 +46,7 @@ fn what_the_client_sends_the_server_reads() {
     let mut server = server();
 
     let datagram = client
-        .encrypt(b"a tunnelled packet", iv(1))
+        .encrypt_with_iv(b"a tunnelled packet", iv(1))
         .expect("encrypt");
 
     assert_eq!(
@@ -64,7 +64,7 @@ fn a_client_cannot_read_its_own_packets() {
     let mut sender = client();
     let mut same_direction = client();
 
-    let datagram = sender.encrypt(b"outbound", iv(1)).expect("encrypt");
+    let datagram = sender.encrypt_with_iv(b"outbound", iv(1)).expect("encrypt");
 
     assert_eq!(
         same_direction.decrypt(&datagram).unwrap_err(),
@@ -77,11 +77,11 @@ fn a_client_cannot_read_its_own_packets() {
 fn the_header_is_an_opcode_a_key_id_and_a_peer_id() {
     let mut client = DataChannel::new(
         DataKeys::for_client(&expansion()).expect("256 bytes"),
-        Some(0x00_12_34),
+        Some(PeerId::new(0x00_12_34).expect("fits in three bytes")),
         KeyId::new(5).expect("five fits in three bits"),
     );
 
-    let datagram = client.encrypt(b"x", iv(1)).expect("encrypt");
+    let datagram = client.encrypt_with_iv(b"x", iv(1)).expect("encrypt");
 
     assert_eq!(
         datagram[0] >> 3,
@@ -103,7 +103,7 @@ fn the_hmac_covers_the_iv_and_ciphertext_and_not_the_header() {
     // believing it would produce packets no server accepts.
     let mut client = client();
     let mut server = server();
-    let mut datagram = client.encrypt(b"payload", iv(1)).expect("encrypt");
+    let mut datagram = client.encrypt_with_iv(b"payload", iv(1)).expect("encrypt");
 
     // Changing the peer id leaves the packet readable...
     datagram[3] ^= 0xff;
@@ -113,7 +113,7 @@ fn the_hmac_covers_the_iv_and_ciphertext_and_not_the_header() {
     );
 
     // ...while changing anything from the IV onwards does not.
-    let mut datagram = client.encrypt(b"payload", iv(2)).expect("encrypt");
+    let mut datagram = client.encrypt_with_iv(b"payload", iv(2)).expect("encrypt");
     let last = datagram.len() - 1;
     datagram[last] ^= 0x01;
     assert_eq!(server.decrypt(&datagram).unwrap_err(), Error::BadHmac);
@@ -127,7 +127,7 @@ fn the_packet_id_travels_inside_the_encryption() {
     // payload alone would need.
     let mut client = client();
 
-    let datagram = client.encrypt(&[0u8; 16], iv(1)).expect("encrypt");
+    let datagram = client.encrypt_with_iv(&[0u8; 16], iv(1)).expect("encrypt");
 
     let ciphertext = &datagram[4 + 64 + 16..];
     assert_eq!(
@@ -142,8 +142,8 @@ fn each_packet_gets_the_next_id_and_a_replay_is_refused() {
     let mut client = client();
     let mut server = server();
 
-    let first = client.encrypt(b"one", iv(1)).expect("encrypt");
-    let second = client.encrypt(b"two", iv(2)).expect("encrypt");
+    let first = client.encrypt_with_iv(b"one", iv(1)).expect("encrypt");
+    let second = client.encrypt_with_iv(b"two", iv(2)).expect("encrypt");
 
     assert_eq!(server.decrypt(&first).expect("valid"), b"one");
     assert_eq!(server.decrypt(&second).expect("valid"), b"two");
@@ -160,11 +160,13 @@ fn a_packet_from_another_tunnel_is_refused() {
     let other_expansion: Vec<u8> = std::iter::repeat_n(0x99, 256).collect();
     let mut stranger = DataChannel::new(
         DataKeys::for_server(&other_expansion).expect("256 bytes"),
-        Some(PEER_ID),
+        Some(PeerId::new(PEER_ID).expect("fits in three bytes")),
         KeyId::FIRST,
     );
 
-    let datagram = client.encrypt(b"not for you", iv(1)).expect("encrypt");
+    let datagram = client
+        .encrypt_with_iv(b"not for you", iv(1))
+        .expect("encrypt");
 
     assert_eq!(stranger.decrypt(&datagram).unwrap_err(), Error::BadHmac);
 }
@@ -173,7 +175,7 @@ fn a_packet_from_another_tunnel_is_refused() {
 fn a_control_packet_is_not_mistaken_for_data() {
     let mut client = client();
     let mut server = server();
-    let mut datagram = client.encrypt(b"payload", iv(1)).expect("encrypt");
+    let mut datagram = client.encrypt_with_iv(b"payload", iv(1)).expect("encrypt");
     datagram[0] = (Opcode::ControlV1 as u8) << 3;
 
     assert_eq!(
@@ -186,7 +188,7 @@ fn a_control_packet_is_not_mistaken_for_data() {
 #[test]
 fn a_truncated_packet_is_an_error_not_a_panic() {
     let mut client = client();
-    let datagram = client.encrypt(b"payload", iv(1)).expect("encrypt");
+    let datagram = client.encrypt_with_iv(b"payload", iv(1)).expect("encrypt");
 
     for cut in 0..datagram.len() {
         let mut server = server();
@@ -205,7 +207,7 @@ fn a_ping_survives_the_round_trip() {
     let mut client = client();
     let mut server = server();
 
-    let datagram = client.encrypt(&PING, iv(1)).expect("encrypt");
+    let datagram = client.encrypt_with_iv(&PING, iv(1)).expect("encrypt");
 
     assert_eq!(server.decrypt(&datagram).expect("valid"), PING);
 }
@@ -232,11 +234,36 @@ fn a_peer_that_assigned_no_id_gets_the_shorter_form() {
         KeyId::FIRST,
     );
 
-    let datagram = client.encrypt(b"no peer id here", iv(1)).expect("encrypt");
+    let datagram = client
+        .encrypt_with_iv(b"no peer id here", iv(1))
+        .expect("encrypt");
 
     assert_eq!(datagram[0] >> 3, Opcode::DataV1 as u8);
     assert_eq!(
         server.decrypt(&datagram).expect("the far end reads it"),
         b"no peer id here"
     );
+}
+
+#[test]
+fn a_peer_id_wider_than_its_field_cannot_be_built() {
+    // Three bytes on the wire. Masking a wider value would produce a valid
+    // packet addressed to a different client, which the server drops without
+    // a word — the same failure `KeyId` exists to prevent, one field over.
+    assert_eq!(PeerId::new(0x00ff_ffff).map(PeerId::get), Some(0x00ff_ffff));
+    assert_eq!(PeerId::new(0x0100_0000), None);
+    assert_eq!(PeerId::new(u32::MAX), None);
+}
+
+#[test]
+fn every_packet_gets_a_different_iv() {
+    // CBC needs a fresh, unpredictable IV per packet, and nothing about a
+    // supplied one can be checked — so the ordinary path generates it.
+    let mut client = client();
+
+    let first = client.encrypt(b"same payload").expect("encrypt");
+    let second = client.encrypt(b"same payload").expect("encrypt");
+
+    let iv = |packet: &[u8]| packet[4 + 64..4 + 64 + 16].to_vec();
+    assert_ne!(iv(&first), iv(&second));
 }

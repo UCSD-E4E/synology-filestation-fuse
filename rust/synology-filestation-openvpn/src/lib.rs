@@ -29,7 +29,7 @@ mod static_key;
 mod tls_auth;
 
 pub use channel::ControlChannel;
-pub use data::{DataChannel, DataKeys, PING};
+pub use data::{DataChannel, DataKeys, PeerId, PING};
 pub use key_method::{ClientKeyMethod2, ServerKeyMethod2, ServerMessage};
 pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 pub use prf::{key_expansion, tls1_prf, KeySource2};
