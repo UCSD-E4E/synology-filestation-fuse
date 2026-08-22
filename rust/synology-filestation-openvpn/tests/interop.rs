@@ -26,8 +26,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use synology_filestation_openvpn::{
-    ClientAuth, ControlChannel, KeyDirection, Opcode, Session, SessionConfig, SessionId, StaticKey,
-    TlsAuth,
+    ClientAuth, ControlChannel, DataChannel, DataKeys, KeyDirection, KeyId, Opcode, Session,
+    SessionConfig, SessionId, StaticKey, TlsAuth, PING,
 };
 
 /// The same throwaway key the other tests use. It is a test vector, not a
@@ -77,6 +77,8 @@ fn a_real_openvpn_answers_our_opening_reset() {
         }
 
         match socket.recv(&mut buf) {
+            // A keepalive is not for the control channel.
+            Ok(len) if is_data(&buf[..len]) => continue,
             Ok(len) => {
                 let datagram = &buf[..len];
                 let (packet, _) = observer
@@ -123,6 +125,24 @@ fn a_real_openvpn_answers_our_opening_reset() {
         OUR_SESSION,
         "addressed to the session we opened, which is how we know it is for us"
     );
+}
+
+/// Whether a datagram belongs to the data channel rather than the control one.
+///
+/// Every loop here needs this. The server sends a keepalive once a second,
+/// and a data packet handed to the control channel fails its `tls-auth`
+/// check — so a loop that does not sort them out fails whenever a keepalive
+/// lands inside it. That is rare enough to pass by luck when the tests are
+/// quick and reliable once they are not, which is the worst shape a test
+/// failure can have.
+fn is_data(datagram: &[u8]) -> bool {
+    match datagram.first() {
+        Some(&first) => {
+            let opcode = first >> 3;
+            opcode == Opcode::DataV1 as u8 || opcode == Opcode::DataV2 as u8
+        }
+        None => false,
+    }
 }
 
 /// A socket pointed at the server, with a read timeout short enough that the
@@ -198,6 +218,10 @@ impl OpenVpnServer {
             .args(["--dh", "none"])
             .args(["--tls-auth", "ta.key", "0"])
             .args(["--auth", "SHA512", "--data-ciphers", "AES-256-CBC"])
+            // A keepalive every second, so the server puts encrypted data
+            // packets on the wire without a tunnel to carry traffic from.
+            // Decrypting one of those is what proves the data channel.
+            .args(["--ping", "1"])
             .args(["--log", "openvpn.log", "--verb", "4"])
             .current_dir(&dir)
             .stdout(Stdio::null())
@@ -327,6 +351,8 @@ fn a_tls_handshake_completes_over_the_control_channel() {
         }
 
         match socket.recv(&mut buf) {
+            // A keepalive is not for the control channel.
+            Ok(len) if is_data(&buf[..len]) => continue,
             Ok(len) => session
                 .handle(&buf[..len], Instant::now())
                 .unwrap_or_else(|error| panic!("{error}\n--- openvpn log ---\n{}", server.log())),
@@ -384,6 +410,8 @@ fn the_key_exchange_completes_against_a_real_openvpn() {
         }
 
         match socket.recv(&mut buf) {
+            // A keepalive is not for the control channel.
+            Ok(len) if is_data(&buf[..len]) => continue,
             Ok(len) => session
                 .handle(&buf[..len], Instant::now())
                 .unwrap_or_else(|error| panic!("{error}\n--- openvpn log ---\n{}", server.log())),
@@ -408,6 +436,94 @@ fn the_key_exchange_completes_against_a_real_openvpn() {
     assert!(
         keys.iter().any(|&byte| byte != 0),
         "and they are derived rather than left empty"
+    );
+}
+
+#[test]
+#[ignore = "spawns a real openvpn process"]
+fn a_ping_from_a_real_openvpn_decrypts() {
+    // The end of the road for the handshake: keys that are actually right.
+    // Everything before this produces 256 bytes that look like key material
+    // whether or not they are, and the only way to tell is to take a packet
+    // encrypted by someone else and get their plaintext back out.
+    //
+    // The server is run with `--ping 1`, so it emits keepalives on the data
+    // channel with no tunnel traffic to carry. Those sixteen bytes are a
+    // constant, so recognising them proves the key derivation, the direction
+    // of the two slots, the framing and the CBC construction all at once.
+    let server = OpenVpnServer::start();
+    let socket = connected_socket(server.port);
+
+    let mut config = SessionConfig::new(
+        server.pki.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.client_auth = Some(ClientAuth {
+        cert_chain_pem: server.pki.client_cert_pem.clone(),
+        private_key_pem: zeroize::Zeroizing::new(server.pki.client_key_pem.clone()),
+    });
+
+    let mut session = Session::new(config).expect("a client");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut buf = [0u8; 4096];
+    let mut data: Option<DataChannel> = None;
+    let mut ping = None;
+
+    while Instant::now() < deadline && ping.is_none() {
+        let now = Instant::now();
+        while let Some(datagram) = session.poll_transmit(now, net_time()) {
+            socket
+                .send(&datagram)
+                .unwrap_or_else(|error| panic!("{error}\n--- openvpn log ---\n{}", server.log()));
+        }
+
+        let len = match socket.recv(&mut buf) {
+            Ok(len) => len,
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(error) => panic!("recv failed: {error}"),
+        };
+
+        // Data packets are the ones the control channel does not want. A
+        // point-to-point peer assigns no peer id, so these arrive as
+        // `P_DATA_V1`.
+        if is_data(&buf[..len]) {
+            let channel = data.get_or_insert_with(|| {
+                DataChannel::new(
+                    DataKeys::for_client(session.keys().expect("keys by now")).expect("256 bytes"),
+                    None,
+                    KeyId::FIRST,
+                )
+            });
+            let payload = channel.decrypt(&buf[..len]).unwrap_or_else(|error| {
+                panic!(
+                    "a data packet from openvpn did not decrypt: {error}\n--- openvpn log ---\n{}",
+                    server.log()
+                )
+            });
+            ping = Some(payload);
+            continue;
+        }
+
+        session
+            .handle(&buf[..len], Instant::now())
+            .unwrap_or_else(|error| panic!("{error}\n--- openvpn log ---\n{}", server.log()));
+    }
+
+    let ping = ping.unwrap_or_else(|| {
+        panic!(
+            "no data packet arrived.\n--- openvpn log ---\n{}",
+            server.log()
+        )
+    });
+
+    assert_eq!(
+        ping, PING,
+        "openvpn's keepalive, decrypted with keys we derived from a PRF it never told us the answer to"
     );
 }
 

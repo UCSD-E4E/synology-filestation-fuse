@@ -73,7 +73,7 @@ pub enum Opcode {
 }
 
 impl Opcode {
-    fn from_u8(value: u8) -> Result<Self, Error> {
+    pub(crate) fn from_u8(value: u8) -> Result<Self, Error> {
         Ok(match value {
             3 => Opcode::ControlSoftResetV1,
             4 => Opcode::ControlV1,
