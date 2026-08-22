@@ -46,3 +46,6 @@ sha2 = "0.10"
 # rather than shelling out to `openssl` keeps the test's dependencies to the
 # one binary it is actually testing against.
 rcgen = "0.14"
+# The in-process peer in `tests/common` is a rustls server, so the tests need
+# rustls directly as well as through the library.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
