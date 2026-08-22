@@ -18,7 +18,9 @@
 //! `tests/wire_format.rs`.
 
 mod channel;
+mod key_method;
 mod packet;
+mod prf;
 mod reliable;
 mod replay;
 mod session;
@@ -26,10 +28,12 @@ mod static_key;
 mod tls_auth;
 
 pub use channel::ControlChannel;
+pub use key_method::{ClientKeyMethod2, ServerKeyMethod2, ServerMessage};
 pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
+pub use prf::{key_expansion, tls1_prf, KeySource2};
 pub use reliable::{Delivery, Outgoing, RecvWindow, SendWindow};
 pub use replay::ReplayWindow;
-pub use session::{ClientAuth, Session, SessionConfig, MAX_TLS_FRAGMENT};
+pub use session::{ClientAuth, Credentials, Session, SessionConfig, MAX_TLS_FRAGMENT};
 pub use static_key::{KeyDirection, StaticKey, STATIC_KEY_LEN};
 pub use tls_auth::{TlsAuth, TlsAuthHeader};
 
@@ -68,6 +72,28 @@ pub enum Error {
 
     #[error("the first packet of a session must be a server reset acknowledging ours")]
     UnexpectedFirstPacket,
+
+    #[error("peer offered key method {0}; only 2 exists")]
+    UnsupportedKeyMethod(u8),
+
+    #[error("the server rejected these credentials{0}")]
+    AuthFailed(
+        /// Whatever the server said after `AUTH_FAILED`, which is sometimes a
+        /// reason and sometimes nothing.
+        String,
+    ),
+
+    #[error("the server sent \"{0}\" where key material was expected")]
+    UnexpectedControlMessage(String),
+
+    #[error("the peer closed the TLS session")]
+    PeerClosed,
+
+    #[error("{context} is longer than the protocol can describe")]
+    FieldTooLong {
+        /// Which field, so the caller knows what to shorten.
+        context: &'static str,
+    },
 
     #[error("TLS: {0}")]
     Tls(String),

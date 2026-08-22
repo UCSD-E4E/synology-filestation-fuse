@@ -80,6 +80,11 @@ impl ControlChannel {
         self.remote_session
     }
 
+    /// The session id we chose.
+    pub fn local_session(&self) -> SessionId {
+        self.local_session
+    }
+
     /// Whether the send window has room for another message.
     ///
     /// A caller deciding when to wake needs this: bytes waiting for a full
