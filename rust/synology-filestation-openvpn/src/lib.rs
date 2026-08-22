@@ -68,6 +68,9 @@ pub enum Error {
     #[error("packet belongs to a different session")]
     WrongSession,
 
+    #[error("packet belongs to key {0:?}, and this session is running {running:?}", running = .1)]
+    OtherKeyId(KeyId, KeyId),
+
     #[error("packet acknowledges messages of a different session")]
     AckForAnotherSession,
 

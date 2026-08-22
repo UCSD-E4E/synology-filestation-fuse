@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use synology_filestation_openvpn::{
-    ClientAuth, ControlChannel, DataChannel, DataKeys, KeyDirection, KeyId, Opcode, Session,
+    ClientAuth, ControlChannel, DataChannel, DataKeys, Error, KeyDirection, KeyId, Opcode, Session,
     SessionConfig, SessionId, StaticKey, TlsAuth, PING,
 };
 
@@ -222,6 +222,9 @@ impl OpenVpnServer {
             // packets on the wire without a tunnel to carry traffic from.
             // Decrypting one of those is what proves the data channel.
             .args(["--ping", "1"])
+            // Renegotiate quickly, so a test can watch one happen instead of
+            // waiting out the hour `reneg-sec` defaults to.
+            .args(["--reneg-sec", "10"])
             .args(["--log", "openvpn.log", "--verb", "4"])
             .current_dir(&dir)
             .stdout(Stdio::null())
@@ -524,6 +527,74 @@ fn a_ping_from_a_real_openvpn_decrypts() {
     assert_eq!(
         ping, PING,
         "openvpn's keepalive, decrypted with keys we derived from a PRF it never told us the answer to"
+    );
+}
+
+#[test]
+#[ignore = "spawns a real openvpn process"]
+fn a_renegotiation_is_refused_rather_than_misread() {
+    // A known limitation, pinned against the thing that will actually do it.
+    // After `reneg-sec` the server starts a new key state, whose messages are
+    // numbered from zero again — and handing those to the window running the
+    // current key would look like replays, so the handshake would vanish with
+    // nothing reporting a fault.
+    //
+    // Today we refuse them by key id and say so. When renegotiation is built,
+    // this test fails, and that is the point of it: it is the reminder.
+    let server = OpenVpnServer::start();
+    let socket = connected_socket(server.port);
+
+    let mut config = SessionConfig::new(
+        server.pki.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.client_auth = Some(ClientAuth {
+        cert_chain_pem: server.pki.client_cert_pem.clone(),
+        private_key_pem: zeroize::Zeroizing::new(server.pki.client_key_pem.clone()),
+    });
+
+    let mut session = Session::new(config).expect("a client");
+    // Long enough for `--reneg-sec 10` to fire, with room for the handshake
+    // in front of it.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut buf = [0u8; 4096];
+    let mut refusal = None;
+
+    while Instant::now() < deadline && refusal.is_none() {
+        let now = Instant::now();
+        while let Some(datagram) = session.poll_transmit(now, net_time()) {
+            let _ = socket.send(&datagram);
+        }
+
+        let len = match socket.recv(&mut buf) {
+            Ok(len) => len,
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(error) => panic!("recv failed: {error}"),
+        };
+        if is_data(&buf[..len]) {
+            continue;
+        }
+
+        if let Err(error) = session.handle(&buf[..len], Instant::now()) {
+            refusal = Some(error);
+        }
+    }
+
+    let refusal = refusal.unwrap_or_else(|| {
+        panic!(
+            "the server never renegotiated in 25s.\n--- openvpn log ---\n{}",
+            server.log()
+        )
+    });
+
+    assert!(
+        matches!(refusal, Error::OtherKeyId(..)),
+        "a renegotiation should be refused by key id, not misread as something else: {refusal}"
     );
 }
 

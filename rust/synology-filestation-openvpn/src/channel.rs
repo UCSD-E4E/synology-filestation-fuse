@@ -216,6 +216,19 @@ impl ControlChannel {
             // hold the first packet to.
             None => {}
         }
+        // A packet for another key id is a renegotiation: the peer has begun
+        // a new key state, which starts its message numbering again from
+        // zero. Feeding that to the window running the current key would look
+        // like a replay of messages we have already had, and the reliability
+        // layer would quietly drop a handshake nobody could see failing.
+        //
+        // Refusing it is not the same as handling it — running a second key
+        // state is not built yet — but it makes the limit visible instead of
+        // silent, and it is what the next piece of work replaces.
+        if packet.key_id != self.key_id {
+            return Err(Error::OtherKeyId(packet.key_id, self.key_id));
+        }
+
         if let Some(acks) = &packet.acks {
             if acks.session_id() != self.local_session {
                 // Acknowledgements for a session that is not ours would clear
