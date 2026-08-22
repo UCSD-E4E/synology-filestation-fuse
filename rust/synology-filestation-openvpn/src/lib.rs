@@ -18,6 +18,7 @@
 //! `tests/wire_format.rs`.
 
 mod channel;
+mod data;
 mod key_method;
 mod packet;
 mod prf;
@@ -28,6 +29,7 @@ mod static_key;
 mod tls_auth;
 
 pub use channel::ControlChannel;
+pub use data::{DataChannel, DataKeys, PING};
 pub use key_method::{ClientKeyMethod2, ServerKeyMethod2, ServerMessage};
 pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 pub use prf::{key_expansion, tls1_prf, KeySource2};
@@ -88,6 +90,15 @@ pub enum Error {
 
     #[error("the peer closed the TLS session")]
     PeerClosed,
+
+    #[error("a data packet cannot have opcode {0:?}")]
+    UnexpectedDataOpcode(Opcode),
+
+    #[error("the packet does not decrypt to a whole number of blocks")]
+    BadPadding,
+
+    #[error("this key has sent every packet id it has")]
+    PacketIdExhausted,
 
     #[error("{context} is longer than the protocol can describe")]
     FieldTooLong {
