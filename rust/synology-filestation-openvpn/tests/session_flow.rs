@@ -409,7 +409,14 @@ fn a_handshake_survives_a_link_that_loses_and_reorders() {
     ));
     let mut session = session_against(&server);
 
-    exchange_lossy(&mut session, &mut server, Instant::now(), 3).expect("recovery, not failure");
+    exchange_lossy(
+        &mut session,
+        &mut server,
+        Instant::now(),
+        3,
+        |session, _| session.is_ready(),
+    )
+    .expect("recovery, not failure");
 
     assert!(session.is_ready(), "the handshake finished anyway");
     assert_eq!(
@@ -429,7 +436,14 @@ fn a_handshake_survives_heavier_loss() {
     let mut server = FakeServer::new(Answer::KeyMaterialThen("PUSH_REPLY,peer-id 7".to_string()));
     let mut session = session_against(&server);
 
-    exchange_lossy(&mut session, &mut server, Instant::now(), 2).expect("recovery, not failure");
+    exchange_lossy(
+        &mut session,
+        &mut server,
+        Instant::now(),
+        2,
+        |session, _| session.is_ready(),
+    )
+    .expect("recovery, not failure");
 
     assert!(session.is_ready());
     assert_eq!(
@@ -439,4 +453,73 @@ fn a_handshake_survives_heavier_loss() {
             .map(|id| id.get()),
         Some(7)
     );
+}
+
+#[test]
+fn a_renegotiation_replaces_the_keys_without_stopping_the_tunnel() {
+    // What `reneg-sec` does to a copy that outlives it, which every
+    // multi-gigabyte copy does. The peer starts a new generation; a second
+    // TLS handshake and key exchange run on the same control channel under a
+    // new key id; and when they finish the tunnel is carrying traffic under
+    // keys that did not exist a moment ago.
+    //
+    // The old keys keep working throughout. A renegotiation that paused the
+    // tunnel would be one nobody could afford to run mid-copy.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+
+    let first_keys = session.keys().expect("keys").to_vec();
+    assert!(session.is_ready());
+
+    // The tunnel works before.
+    let before = session
+        .send_payload(start, b"before the rotation")
+        .expect("wrapped");
+    assert_eq!(
+        server.decrypt_payload(&before).expect("the peer reads it"),
+        b"before the rotation"
+    );
+
+    // And now the peer rotates.
+    let announcement = server.renegotiate();
+    session
+        .handle(&announcement, start)
+        .expect("a new generation, not an intruder");
+    exchange(&mut session, &mut server, start).expect("the second handshake");
+
+    assert!(server.renegotiated(), "the peer saw it through");
+    let second_keys = session.keys().expect("keys").to_vec();
+    assert_ne!(
+        first_keys, second_keys,
+        "new keys, which is the entire point"
+    );
+    assert!(session.is_ready(), "and the tunnel is still there");
+}
+
+#[test]
+fn a_renegotiation_survives_a_link_that_loses_and_reorders() {
+    // The rotation is a whole handshake, so it meets loss like the first one
+    // did — except now there are two message streams in flight at once, and
+    // they must not be confused for one another.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+    let first_keys = session.keys().expect("keys").to_vec();
+
+    let announcement = server.renegotiate();
+    session.handle(&announcement, start).expect("valid");
+    exchange_lossy(&mut session, &mut server, start, 3, |_, server| {
+        server.renegotiated()
+    })
+    .expect("recovery, not failure");
+
+    assert!(server.renegotiated());
+    assert_ne!(first_keys, session.keys().expect("keys").to_vec());
 }

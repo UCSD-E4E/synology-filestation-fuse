@@ -63,6 +63,9 @@ pub enum Answer {
 pub struct FakeServer {
     auth: TlsAuth,
     tls: ServerConnection,
+    /// Kept so a renegotiation can build a second TLS session on the same
+    /// terms, exactly as the client does.
+    tls_config: Arc<ServerConfig>,
     pub ca_pem: String,
     next_message_id: u32,
     next_replay_id: u32,
@@ -87,13 +90,31 @@ pub struct FakeServer {
     /// arrival order is a decryption failure, not a reordering.
     next_expected: u32,
     early: BTreeMap<u32, Vec<u8>>,
+    /// The generation being negotiated, once this peer has started one.
+    ///
+    /// A second everything: its own TLS session, its own message numbering
+    /// from zero, its own key material. Only the session id and the
+    /// `tls-auth` key carry over — which is what makes a renegotiation
+    /// different from a reconnection, and what the client has to get right.
+    reneg: Option<Renegotiation>,
+}
+
+struct Renegotiation {
+    key_id: KeyId,
+    tls: ServerConnection,
+    next_expected: u32,
+    early: BTreeMap<u32, Vec<u8>>,
+    next_message_id: u32,
+    owed_acks: Vec<u32>,
+    plaintext: Vec<u8>,
+    answered: bool,
 }
 
 impl FakeServer {
     pub fn new(answer: Answer) -> Self {
         let key = KeyPairAndCert::generate();
 
-        let config =
+        let config = Arc::new(
             ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
                 .expect("default versions")
@@ -101,14 +122,16 @@ impl FakeServer {
                 // `verify-client-cert none` and takes an AD username and password.
                 .with_no_client_auth()
                 .with_single_cert(key.chain, key.private)
-                .expect("a usable certificate");
+                .expect("a usable certificate"),
+        );
 
         Self {
             auth: TlsAuth::new(
                 &StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
                 KeyDirection::Normal,
             ),
-            tls: ServerConnection::new(Arc::new(config)).expect("a server"),
+            tls: ServerConnection::new(config.clone()).expect("a server"),
+            tls_config: config,
             ca_pem: key.ca_pem,
             next_message_id: 0,
             next_replay_id: 1,
@@ -122,13 +145,59 @@ impl FakeServer {
             data: None,
             next_expected: 0,
             early: BTreeMap::new(),
+            reneg: None,
         }
+    }
+
+    /// Begin a new key generation, as a server does every `reneg-sec`.
+    ///
+    /// Returns the soft reset that announces it.
+    pub fn renegotiate(&mut self) -> Vec<u8> {
+        let key_id = KeyId::new(1).expect("one fits in three bits");
+        let config = self.tls_config.clone();
+        self.reneg = Some(Renegotiation {
+            key_id,
+            tls: ServerConnection::new(config).expect("a server"),
+            next_expected: 0,
+            early: BTreeMap::new(),
+            next_message_id: 0,
+            owed_acks: Vec::new(),
+            plaintext: Vec::new(),
+            answered: false,
+        });
+
+        let packet = ControlPacket {
+            opcode: Opcode::ControlSoftResetV1,
+            key_id,
+            session_id: SERVER_SESSION,
+            acks: None,
+            packet_id: Some(0),
+            payload: Vec::new(),
+        };
+        let reneg = self.reneg.as_mut().expect("just built");
+        reneg.next_message_id = 1;
+        let replay_id = self.next_replay_id;
+        self.next_replay_id += 1;
+        self.auth.wrap(&packet, replay_id, 0)
+    }
+
+    /// Whether the new generation has finished negotiating.
+    pub fn renegotiated(&self) -> bool {
+        self.reneg.as_ref().is_some_and(|reneg| reneg.answered)
     }
 
     /// Take a datagram from the client; give back whatever the peer says.
     pub fn handle(&mut self, datagram: &[u8]) -> Vec<Vec<u8>> {
         let (packet, _) = self.auth.unwrap(datagram).expect("the client signs it");
         self.client_session.get_or_insert(packet.session_id);
+
+        if self
+            .reneg
+            .as_ref()
+            .is_some_and(|reneg| reneg.key_id == packet.key_id)
+        {
+            return self.handle_renegotiation(packet);
+        }
 
         if let Some(id) = packet.packet_id {
             self.owed_acks.push(id);
@@ -208,6 +277,99 @@ impl FakeServer {
     /// receive.
     pub fn encrypt_payload(&mut self, payload: &[u8]) -> Vec<u8> {
         self.tunnel().encrypt(payload).expect("encrypt")
+    }
+
+    /// The same exchange again, under the new key.
+    fn handle_renegotiation(&mut self, packet: ControlPacket) -> Vec<Vec<u8>> {
+        let session = self.client_session.expect("known by now");
+        let reneg = self.reneg.as_mut().expect("checked by the caller");
+
+        if let Some(id) = packet.packet_id {
+            reneg.owed_acks.push(id);
+        }
+
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        if packet.opcode == Opcode::ControlV1 {
+            if let Some(id) = packet.packet_id {
+                if id >= reneg.next_expected {
+                    reneg.early.insert(id, packet.payload);
+                }
+            }
+            while let Some(payload) = reneg.early.remove(&reneg.next_expected) {
+                reneg.next_expected += 1;
+                let mut remaining = payload.as_slice();
+                while !remaining.is_empty() {
+                    reneg.tls.read_tls(&mut remaining).expect("readable");
+                    reneg.tls.process_new_packets().expect("valid TLS");
+                }
+
+                let mut buffer = [0u8; 4096];
+                while let Ok(read) = reneg.tls.reader().read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    reneg.plaintext.extend_from_slice(&buffer[..read]);
+                }
+
+                if reneg.plaintext.len() > 4
+                    && reneg.plaintext[..4] == [0, 0, 0, 0]
+                    && !reneg.answered
+                {
+                    reneg.answered = true;
+                    let reply = server_key_method_2();
+                    reneg.tls.writer().write_all(&reply).expect("write");
+                }
+
+                while reneg.tls.wants_write() {
+                    let mut bytes = Vec::new();
+                    match reneg.tls.write_tls(&mut bytes) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => records.push(bytes),
+                    }
+                }
+            }
+        }
+
+        // Framed with the new key id, and numbered from zero again.
+        let mut out = Vec::new();
+        for record in records {
+            for chunk in record.chunks(1024) {
+                let reneg = self.reneg.as_mut().expect("still there");
+                let acks = take_acks(&mut reneg.owed_acks, session);
+                let id = reneg.next_message_id;
+                reneg.next_message_id += 1;
+                let key_id = reneg.key_id;
+                let packet = ControlPacket {
+                    opcode: Opcode::ControlV1,
+                    key_id,
+                    session_id: SERVER_SESSION,
+                    acks,
+                    packet_id: Some(id),
+                    payload: chunk.to_vec(),
+                };
+                let replay_id = self.next_replay_id;
+                self.next_replay_id += 1;
+                out.push(self.auth.wrap(&packet, replay_id, 0));
+            }
+        }
+
+        let reneg = self.reneg.as_mut().expect("still there");
+        if !reneg.owed_acks.is_empty() {
+            let acks = take_acks(&mut reneg.owed_acks, session);
+            let key_id = reneg.key_id;
+            let packet = ControlPacket {
+                opcode: Opcode::AckV1,
+                key_id,
+                session_id: SERVER_SESSION,
+                acks,
+                packet_id: None,
+                payload: Vec::new(),
+            };
+            let replay_id = self.next_replay_id;
+            self.next_replay_id += 1;
+            out.push(self.auth.wrap(&packet, replay_id, 0));
+        }
+        out
     }
 
     fn read_plaintext(&mut self) {
@@ -388,6 +550,10 @@ pub fn exchange_lossy(
     server: &mut FakeServer,
     now: Instant,
     drop_every: usize,
+    // What "finished" means, said by the caller rather than guessed at here.
+    // A renegotiation begins with the session already ready, so a driver that
+    // assumed readiness was the end would return before it had done anything.
+    done: impl Fn(&synology_filestation_openvpn::Session, &FakeServer) -> bool,
 ) -> Result<(), synology_filestation_openvpn::Error> {
     let mut sent = 0usize;
     let mut at = now;
@@ -427,7 +593,7 @@ pub fn exchange_lossy(
             }
         }
 
-        if session.is_ready() {
+        if done(session, server) {
             return Ok(());
         }
         if let Some(error) = session.failure() {
@@ -488,4 +654,14 @@ fn client_source_from(key_method: &[u8]) -> KeySource2 {
     source.server_random1 = [0x51; 32];
     source.server_random2 = [0x62; 32];
     source
+}
+
+/// Acknowledgements to attach, bounded the way the wire bounds them.
+fn take_acks(owed: &mut Vec<u32>, session: SessionId) -> Option<Acks> {
+    if owed.is_empty() {
+        return None;
+    }
+    let taking = owed.len().min(Acks::MAX);
+    let ids: Vec<u32> = owed.drain(..taking).collect();
+    Some(Acks::new(ids, session).expect("bounded by Acks::MAX"))
 }

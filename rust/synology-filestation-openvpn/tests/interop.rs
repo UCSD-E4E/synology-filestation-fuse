@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use synology_filestation_openvpn::{
-    ClientAuth, ControlChannel, DataChannel, DataKeys, Error, KeyDirection, KeyId, Opcode, Session,
+    ClientAuth, ControlChannel, DataChannel, DataKeys, KeyDirection, KeyId, Opcode, Session,
     SessionConfig, SessionId, StaticKey, TlsAuth, PING,
 };
 
@@ -532,15 +532,18 @@ fn a_ping_from_a_real_openvpn_decrypts() {
 
 #[test]
 #[ignore = "spawns a real openvpn process"]
-fn a_renegotiation_is_refused_rather_than_misread() {
-    // A known limitation, pinned against the thing that will actually do it.
-    // After `reneg-sec` the server starts a new key state, whose messages are
-    // numbered from zero again — and handing those to the window running the
-    // current key would look like replays, so the handshake would vanish with
-    // nothing reporting a fault.
+fn a_renegotiation_completes_against_a_real_openvpn() {
+    // This test used to assert that a renegotiation was *refused*, and said
+    // it would fail the day one could be completed. This is that day.
     //
-    // Today we refuse them by key id and say so. When renegotiation is built,
-    // this test fails, and that is the point of it: it is the reminder.
+    // The server runs `--reneg-sec 10`, so ten seconds in it begins a new key
+    // generation: a soft reset under a new key id, then a second TLS
+    // handshake and key exchange on the same control channel. The keys that
+    // come out are different ones, and the session is still up.
+    //
+    // An hour is the default, and a multi-gigabyte copy passes it by
+    // definition, so this is the difference between a tunnel that survives a
+    // long transfer and one that does not.
     let server = OpenVpnServer::start();
     let socket = connected_socket(server.port);
 
@@ -555,13 +558,11 @@ fn a_renegotiation_is_refused_rather_than_misread() {
     });
 
     let mut session = Session::new(config).expect("a client");
-    // Long enough for `--reneg-sec 10` to fire, with room for the handshake
-    // in front of it.
-    let deadline = Instant::now() + Duration::from_secs(25);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut buf = [0u8; 4096];
-    let mut refusal = None;
+    let mut first_keys: Option<Vec<u8>> = None;
 
-    while Instant::now() < deadline && refusal.is_none() {
+    while Instant::now() < deadline {
         let now = Instant::now();
         while let Some(datagram) = session.poll_transmit(now, net_time()) {
             let _ = socket.send(&datagram);
@@ -569,32 +570,37 @@ fn a_renegotiation_is_refused_rather_than_misread() {
 
         let len = match socket.recv(&mut buf) {
             Ok(len) => len,
-            Err(error)
-                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
-            {
-                continue
-            }
-            Err(error) => panic!("recv failed: {error}"),
+            Err(_) => continue,
         };
         if is_data(&buf[..len]) {
             continue;
         }
 
+        // A refused datagram is not a refused session; only a fatal one ends
+        // it. Reordering and retransmission both produce the other sort.
         if let Err(error) = session.handle(&buf[..len], Instant::now()) {
-            refusal = Some(error);
+            assert!(
+                !error.is_fatal(),
+                "{error}\n--- openvpn log ---\n{}",
+                server.log()
+            );
+            continue;
+        }
+
+        match (&first_keys, session.keys()) {
+            (None, Some(keys)) => first_keys = Some(keys.to_vec()),
+            (Some(first), Some(now_keys)) if first != now_keys => {
+                // The keys changed under us, which only a completed
+                // renegotiation does.
+                return;
+            }
+            _ => {}
         }
     }
 
-    let refusal = refusal.unwrap_or_else(|| {
-        panic!(
-            "the server never renegotiated in 25s.\n--- openvpn log ---\n{}",
-            server.log()
-        )
-    });
-
-    assert!(
-        matches!(refusal, Error::OtherKeyId(..)),
-        "a renegotiation should be refused by key id, not misread as something else: {refusal}"
+    panic!(
+        "no renegotiation completed in 30s.\n--- openvpn log ---\n{}",
+        server.log()
     );
 }
 
