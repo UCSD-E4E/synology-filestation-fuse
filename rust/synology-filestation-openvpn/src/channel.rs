@@ -138,11 +138,17 @@ impl ControlChannel {
 
     /// Make the negotiated generation the one that carries traffic.
     ///
-    /// The old state is dropped rather than kept: OpenVPN keeps it briefly to
-    /// decrypt packets still in flight under the old key, which matters for a
-    /// tunnel carrying its own traffic. This client's caller re-keys its data
-    /// channel at the same moment, so the window where that would help is the
-    /// time it takes to return from this call.
+    /// The old *control* state is dropped: its handshake is over, and the
+    /// peer has no more to say under it.
+    ///
+    /// The old *data* keys are a different matter, and the caller keeps them
+    /// for a while — see `Session::receive_payload`. Two windows open around
+    /// this call, and only one of them can be closed from here. Packets the
+    /// peer sent under the old key may still be in flight, which the caller
+    /// handles by keeping the old key to decrypt with. And packets we send
+    /// under the new key may arrive before the peer has activated its own new
+    /// state, which it drops; those are recovered by whatever sits above the
+    /// tunnel, as any lost packet is.
     pub fn promote(&mut self) {
         if let Some(pending) = self.pending.take() {
             self.primary = pending;
@@ -271,11 +277,21 @@ impl ControlChannel {
         // generation. Refusing it — which this did until renegotiation
         // existed — leaves the peer negotiating with nobody and eventually
         // dropping the session, an hour into whatever it was carrying.
-        if packet.opcode == Opcode::ControlSoftResetV1
-            && packet.key_id != self.primary.key_id
-            && self.pending.is_none()
-        {
-            self.pending = Some(KeyState::new(packet.key_id, self.tls_timeout));
+        if packet.opcode == Opcode::ControlSoftResetV1 && packet.key_id != self.primary.key_id {
+            // A soft reset for a generation we are not already negotiating
+            // replaces whatever we were negotiating. A peer whose attempt
+            // stalled simply tries again under the next key id, and holding
+            // on to the abandoned one would refuse every later attempt as
+            // `OtherKeyId` — the session then dies when the key it is still
+            // using expires, which is the failure renegotiation exists to
+            // prevent.
+            let already = self
+                .pending
+                .as_ref()
+                .is_some_and(|state| state.key_id == packet.key_id);
+            if !already {
+                self.pending = Some(KeyState::new(packet.key_id, self.tls_timeout));
+            }
         }
 
         // Settled before the state is borrowed, and only now that every

@@ -523,3 +523,64 @@ fn a_renegotiation_survives_a_link_that_loses_and_reorders() {
     assert!(server.renegotiated());
     assert_ne!(first_keys, session.keys().expect("keys").to_vec());
 }
+
+#[test]
+fn packets_still_in_flight_under_the_old_keys_are_read_after_a_rotation() {
+    // A rotation does not stop what is already on the wire. A tunnel that
+    // forgot the old keys the instant it re-keyed would drop the last few
+    // packets of every rotation — an hour apart, and indistinguishable from a
+    // lossy link.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+
+    // The peer sends under the keys in force now...
+    let in_flight = server.encrypt_payload(b"sent before the rotation");
+
+    // ...and the rotation happens before it is read.
+    let announcement = server.renegotiate();
+    session
+        .handle(&announcement, start)
+        .expect("a new generation");
+    exchange(&mut session, &mut server, start).expect("the second handshake");
+    assert!(server.renegotiated());
+
+    assert_eq!(
+        session.receive_payload(&in_flight).expect("still readable"),
+        Some(b"sent before the rotation".to_vec()),
+        "the old keys outlive the rotation by exactly as long as they need to"
+    );
+}
+
+#[test]
+fn a_renegotiation_the_peer_abandons_does_not_block_the_next_one() {
+    // The peer announces a generation and then says nothing more about it —
+    // and later tries again under a different key. Ours has to follow, or it
+    // would be negotiating a generation nobody is listening for.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+    let first_keys = session.keys().expect("keys").to_vec();
+
+    // Announced, then abandoned: the peer's own state is replaced when it
+    // starts again.
+    let abandoned = server.renegotiate();
+    session.handle(&abandoned, start).expect("a new generation");
+
+    let second = server.renegotiate();
+    session.handle(&second, start).expect("and another");
+    exchange(&mut session, &mut server, start).expect("the one that finishes");
+
+    assert!(server.renegotiated());
+    assert_ne!(
+        first_keys,
+        session.keys().expect("keys").to_vec(),
+        "the second attempt saw it through"
+    );
+}

@@ -193,6 +193,9 @@ pub struct Session {
     push_first_requested_at: Option<Instant>,
     /// The tunnel itself, once there are keys to build it from.
     data: Option<DataChannel>,
+    /// The tunnel as it was before the last rotation, kept only long enough
+    /// for packets already in flight under those keys.
+    previous_data: Option<DataChannel>,
     /// When we last put anything on the wire, which is what a keepalive is
     /// measured from.
     last_sent: Option<Instant>,
@@ -232,6 +235,7 @@ impl Session {
             push_requested_at: None,
             push_first_requested_at: None,
             data: None,
+            previous_data: None,
             last_sent: None,
             failure: None,
         };
@@ -293,7 +297,26 @@ impl Session {
     /// would splice them into whatever stream the caller is reassembling.
     pub fn receive_payload(&mut self, datagram: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let data = self.data.as_mut().ok_or(Error::NotReady)?;
-        let payload = data.decrypt(datagram)?;
+        let payload = match data.decrypt(datagram) {
+            Ok(payload) => {
+                // Something arrived under the new key, so nothing more will
+                // arrive under the old one.
+                self.previous_data = None;
+                payload
+            }
+            // A packet from before the rotation, still in flight. It is a
+            // packet, not an intruder.
+            Err(Error::OtherKeyId(..)) => match self.previous_data.as_mut() {
+                Some(previous) => previous.decrypt(datagram)?,
+                None => {
+                    return Err(Error::OtherKeyId(
+                        self.channel.key_id(),
+                        self.channel.key_id(),
+                    ))
+                }
+            },
+            Err(error) => return Err(error),
+        };
         if payload == crate::PING {
             return Ok(None);
         }
@@ -411,6 +434,15 @@ impl Session {
         if self.channel.can_send() && (self.tls.wants_write() || !self.outbox.is_empty()) {
             return Some(now);
         }
+        // And about the other handshake, if one is running. A fragment
+        // waiting in its outbox is work `poll_transmit` will do the moment it
+        // is asked, and a caller that slept instead would stall a
+        // renegotiation the peer is timing.
+        if let Some(pending) = &self.renegotiation {
+            if pending.tls.wants_write() || !pending.outbox.is_empty() {
+                return Some(now);
+            }
+        }
 
         // Everything `poll_transmit` will do on a timer has to be here too.
         // The keepalive is the one that matters: once the handshake settles
@@ -495,7 +527,14 @@ impl Session {
         let Some(key_id) = self.channel.pending_key_id() else {
             return Ok(());
         };
-        if self.renegotiation.is_some() {
+        // A different key id means the peer gave up on its last attempt and
+        // started another. Ours has to start again with it, or we would be
+        // negotiating a generation nobody is listening for.
+        if self
+            .renegotiation
+            .as_ref()
+            .is_some_and(|pending| pending.key_id == key_id)
+        {
             return Ok(());
         }
 
@@ -555,16 +594,22 @@ impl Session {
             }
         }
 
-        let reply = match ServerMessage::decode(&pending.inbound) {
+        let (reply, used) = match ServerMessage::decode(&pending.inbound) {
             Err(Error::Truncated { .. }) => return Ok(()),
             Err(error) => return Err(error),
-            Ok((ServerMessage::Control(text), _)) => {
+            Ok((ServerMessage::Control(text), used)) => {
+                // Consumed even though it is an error. Left in the buffer it
+                // would be decoded again on every later datagram, and the key
+                // material queued behind it would never be reached — a
+                // renegotiation wedged for good by one message we had no use
+                // for.
+                pending.inbound = Zeroizing::new(pending.inbound[used..].to_vec());
                 return Err(match text.strip_prefix("AUTH_FAILED") {
                     Some(detail) => Error::AuthFailed(detail.to_string()),
                     None => Error::UnexpectedControlMessage(text),
-                })
+                });
             }
-            Ok((ServerMessage::KeyMethod2(reply), _)) => reply,
+            Ok((ServerMessage::KeyMethod2(reply), used)) => (reply, used),
         };
 
         pending.source.server_random1 = reply.random1;
@@ -586,8 +631,17 @@ impl Session {
         self.tls = pending.tls;
         self.outbox = pending.outbox;
         self.source = pending.source;
-        self.inbound = Zeroizing::new(Vec::new());
+        // Only what the key material used. A peer can put more behind it in
+        // the same flight — a deferred authentication answers that way — and
+        // discarding the remainder loses bytes TLS will not hand over twice.
+        self.inbound = Zeroizing::new(pending.inbound[used..].to_vec());
         self.keys = Some(keys);
+
+        // The old keys stay reachable for a moment. Packets the peer sent
+        // under them may still be in flight, and a tunnel that forgot them the
+        // instant it re-keyed would drop the last few packets of every
+        // rotation — an hour apart, and indistinguishable from a lossy link.
+        self.previous_data = self.data.take();
         self.open_tunnel()?;
         Ok(())
     }

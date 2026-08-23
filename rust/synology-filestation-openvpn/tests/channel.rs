@@ -660,3 +660,41 @@ fn a_forged_packet_never_reaches_the_reliability_layer() {
         "the reset is still in flight, because that ack was never authentic"
     );
 }
+
+#[test]
+fn a_second_attempt_replaces_an_abandoned_one() {
+    // A peer whose renegotiation stalls simply tries again under the next key
+    // id. Holding on to the abandoned generation would refuse every later
+    // attempt as `OtherKeyId`, and the session would then die when the key it
+    // is still using expires — the exact failure renegotiation prevents.
+    let now = Instant::now();
+    let (mut client, _) = handshaken(now);
+    let signer = TlsAuth::new(&key(), KeyDirection::Normal);
+
+    let soft_reset = |key_id: KeyId| ControlPacket {
+        opcode: Opcode::ControlSoftResetV1,
+        key_id,
+        session_id: SERVER_SESSION,
+        acks: None,
+        packet_id: Some(0),
+        payload: Vec::new(),
+    };
+
+    let first = KeyId::new(1).expect("one fits");
+    client
+        .handle(&signer.wrap(&soft_reset(first), 2, 0), now)
+        .expect("a new generation");
+    assert_eq!(client.pending_key_id(), Some(first));
+
+    // It stalls, and the peer tries again.
+    let second = KeyId::new(2).expect("two fits");
+    client
+        .handle(&signer.wrap(&soft_reset(second), 3, 0), now)
+        .expect("and another");
+
+    assert_eq!(
+        client.pending_key_id(),
+        Some(second),
+        "the newer attempt is the one being negotiated"
+    );
+}
