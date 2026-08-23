@@ -75,6 +75,14 @@ pub struct FakeServer {
     /// Both ends' material, once the client has sent its half.
     client_source: Option<KeySource2>,
     data: Option<DataChannel>,
+    /// Client message ids already handed to TLS.
+    ///
+    /// The peer needs this much of a reliability layer and no more: a client
+    /// that retransmits — which is the whole point of it doing so — would
+    /// otherwise feed the same TLS record in twice, and TLS treats a repeated
+    /// record as an attack rather than as a duplicate. Real peers deduplicate
+    /// before TLS ever sees the bytes.
+    delivered: Vec<u32>,
 }
 
 impl FakeServer {
@@ -108,6 +116,7 @@ impl FakeServer {
             answered_push: false,
             client_source: None,
             data: None,
+            delivered: Vec::new(),
         }
     }
 
@@ -124,14 +133,18 @@ impl FakeServer {
         match packet.opcode {
             Opcode::ControlHardResetClientV2 => out.push(self.reset()),
             Opcode::ControlV1 => {
-                let mut remaining = packet.payload.as_slice();
-                while !remaining.is_empty() {
-                    self.tls.read_tls(&mut remaining).expect("readable");
-                    self.tls.process_new_packets().expect("valid TLS");
+                let id = packet.packet_id.expect("a control message is numbered");
+                if !self.delivered.contains(&id) {
+                    self.delivered.push(id);
+                    let mut remaining = packet.payload.as_slice();
+                    while !remaining.is_empty() {
+                        self.tls.read_tls(&mut remaining).expect("readable");
+                        self.tls.process_new_packets().expect("valid TLS");
+                    }
+                    self.read_plaintext();
+                    self.speak();
+                    out.extend(self.flush_tls());
                 }
-                self.read_plaintext();
-                self.speak();
-                out.extend(self.flush_tls());
             }
             _ => {}
         }
@@ -339,6 +352,69 @@ impl KeyPairAndCert {
             ca_pem: cert.cert.pem(),
         }
     }
+}
+
+/// Drive a session against a peer over a link that loses and reorders.
+///
+/// Only datagrams *to* the peer are dropped: this peer does not retransmit —
+/// deliberately, it is meant to be simple — so losing one of its replies would
+/// stall a handshake for reasons that say nothing about the client. What is
+/// under test is the client's own recovery: its retransmission timer, and its
+/// receive window putting a reordered flight back in order before TLS ever
+/// sees it.
+///
+/// Time advances in steps longer than the retransmission timeout, so a lost
+/// message is actually resent rather than merely queued.
+pub fn exchange_lossy(
+    session: &mut synology_filestation_openvpn::Session,
+    server: &mut FakeServer,
+    now: Instant,
+    drop_every: usize,
+) -> Result<(), synology_filestation_openvpn::Error> {
+    let mut sent = 0usize;
+    let mut at = now;
+
+    for _ in 0..200 {
+        let mut progressed = false;
+
+        while let Some(datagram) = session.poll_transmit(at, 0) {
+            sent += 1;
+            if sent.is_multiple_of(drop_every) {
+                continue; // lost on the way out
+            }
+            // Backwards, so the client's receive window has to put a flight
+            // back in order before TLS sees any of it.
+            for reply in server.handle(&datagram).into_iter().rev() {
+                progressed = true;
+                // A refused datagram is not a refused session. Reordering
+                // makes this happen for real: a flight arriving backwards
+                // puts the peer's acknowledgement in front of the reset that
+                // opens the session, and the client is right to turn that
+                // away — the reset is along in a moment. A driver that gave up
+                // here could not survive a reordered link.
+                if let Err(error) = session.handle(&reply, at) {
+                    if error.is_fatal() {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        if session.is_ready() {
+            return Ok(());
+        }
+        if let Some(error) = session.failure() {
+            return Err(error.clone());
+        }
+
+        // Only now does the clock move: waiting is what a retransmission
+        // timer is for, and advancing it on a round that made progress would
+        // spend the handshake's own deadlines on nothing.
+        if !progressed {
+            at += Duration::from_millis(2_500);
+        }
+    }
+    Ok(())
 }
 
 /// Drive a session against a peer until it stops having anything to say.

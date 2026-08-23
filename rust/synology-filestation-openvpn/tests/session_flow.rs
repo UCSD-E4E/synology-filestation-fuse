@@ -14,7 +14,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{exchange, Answer, FakeServer, TA_KEY_HEX};
+use common::{exchange, exchange_lossy, Answer, FakeServer, TA_KEY_HEX};
 use synology_filestation_openvpn::{Error, Session, SessionConfig, StaticKey, PING};
 
 fn session_against(server: &FakeServer) -> Session {
@@ -393,4 +393,50 @@ fn a_keepalive_interval_of_zero_means_no_keepalive() {
     assert!(session
         .poll_transmit(start + Duration::from_secs(3600), 0)
         .is_none());
+}
+
+#[test]
+fn a_handshake_survives_a_link_that_loses_and_reorders() {
+    // The reliability layer is tested on its own, and the session is tested
+    // over a link that behaves. Neither says anything about the two together,
+    // and that composition is where every recurring bug in this crate has
+    // lived: each layer right, the seam between them wrong.
+    //
+    // Every third datagram out is lost, and every flight in arrives
+    // backwards.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC,ping 10".to_string(),
+    ));
+    let mut session = session_against(&server);
+
+    exchange_lossy(&mut session, &mut server, Instant::now(), 3).expect("recovery, not failure");
+
+    assert!(session.is_ready(), "the handshake finished anyway");
+    assert_eq!(
+        session
+            .push_reply()
+            .and_then(|reply| reply.peer_id)
+            .map(|id| id.get()),
+        Some(4),
+        "and everything arrived, in order, exactly once"
+    );
+}
+
+#[test]
+fn a_handshake_survives_heavier_loss() {
+    // Every other datagram. Slower, not different: the same timer runs more
+    // often.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen("PUSH_REPLY,peer-id 7".to_string()));
+    let mut session = session_against(&server);
+
+    exchange_lossy(&mut session, &mut server, Instant::now(), 2).expect("recovery, not failure");
+
+    assert!(session.is_ready());
+    assert_eq!(
+        session
+            .push_reply()
+            .and_then(|reply| reply.peer_id)
+            .map(|id| id.get()),
+        Some(7)
+    );
 }
