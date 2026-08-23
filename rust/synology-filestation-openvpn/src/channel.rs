@@ -157,7 +157,18 @@ impl ControlChannel {
 
     /// Whether the generation carrying traffic has room for another message.
     pub fn can_send(&self) -> bool {
-        !self.primary.send.is_full()
+        self.can_send_for(self.primary.key_id)
+    }
+
+    /// The same question about either generation.
+    ///
+    /// A caller deciding when to wake needs this per key: bytes held back by
+    /// one generation's full window are a reason to wait for *its*
+    /// acknowledgement, not a reason to be woken immediately.
+    pub fn can_send_for(&self, key_id: KeyId) -> bool {
+        self.states()
+            .find(|state| state.key_id == key_id)
+            .is_some_and(|state| !state.send.is_full())
     }
 
     /// The next datagram to put on the wire, if there is one.

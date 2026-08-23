@@ -434,12 +434,17 @@ impl Session {
         if self.channel.can_send() && (self.tls.wants_write() || !self.outbox.is_empty()) {
             return Some(now);
         }
-        // And about the other handshake, if one is running. A fragment
-        // waiting in its outbox is work `poll_transmit` will do the moment it
-        // is asked, and a caller that slept instead would stall a
-        // renegotiation the peer is timing.
+        // And about the other handshake, if one is running — under the same
+        // condition as the first. A fragment waiting in its outbox is work
+        // `poll_transmit` will do the moment it is asked, *if* that
+        // generation's window has room; if it has not, the thing to wait for
+        // is an acknowledgement, and answering `now` would be a busy loop
+        // rather than a wakeup. That is the mistake the primary's guard
+        // already exists to prevent, and this clause had made it again.
         if let Some(pending) = &self.renegotiation {
-            if pending.tls.wants_write() || !pending.outbox.is_empty() {
+            if self.channel.can_send_for(pending.key_id)
+                && (pending.tls.wants_write() || !pending.outbox.is_empty())
+            {
                 return Some(now);
             }
         }

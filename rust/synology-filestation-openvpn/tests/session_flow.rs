@@ -584,3 +584,124 @@ fn a_renegotiation_the_peer_abandons_does_not_block_the_next_one() {
         "the second attempt saw it through"
     );
 }
+
+/// The invariant that seven separate bugs have violated.
+///
+/// `next_wakeup` is a promise about `poll_transmit`: if there is something to
+/// send now, the caller must be told to ask now. Every time a new thing was
+/// added that `poll_transmit` would do — fast retransmit, a freed send window,
+/// the keepalive, a renegotiation's outbox — the wakeup was not told about it,
+/// and a caller sleeping on the answer missed it.
+///
+/// Checking it once per state is worth more than remembering to update two
+/// functions together, because it holds for paths nobody has written yet.
+/// Asking the question costs a datagram, so the datagram is delivered rather
+/// than dropped: a check that quietly loses the opening reset would be
+/// measuring a session it had broken.
+fn wakeup_agrees_with_transmit(
+    session: &mut Session,
+    server: &mut FakeServer,
+    now: Instant,
+    state: &str,
+) {
+    let wakeup = session.next_wakeup(now);
+    let datagram = session.poll_transmit(now, 0);
+    let sends = datagram.is_some();
+
+    if let Some(datagram) = datagram {
+        // `poll_transmit` speaks for both channels, so what comes back may be
+        // a keepalive rather than a handshake message — and the peer's control
+        // path cannot authenticate one of those.
+        if Session::is_data(&datagram) {
+            server
+                .decrypt_payload(&datagram)
+                .expect("the peer reads it");
+        } else {
+            for reply in server.handle(&datagram) {
+                let _ = session.handle(&reply, now);
+            }
+        }
+    }
+
+    if sends {
+        // At or before `now`: a deadline already past means "due", and a
+        // caller sleeping until it wakes immediately. What must never happen
+        // is a wakeup in the future, or none at all, while something waits.
+        match wakeup {
+            Some(at) => assert!(
+                at <= now,
+                "{state}: something to send, and the wakeup pointed at the future"
+            ),
+            None => panic!("{state}: something to send, and the wakeup said idle"),
+        }
+    }
+    if wakeup.is_none() {
+        assert!(
+            !sends,
+            "{state}: the wakeup said idle and there was something to send"
+        );
+    }
+}
+
+#[test]
+fn the_wakeup_never_disagrees_with_what_can_be_sent() {
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC,ping 10".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+
+    // Fresh: rustls has a ClientHello ready before the channel has anything.
+    wakeup_agrees_with_transmit(&mut session, &mut server, start, "before the handshake");
+
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+    wakeup_agrees_with_transmit(&mut session, &mut server, start, "settled");
+
+    // A keepalive coming due.
+    wakeup_agrees_with_transmit(
+        &mut session,
+        &mut server,
+        start + Duration::from_secs(30),
+        "keepalive due",
+    );
+
+    // And in the middle of a rotation, where a second handshake's fragments
+    // are waiting on a second key.
+    let announcement = server.renegotiate();
+    session
+        .handle(&announcement, start)
+        .expect("a new generation");
+    // Several times over: the first thing due is the channel's own
+    // acknowledgement of the soft reset, and only once that is gone is the
+    // second handshake's first fragment the *only* thing waiting — which is
+    // the state where forgetting it in the wakeup actually shows.
+    for step in 0..4 {
+        wakeup_agrees_with_transmit(
+            &mut session,
+            &mut server,
+            start,
+            &format!("renegotiating, step {step}"),
+        );
+    }
+
+    exchange(&mut session, &mut server, start).expect("the second handshake");
+    wakeup_agrees_with_transmit(&mut session, &mut server, start, "after the rotation");
+}
+
+#[test]
+fn the_wakeup_agrees_while_a_push_reply_is_outstanding() {
+    // The retry path has its own timer, and its own chance to be forgotten.
+    let mut server = FakeServer::new(Answer::KeyMaterialOnly);
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("silence is not yet an error");
+
+    for after in [0u64, 3, 6, 12] {
+        wakeup_agrees_with_transmit(
+            &mut session,
+            &mut server,
+            start + Duration::from_secs(after),
+            &format!("{after}s into waiting for a push reply"),
+        );
+    }
+}

@@ -606,6 +606,89 @@ fn a_renegotiation_completes_against_a_real_openvpn() {
 
 #[test]
 #[ignore = "spawns a real openvpn process"]
+fn a_packet_sent_immediately_after_a_rotation_is_accepted() {
+    // `promote` documents a window it cannot close: our packets under the new
+    // key can arrive before the peer has activated its own new state, and it
+    // drops what it cannot yet decrypt. Whether that window is real, and how
+    // wide, is a question about openvpn rather than about this code — so it
+    // is measured rather than reasoned about.
+    //
+    // If this ever fails, the answer is to keep sending under the old key
+    // until something arrives under the new one. Today it passes, which says
+    // the peer has both halves by the time it sends us its own key material.
+    let server = OpenVpnServer::start();
+    let socket = connected_socket(server.port);
+
+    let mut config = SessionConfig::new(
+        server.pki.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.client_auth = Some(ClientAuth {
+        cert_chain_pem: server.pki.client_cert_pem.clone(),
+        private_key_pem: zeroize::Zeroizing::new(server.pki.client_key_pem.clone()),
+    });
+
+    let mut session = Session::new(config).expect("a client");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut buf = [0u8; 4096];
+    let mut first_keys: Option<Vec<u8>> = None;
+    let mut rotated = false;
+
+    while Instant::now() < deadline && !rotated {
+        let now = Instant::now();
+        while let Some(datagram) = session.poll_transmit(now, net_time()) {
+            let _ = socket.send(&datagram);
+        }
+
+        let len = match socket.recv(&mut buf) {
+            Ok(len) => len,
+            Err(_) => continue,
+        };
+        if is_data(&buf[..len]) {
+            continue;
+        }
+        if let Err(error) = session.handle(&buf[..len], Instant::now()) {
+            assert!(!error.is_fatal(), "{error}");
+            continue;
+        }
+
+        match (&first_keys, session.keys()) {
+            (None, Some(keys)) => first_keys = Some(keys.to_vec()),
+            (Some(first), Some(current)) if first != current => rotated = true,
+            _ => {}
+        }
+    }
+    assert!(
+        rotated,
+        "no rotation.\n--- openvpn log ---\n{}",
+        server.log()
+    );
+
+    // Immediately: no waiting, no settling.
+    let complaints_before = server
+        .log()
+        .matches("Authenticate/Decrypt packet error")
+        .count();
+    let datagram = session
+        .send_payload(Instant::now(), &PING)
+        .expect("the tunnel is up");
+    socket.send(&datagram).expect("send");
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert_eq!(
+        server
+            .log()
+            .matches("Authenticate/Decrypt packet error")
+            .count(),
+        complaints_before,
+        "openvpn refused a packet sent under the keys it had just given us.\n--- its log ---\n{}",
+        server.log()
+    );
+}
+
+#[test]
+#[ignore = "spawns a real openvpn process"]
 fn a_real_openvpn_accepts_a_packet_we_encrypted() {
     // Everything else here proves we can *read* what openvpn sends. Nothing
     // proved it can read what we send — our encryption was checked only by our
