@@ -274,6 +274,41 @@ fn control_payloads_come_out_in_the_order_they_were_sent() {
 }
 
 #[test]
+fn a_packet_for_another_key_is_refused_rather_than_misread() {
+    // A renegotiation is a new key state, and a new key state numbers its
+    // messages from zero again. Handed to the window running the current key,
+    // those look like replays of messages long since delivered, and the
+    // handshake behind them disappears without anything reporting a fault.
+    //
+    // Refusing is not handling — running two key states is the next piece of
+    // work — but a visible limit beats an invisible one.
+    let now = Instant::now();
+    let (mut client, _) = handshaken(now);
+
+    let renegotiation = ControlPacket {
+        opcode: Opcode::ControlSoftResetV1,
+        key_id: KeyId::new(1).expect("one fits in three bits"),
+        session_id: SERVER_SESSION,
+        acks: None,
+        packet_id: Some(0),
+        payload: Vec::new(),
+    };
+    let datagram = TlsAuth::new(&key(), KeyDirection::Normal).wrap(&renegotiation, 2, 0);
+
+    assert_eq!(
+        client.handle(&datagram, now).unwrap_err(),
+        Error::OtherKeyId(KeyId::new(1).expect("one fits"), KeyId::FIRST)
+    );
+
+    // And the key we are running is untouched by it.
+    client.send_control(b"still working".to_vec());
+    let next = client.poll_transmit(now, 0).expect("something to send");
+    let (packet, _) = read(&next);
+    assert_eq!(packet.key_id, KeyId::FIRST);
+    assert_eq!(packet.payload, b"still working");
+}
+
+#[test]
 fn a_packet_from_a_different_session_is_refused() {
     // Once the peer's session id is known, a packet claiming another one is
     // either a stale session or somebody else's, and neither belongs here.

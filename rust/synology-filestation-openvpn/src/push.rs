@@ -50,6 +50,13 @@ pub struct PushReply {
     pub ping: Option<Duration>,
     /// How long the server will wait before concluding we have gone.
     pub ping_restart: Option<Duration>,
+    /// A compression directive, if the server pushed one.
+    ///
+    /// Compression is not a detail of the payload — it prepends a byte to
+    /// every packet and changes the framing, exactly as a different cipher
+    /// would. This client implements none, so a server that enables it is one
+    /// we cannot talk to.
+    pub compression: Option<String>,
     /// Every directive, in the order they arrived, including the ones above.
     pub directives: Vec<String>,
 }
@@ -94,6 +101,10 @@ impl PushReply {
                         .map_err(|_| Error::BadPushDirective(directive.to_string()))?;
                     parsed.ifconfig = Some((address, mask));
                 }
+                // `comp-lzo no` is the server saying it is *off*, which is
+                // the one form that asks nothing of us.
+                ("comp-lzo", ["no"]) => {}
+                ("comp-lzo" | "compress", _) => parsed.compression = Some(directive.to_string()),
                 ("ping", [seconds]) => parsed.ping = Some(seconds_from(seconds, directive)?),
                 ("ping-restart", [seconds]) => {
                     parsed.ping_restart = Some(seconds_from(seconds, directive)?)
@@ -107,6 +118,11 @@ impl PushReply {
         }
 
         Ok(parsed)
+    }
+
+    /// Whether the server asked for compression we cannot do.
+    pub fn compression_is_supported(&self) -> bool {
+        self.compression.is_none()
     }
 
     /// Whether the cipher the server chose is one we can speak.
