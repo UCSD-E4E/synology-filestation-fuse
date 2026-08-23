@@ -22,6 +22,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,14 +76,17 @@ pub struct FakeServer {
     /// Both ends' material, once the client has sent its half.
     client_source: Option<KeySource2>,
     data: Option<DataChannel>,
-    /// Client message ids already handed to TLS.
+    /// The peer's receive window: the next client message it expects, and the
+    /// ones that arrived early.
     ///
-    /// The peer needs this much of a reliability layer and no more: a client
-    /// that retransmits — which is the whole point of it doing so — would
-    /// otherwise feed the same TLS record in twice, and TLS treats a repeated
-    /// record as an attack rather than as a duplicate. Real peers deduplicate
-    /// before TLS ever sees the bytes.
-    delivered: Vec<u32>,
+    /// This much of a reliability layer and no more, because TLS needs exactly
+    /// two things of whatever is under it. It must not see a record twice — a
+    /// client that retransmits would otherwise present one, and TLS reads a
+    /// repeat as an attack rather than as a duplicate. And it must see records
+    /// in order — a flight that arrives out of order and is fed through in
+    /// arrival order is a decryption failure, not a reordering.
+    next_expected: u32,
+    early: BTreeMap<u32, Vec<u8>>,
 }
 
 impl FakeServer {
@@ -116,7 +120,8 @@ impl FakeServer {
             answered_push: false,
             client_source: None,
             data: None,
-            delivered: Vec::new(),
+            next_expected: 0,
+            early: BTreeMap::new(),
         }
     }
 
@@ -131,12 +136,25 @@ impl FakeServer {
 
         let mut out = Vec::new();
         match packet.opcode {
-            Opcode::ControlHardResetClientV2 => out.push(self.reset()),
+            Opcode::ControlHardResetClientV2 => {
+                // The reset is message zero of the same sequence the control
+                // messages continue, so the window has to step over it — or
+                // everything after it waits forever for a message that has
+                // already been dealt with.
+                if packet.packet_id == Some(self.next_expected) {
+                    self.next_expected += 1;
+                }
+                out.push(self.reset());
+            }
             Opcode::ControlV1 => {
                 let id = packet.packet_id.expect("a control message is numbered");
-                if !self.delivered.contains(&id) {
-                    self.delivered.push(id);
-                    let mut remaining = packet.payload.as_slice();
+                if id >= self.next_expected {
+                    self.early.insert(id, packet.payload);
+                }
+                // Only ever in order, and only ever once.
+                while let Some(payload) = self.early.remove(&self.next_expected) {
+                    self.next_expected += 1;
+                    let mut remaining = payload.as_slice();
                     while !remaining.is_empty() {
                         self.tls.read_tls(&mut remaining).expect("readable");
                         self.tls.process_new_packets().expect("valid TLS");
@@ -377,13 +395,22 @@ pub fn exchange_lossy(
     for _ in 0..200 {
         let mut progressed = false;
 
+        // A whole flight, then delivered backwards — so the *peer's* receive
+        // window has to reorder as well. Feeding TLS a flight in arrival order
+        // is a decryption failure rather than a reordering, which is a panic
+        // waiting for the first link that delivers out of order.
+        let mut outbound = Vec::new();
         while let Some(datagram) = session.poll_transmit(at, 0) {
             sent += 1;
             if sent.is_multiple_of(drop_every) {
                 continue; // lost on the way out
             }
-            // Backwards, so the client's receive window has to put a flight
-            // back in order before TLS sees any of it.
+            outbound.push(datagram);
+        }
+
+        for datagram in outbound.into_iter().rev() {
+            // Backwards again on the way back, so the client's receive window
+            // has to put a flight in order before TLS sees any of it.
             for reply in server.handle(&datagram).into_iter().rev() {
                 progressed = true;
                 // A refused datagram is not a refused session. Reordering
@@ -414,7 +441,13 @@ pub fn exchange_lossy(
             at += Duration::from_millis(2_500);
         }
     }
-    Ok(())
+
+    // Falling out of the budget is a stalled handshake, and returning `Ok`
+    // for it would make `expect("recovery, not failure")` unable to fire —
+    // a test that cannot fail.
+    Err(synology_filestation_openvpn::Error::Tls(
+        "the handshake did not finish within the round budget".into(),
+    ))
 }
 
 /// Drive a session against a peer until it stops having anything to say.

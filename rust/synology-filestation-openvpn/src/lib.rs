@@ -45,51 +45,6 @@ pub use tls_auth::{TlsAuth, TlsAuthHeader};
 ///
 /// Deliberately one enum: the caller's question is always "can I use this?",
 /// and splitting it by module would only make them write two `From` impls.
-impl Error {
-    /// Whether this ends the session, or only this datagram.
-    ///
-    /// A caller reading a socket needs the difference. Most of what can go
-    /// wrong here is about one packet — a duplicate, a reordered flight, a
-    /// stray from another session, something a scanner sent — and a client
-    /// that tore the tunnel down over any of them would be unusable on a link
-    /// that loses anything at all. What is fatal is the session itself being
-    /// over or impossible: a refused password, a cipher we cannot speak, a
-    /// peer that hung up.
-    pub fn is_fatal(&self) -> bool {
-        match self {
-            // One packet, and the next one may well be fine.
-            Error::Truncated { .. }
-            | Error::UnknownOpcode(_)
-            | Error::BadHmac
-            | Error::WrongSession
-            | Error::AckForAnotherSession
-            | Error::UnexpectedFirstPacket
-            | Error::Replayed
-            | Error::OtherKeyId(..)
-            | Error::TooManyAcks { .. }
-            | Error::UnexpectedDataOpcode(_)
-            | Error::BadPadding
-            | Error::UnexpectedControlMessage(_) => false,
-
-            // The session cannot continue, or never could.
-            Error::KeyLength { .. }
-            | Error::KeyNotHex
-            | Error::KeyMissing
-            | Error::UnsupportedKeyMethod(_)
-            | Error::FieldTooLong { .. }
-            | Error::Tls(_)
-            | Error::AuthFailed(_)
-            | Error::PeerClosed
-            | Error::PacketIdExhausted
-            | Error::BadPushDirective(_)
-            | Error::UnsupportedCipher(_)
-            | Error::UnsupportedCompression(_)
-            | Error::NotReady
-            | Error::NoPushReply => true,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     #[error("packet is too short to hold {context}")]
@@ -185,4 +140,54 @@ pub enum Error {
 
     #[error("no OpenVPN static key found")]
     KeyMissing,
+}
+
+impl Error {
+    /// Whether this ends the session, or only this datagram.
+    ///
+    /// A caller reading a socket needs the difference. Most of what can go
+    /// wrong here is about one packet — a duplicate, a reordered flight, a
+    /// stray from another session, something a scanner sent — and a client
+    /// that tore the tunnel down over any of them would be unusable on a link
+    /// that loses anything at all. What is fatal is the session itself being
+    /// over or impossible: a refused password, a cipher we cannot speak, a
+    /// peer that hung up.
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            // One packet, and the next one may well be fine.
+            Error::Truncated { .. }
+            | Error::UnknownOpcode(_)
+            | Error::BadHmac
+            | Error::WrongSession
+            | Error::AckForAnotherSession
+            | Error::UnexpectedFirstPacket
+            | Error::Replayed
+            | Error::OtherKeyId(..)
+            | Error::TooManyAcks { .. }
+            | Error::UnexpectedDataOpcode(_)
+            | Error::BadPadding
+            | Error::UnexpectedControlMessage(_)
+            // A data packet that arrives before the tunnel is open. The
+            // server generates its key a moment before we finish with ours,
+            // so its first keepalive can land in that gap — which the interop
+            // tests document, having been caught by it. Tearing a healthy
+            // session down over one early packet would be absurd.
+            | Error::NotReady => false,
+
+            // The session cannot continue, or never could.
+            Error::KeyLength { .. }
+            | Error::KeyNotHex
+            | Error::KeyMissing
+            | Error::UnsupportedKeyMethod(_)
+            | Error::FieldTooLong { .. }
+            | Error::Tls(_)
+            | Error::AuthFailed(_)
+            | Error::PeerClosed
+            | Error::PacketIdExhausted
+            | Error::BadPushDirective(_)
+            | Error::UnsupportedCipher(_)
+            | Error::UnsupportedCompression(_)
+            | Error::NoPushReply => true,
+        }
+    }
 }
