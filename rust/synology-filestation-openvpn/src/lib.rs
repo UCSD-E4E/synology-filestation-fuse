@@ -114,6 +114,12 @@ pub enum Error {
     #[error("the server pushed compression ({0}); this client implements none")]
     UnsupportedCompression(String),
 
+    #[error("the tunnel is not ready to carry anything yet")]
+    NotReady,
+
+    #[error("the server never answered the request for its configuration")]
+    NoPushReply,
+
     #[error("{context} is longer than the protocol can describe")]
     FieldTooLong {
         /// Which field, so the caller knows what to shorten.
