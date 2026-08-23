@@ -112,18 +112,28 @@ fn a_cipher_we_cannot_speak_stops_the_session_rather_than_the_tunnel() {
 }
 
 #[test]
-fn a_server_that_never_answers_the_request_leaves_the_session_usable() {
-    // A point-to-point peer does exactly this. It is not a failure: the keys
-    // exist and the tunnel works, there is simply no peer id, so packets take
-    // the shorter form.
+fn a_server_that_has_not_answered_yet_is_not_a_failure_yet() {
+    // Silence is ordinary at first — the server may not be ready. The keys
+    // exist and the session is established; what it does not have is a
+    // tunnel, because the peer id that makes data packets addressable comes
+    // in the answer.
+    //
+    // A point-to-point openvpn stays here forever, which is why the interop
+    // tests build their own `DataChannel` from `keys()`. Against a
+    // `--mode server` peer it is a failure, and after the handshake window
+    // this client says so — see `asking_for_a_configuration_forever_is_not_asking`.
     let mut server = FakeServer::new(Answer::KeyMaterialOnly);
     let mut session = session_against(&server);
 
-    exchange(&mut session, &mut server, Instant::now()).expect("silence is not an error");
+    exchange(&mut session, &mut server, Instant::now()).expect("silence is not yet an error");
 
     assert!(session.is_established());
     assert!(session.keys().is_some());
     assert_eq!(session.push_reply(), None);
+    assert!(
+        !session.is_ready(),
+        "and no tunnel, because there is no peer id"
+    );
 }
 
 #[test]
@@ -195,11 +205,12 @@ fn a_ready_session_carries_payload_both_ways() {
         "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
     ));
     let mut session = session_against(&server);
-    exchange(&mut session, &mut server, Instant::now()).expect("a whole handshake");
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
 
     assert!(session.is_ready(), "there is a tunnel");
     let datagram = session
-        .send_payload(b"a packet for the NAS")
+        .send_payload(start, b"a packet for the NAS")
         .expect("wrapped");
 
     assert!(
@@ -220,7 +231,9 @@ fn a_session_with_no_tunnel_yet_refuses_payload_rather_than_inventing_one() {
     let mut session = session_against(&server);
 
     assert_eq!(
-        session.send_payload(b"too early").unwrap_err(),
+        session
+            .send_payload(Instant::now(), b"too early")
+            .unwrap_err(),
         Error::NotReady
     );
 }
@@ -284,4 +297,100 @@ fn asking_for_a_configuration_forever_is_not_asking() {
     let much_later = start + Duration::from_secs(90);
     assert!(session.poll_transmit(much_later, 0).is_none());
     assert_eq!(session.failure(), Some(&Error::NoPushReply));
+}
+
+#[test]
+fn the_peers_own_keepalive_is_not_handed_to_the_caller() {
+    // A real openvpn sends an encrypted PING every `ping` seconds. Those
+    // sixteen bytes are addressed to the tunnel, not sent through it, and
+    // handing them up would splice them into whatever stream the caller is
+    // reassembling — a corruption that reads as the far end misbehaving.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,ping 10".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+
+    let keepalive = server.encrypt_payload(&PING);
+    assert_eq!(
+        session.receive_payload(&keepalive).expect("it decrypts"),
+        None,
+        "nothing for the caller"
+    );
+
+    let real = server.encrypt_payload(b"an actual packet");
+    assert_eq!(
+        session.receive_payload(&real).expect("it decrypts"),
+        Some(b"an actual packet".to_vec())
+    );
+}
+
+#[test]
+fn traffic_of_its_own_postpones_the_keepalive() {
+    // The server counts silence, so a busy tunnel has already said everything
+    // a keepalive would. Sending one anyway is a packet per interval that
+    // nobody needed.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,ping 10".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+
+    let busy = start + Duration::from_secs(9);
+    session.send_payload(busy, b"traffic").expect("wrapped");
+
+    assert!(
+        session
+            .poll_transmit(busy + Duration::from_secs(5), 0)
+            .is_none(),
+        "not due: we spoke five seconds ago"
+    );
+    assert!(
+        session
+            .poll_transmit(busy + Duration::from_secs(11), 0)
+            .is_some(),
+        "due: eleven seconds of silence"
+    );
+}
+
+#[test]
+fn the_wakeup_knows_when_the_keepalive_is_due() {
+    // `next_wakeup` is what a caller sleeps on. Once the handshake settles the
+    // control channel has nothing outstanding and answers `None`, so a wakeup
+    // consulting only that would sleep through every ping — and the server
+    // would drop a tunnel for a silence the client had a timer for.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,ping 10".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+
+    let settled = start + Duration::from_secs(1);
+    session.send_payload(settled, b"traffic").expect("wrapped");
+
+    assert_eq!(
+        session.next_wakeup(settled),
+        Some(settled + Duration::from_secs(10)),
+        "the next thing due is the keepalive"
+    );
+}
+
+#[test]
+fn a_keepalive_interval_of_zero_means_no_keepalive() {
+    // OpenVPN spells "off" as zero. Taken literally it is a keepalive that is
+    // always due, and a caller draining `poll_transmit` never finishes.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,ping 0".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+
+    assert_eq!(session.push_reply().expect("answered").ping, None);
+    assert!(session
+        .poll_transmit(start + Duration::from_secs(3600), 0)
+        .is_none());
 }

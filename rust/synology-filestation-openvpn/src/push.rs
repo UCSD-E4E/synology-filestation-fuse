@@ -105,7 +105,15 @@ impl PushReply {
                 // the one form that asks nothing of us.
                 ("comp-lzo", ["no"]) => {}
                 ("comp-lzo" | "compress", _) => parsed.compression = Some(directive.to_string()),
-                ("ping", [seconds]) => parsed.ping = Some(seconds_from(seconds, directive)?),
+                // Zero is how OpenVPN spells "off". Taken literally it would
+                // mean a keepalive that is always due, and a caller polling
+                // until there is nothing to send would never get there.
+                ("ping", [seconds]) => {
+                    parsed.ping = match seconds_from(seconds, directive)? {
+                        zero if zero.is_zero() => None,
+                        interval => Some(interval),
+                    }
+                }
                 ("ping-restart", [seconds]) => {
                     parsed.ping_restart = Some(seconds_from(seconds, directive)?)
                 }
