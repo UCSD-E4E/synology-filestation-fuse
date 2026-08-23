@@ -842,3 +842,64 @@ impl Pki {
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "spawns a real openvpn process"]
+async fn the_driver_brings_a_tunnel_up_against_a_real_openvpn() {
+    // The first test in this crate with a socket in it, and the last thing
+    // that had never been exercised: everything else drives the state machine
+    // by hand — which is what made it testable at all — so nothing had run the
+    // whole thing end to end. Bind, hand it what arrives, send what it asks
+    // for, sleep as long as it says, and come back with a tunnel.
+    let server = OpenVpnServer::start();
+
+    let mut config = SessionConfig::new(
+        server.pki.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.client_auth = Some(ClientAuth {
+        cert_chain_pem: server.pki.client_cert_pem.clone(),
+        private_key_pem: zeroize::Zeroizing::new(server.pki.client_key_pem.clone()),
+    });
+
+    let remote: std::net::SocketAddr = format!("127.0.0.1:{}", server.port)
+        .parse()
+        .expect("a local address");
+
+    let tunnel = synology_filestation_openvpn::Tunnel::connect(config, remote)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "the tunnel did not come up: {error}\n--- openvpn log ---\n{}",
+                server.log()
+            )
+        });
+
+    // And it carries. The keepalive is the one payload whose acceptance
+    // openvpn will comment on if it is wrong.
+    let complaints_before = server
+        .log()
+        .matches("Authenticate/Decrypt packet error")
+        .count();
+    tunnel
+        .send(PING.to_vec())
+        .await
+        .expect("the tunnel carries");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        server
+            .log()
+            .matches("Authenticate/Decrypt packet error")
+            .count(),
+        complaints_before,
+        "openvpn refused what the driver sent.\n--- its log ---\n{}",
+        server.log()
+    );
+    assert!(
+        tunnel.failure().is_none(),
+        "the tunnel stopped: {:?}",
+        tunnel.failure()
+    );
+}

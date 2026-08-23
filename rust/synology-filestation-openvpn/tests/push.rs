@@ -1,11 +1,15 @@
 //! Reading what the server pushed.
 //!
-//! Unlike the rest of the crate, none of this is proven against a real
-//! openvpn here: a point-to-point peer — which is the only kind the interop
-//! tests can run without privileges — has no push exchange at all. The
-//! directives below are the ones e4e-nas's configuration will produce, taken
-//! from `spec/e4e-nas/vpn.yml` and from OpenVPN's own option parser, and the
-//! first time they meet a real server is the live pass.
+//! Only lightly proven against a real openvpn. A point-to-point peer — the
+//! only kind the interop tests can run without privileges — does answer a
+//! `PUSH_REQUEST`, which I had written down as it not doing so until the
+//! driver test brought a tunnel up against one. What it does not do is assign
+//! a peer id, so the directive that matters most here is exactly the one that
+//! never arrives.
+//!
+//! The rest are the ones e4e-nas's configuration will produce, taken from
+//! `spec/e4e-nas/vpn.yml` and from OpenVPN's own option parser, and the first
+//! time most of them meet a real server is the live pass.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;

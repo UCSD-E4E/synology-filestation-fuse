@@ -647,7 +647,15 @@ impl Session {
         // instant it re-keyed would drop the last few packets of every
         // rotation — an hour apart, and indistinguishable from a lossy link.
         self.previous_data = self.data.take();
-        self.open_tunnel()?;
+        // Re-keyed, not created. A rotation replaces the keys of a tunnel that
+        // exists; it is not a second way to bring one into being. The
+        // handshake path deliberately waits for the push reply before opening
+        // one — the peer id in it is what makes a data packet addressable —
+        // and a rotation that opened one anyway would quietly route around
+        // that decision.
+        if self.previous_data.is_some() {
+            self.open_tunnel()?;
+        }
         Ok(())
     }
 
