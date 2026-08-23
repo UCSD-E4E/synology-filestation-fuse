@@ -409,7 +409,14 @@ fn a_handshake_survives_a_link_that_loses_and_reorders() {
     ));
     let mut session = session_against(&server);
 
-    exchange_lossy(&mut session, &mut server, Instant::now(), 3).expect("recovery, not failure");
+    exchange_lossy(
+        &mut session,
+        &mut server,
+        Instant::now(),
+        3,
+        |session, _| session.is_ready(),
+    )
+    .expect("recovery, not failure");
 
     assert!(session.is_ready(), "the handshake finished anyway");
     assert_eq!(
@@ -429,7 +436,14 @@ fn a_handshake_survives_heavier_loss() {
     let mut server = FakeServer::new(Answer::KeyMaterialThen("PUSH_REPLY,peer-id 7".to_string()));
     let mut session = session_against(&server);
 
-    exchange_lossy(&mut session, &mut server, Instant::now(), 2).expect("recovery, not failure");
+    exchange_lossy(
+        &mut session,
+        &mut server,
+        Instant::now(),
+        2,
+        |session, _| session.is_ready(),
+    )
+    .expect("recovery, not failure");
 
     assert!(session.is_ready());
     assert_eq!(
@@ -439,4 +453,255 @@ fn a_handshake_survives_heavier_loss() {
             .map(|id| id.get()),
         Some(7)
     );
+}
+
+#[test]
+fn a_renegotiation_replaces_the_keys_without_stopping_the_tunnel() {
+    // What `reneg-sec` does to a copy that outlives it, which every
+    // multi-gigabyte copy does. The peer starts a new generation; a second
+    // TLS handshake and key exchange run on the same control channel under a
+    // new key id; and when they finish the tunnel is carrying traffic under
+    // keys that did not exist a moment ago.
+    //
+    // The old keys keep working throughout. A renegotiation that paused the
+    // tunnel would be one nobody could afford to run mid-copy.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+
+    let first_keys = session.keys().expect("keys").to_vec();
+    assert!(session.is_ready());
+
+    // The tunnel works before.
+    let before = session
+        .send_payload(start, b"before the rotation")
+        .expect("wrapped");
+    assert_eq!(
+        server.decrypt_payload(&before).expect("the peer reads it"),
+        b"before the rotation"
+    );
+
+    // And now the peer rotates.
+    let announcement = server.renegotiate();
+    session
+        .handle(&announcement, start)
+        .expect("a new generation, not an intruder");
+    exchange(&mut session, &mut server, start).expect("the second handshake");
+
+    assert!(server.renegotiated(), "the peer saw it through");
+    let second_keys = session.keys().expect("keys").to_vec();
+    assert_ne!(
+        first_keys, second_keys,
+        "new keys, which is the entire point"
+    );
+    assert!(session.is_ready(), "and the tunnel is still there");
+}
+
+#[test]
+fn a_renegotiation_survives_a_link_that_loses_and_reorders() {
+    // The rotation is a whole handshake, so it meets loss like the first one
+    // did — except now there are two message streams in flight at once, and
+    // they must not be confused for one another.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+    let first_keys = session.keys().expect("keys").to_vec();
+
+    let announcement = server.renegotiate();
+    session.handle(&announcement, start).expect("valid");
+    exchange_lossy(&mut session, &mut server, start, 3, |_, server| {
+        server.renegotiated()
+    })
+    .expect("recovery, not failure");
+
+    assert!(server.renegotiated());
+    assert_ne!(first_keys, session.keys().expect("keys").to_vec());
+}
+
+#[test]
+fn packets_still_in_flight_under_the_old_keys_are_read_after_a_rotation() {
+    // A rotation does not stop what is already on the wire. A tunnel that
+    // forgot the old keys the instant it re-keyed would drop the last few
+    // packets of every rotation — an hour apart, and indistinguishable from a
+    // lossy link.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+
+    // The peer sends under the keys in force now...
+    let in_flight = server.encrypt_payload(b"sent before the rotation");
+
+    // ...and the rotation happens before it is read.
+    let announcement = server.renegotiate();
+    session
+        .handle(&announcement, start)
+        .expect("a new generation");
+    exchange(&mut session, &mut server, start).expect("the second handshake");
+    assert!(server.renegotiated());
+
+    assert_eq!(
+        session.receive_payload(&in_flight).expect("still readable"),
+        Some(b"sent before the rotation".to_vec()),
+        "the old keys outlive the rotation by exactly as long as they need to"
+    );
+}
+
+#[test]
+fn a_renegotiation_the_peer_abandons_does_not_block_the_next_one() {
+    // The peer announces a generation and then says nothing more about it —
+    // and later tries again under a different key. Ours has to follow, or it
+    // would be negotiating a generation nobody is listening for.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+    let first_keys = session.keys().expect("keys").to_vec();
+
+    // Announced, then abandoned: the peer's own state is replaced when it
+    // starts again.
+    let abandoned = server.renegotiate();
+    session.handle(&abandoned, start).expect("a new generation");
+
+    let second = server.renegotiate();
+    session.handle(&second, start).expect("and another");
+    exchange(&mut session, &mut server, start).expect("the one that finishes");
+
+    assert!(server.renegotiated());
+    assert_ne!(
+        first_keys,
+        session.keys().expect("keys").to_vec(),
+        "the second attempt saw it through"
+    );
+}
+
+/// The invariant that seven separate bugs have violated.
+///
+/// `next_wakeup` is a promise about `poll_transmit`: if there is something to
+/// send now, the caller must be told to ask now. Every time a new thing was
+/// added that `poll_transmit` would do — fast retransmit, a freed send window,
+/// the keepalive, a renegotiation's outbox — the wakeup was not told about it,
+/// and a caller sleeping on the answer missed it.
+///
+/// Checking it once per state is worth more than remembering to update two
+/// functions together, because it holds for paths nobody has written yet.
+/// Asking the question costs a datagram, so the datagram is delivered rather
+/// than dropped: a check that quietly loses the opening reset would be
+/// measuring a session it had broken.
+fn wakeup_agrees_with_transmit(
+    session: &mut Session,
+    server: &mut FakeServer,
+    now: Instant,
+    state: &str,
+) {
+    let wakeup = session.next_wakeup(now);
+    let datagram = session.poll_transmit(now, 0);
+    let sends = datagram.is_some();
+
+    if let Some(datagram) = datagram {
+        // `poll_transmit` speaks for both channels, so what comes back may be
+        // a keepalive rather than a handshake message — and the peer's control
+        // path cannot authenticate one of those.
+        if Session::is_data(&datagram) {
+            server
+                .decrypt_payload(&datagram)
+                .expect("the peer reads it");
+        } else {
+            for reply in server.handle(&datagram) {
+                let _ = session.handle(&reply, now);
+            }
+        }
+    }
+
+    if sends {
+        // At or before `now`: a deadline already past means "due", and a
+        // caller sleeping until it wakes immediately. What must never happen
+        // is a wakeup in the future, or none at all, while something waits.
+        match wakeup {
+            Some(at) => assert!(
+                at <= now,
+                "{state}: something to send, and the wakeup pointed at the future"
+            ),
+            None => panic!("{state}: something to send, and the wakeup said idle"),
+        }
+    }
+    if wakeup.is_none() {
+        assert!(
+            !sends,
+            "{state}: the wakeup said idle and there was something to send"
+        );
+    }
+}
+
+#[test]
+fn the_wakeup_never_disagrees_with_what_can_be_sent() {
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC,ping 10".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+
+    // Fresh: rustls has a ClientHello ready before the channel has anything.
+    wakeup_agrees_with_transmit(&mut session, &mut server, start, "before the handshake");
+
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+    wakeup_agrees_with_transmit(&mut session, &mut server, start, "settled");
+
+    // A keepalive coming due.
+    wakeup_agrees_with_transmit(
+        &mut session,
+        &mut server,
+        start + Duration::from_secs(30),
+        "keepalive due",
+    );
+
+    // And in the middle of a rotation, where a second handshake's fragments
+    // are waiting on a second key.
+    let announcement = server.renegotiate();
+    session
+        .handle(&announcement, start)
+        .expect("a new generation");
+    // Several times over: the first thing due is the channel's own
+    // acknowledgement of the soft reset, and only once that is gone is the
+    // second handshake's first fragment the *only* thing waiting — which is
+    // the state where forgetting it in the wakeup actually shows.
+    for step in 0..4 {
+        wakeup_agrees_with_transmit(
+            &mut session,
+            &mut server,
+            start,
+            &format!("renegotiating, step {step}"),
+        );
+    }
+
+    exchange(&mut session, &mut server, start).expect("the second handshake");
+    wakeup_agrees_with_transmit(&mut session, &mut server, start, "after the rotation");
+}
+
+#[test]
+fn the_wakeup_agrees_while_a_push_reply_is_outstanding() {
+    // The retry path has its own timer, and its own chance to be forgotten.
+    let mut server = FakeServer::new(Answer::KeyMaterialOnly);
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("silence is not yet an error");
+
+    for after in [0u64, 3, 6, 12] {
+        wakeup_agrees_with_transmit(
+            &mut session,
+            &mut server,
+            start + Duration::from_secs(after),
+            &format!("{after}s into waiting for a push reply"),
+        );
+    }
 }

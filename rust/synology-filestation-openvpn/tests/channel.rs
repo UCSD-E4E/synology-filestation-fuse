@@ -236,7 +236,7 @@ fn acknowledgements_ride_along_on_the_next_real_packet() {
     let now = Instant::now();
     let (mut client, _) = handshaken(now);
 
-    client.send_control(b"a TLS record".to_vec());
+    client.send_control(KeyId::FIRST, b"a TLS record".to_vec());
     let datagram = client.poll_transmit(now, 0).expect("something to send");
     let (packet, _) = read(&datagram);
 
@@ -254,9 +254,9 @@ fn control_payloads_come_out_in_the_order_they_were_sent() {
     let now = Instant::now();
     let (mut client, mut server) = handshaken(now);
 
-    client.send_control(b"first".to_vec());
+    client.send_control(KeyId::FIRST, b"first".to_vec());
     let first = client.poll_transmit(now, 0).expect("first");
-    client.send_control(b"second".to_vec());
+    client.send_control(KeyId::FIRST, b"second".to_vec());
     let second = client.poll_transmit(now, 0).expect("second");
 
     // Delivered out of order on purpose.
@@ -268,26 +268,33 @@ fn control_payloads_come_out_in_the_order_they_were_sent() {
     );
 
     server.handle(&first, now).expect("valid");
-    assert_eq!(server.poll_control(), Some(b"first".to_vec()));
-    assert_eq!(server.poll_control(), Some(b"second".to_vec()));
+    assert_eq!(
+        server.poll_control(),
+        Some((KeyId::FIRST, b"first".to_vec()))
+    );
+    assert_eq!(
+        server.poll_control(),
+        Some((KeyId::FIRST, b"second".to_vec()))
+    );
     assert_eq!(server.poll_control(), None);
 }
 
 #[test]
-fn a_packet_for_another_key_is_refused_rather_than_misread() {
-    // A renegotiation is a new key state, and a new key state numbers its
-    // messages from zero again. Handed to the window running the current key,
-    // those look like replays of messages long since delivered, and the
-    // handshake behind them disappears without anything reporting a fault.
+fn a_soft_reset_under_a_new_key_starts_a_second_generation() {
+    // This test used to assert the opposite, and was written to fail the day
+    // renegotiation arrived. That day is this commit.
     //
-    // Refusing is not handling — running two key states is the next piece of
-    // work — but a visible limit beats an invisible one.
+    // A soft reset under a key we do not have is the peer beginning a new
+    // generation. Refusing it left the peer negotiating with nobody and
+    // eventually dropping the session — an hour into whatever it was
+    // carrying.
     let now = Instant::now();
     let (mut client, _) = handshaken(now);
+    let next = KeyId::new(1).expect("one fits in three bits");
 
     let renegotiation = ControlPacket {
         opcode: Opcode::ControlSoftResetV1,
-        key_id: KeyId::new(1).expect("one fits in three bits"),
+        key_id: next,
         session_id: SERVER_SESSION,
         acks: None,
         packet_id: Some(0),
@@ -295,17 +302,105 @@ fn a_packet_for_another_key_is_refused_rather_than_misread() {
     };
     let datagram = TlsAuth::new(&key(), KeyDirection::Normal).wrap(&renegotiation, 2, 0);
 
+    client
+        .handle(&datagram, now)
+        .expect("a new generation, not an intruder");
+
+    assert_eq!(client.pending_key_id(), Some(next));
+    assert_eq!(
+        client.key_id(),
+        KeyId::FIRST,
+        "and traffic is still on the old one"
+    );
+}
+
+#[test]
+fn a_packet_for_a_key_that_is_neither_is_still_refused() {
+    // Two generations exist at once, and no more. A packet for a third is
+    // either stale or somebody else's.
+    let now = Instant::now();
+    let (mut client, _) = handshaken(now);
+
+    let stray = ControlPacket {
+        opcode: Opcode::ControlV1,
+        key_id: KeyId::new(5).expect("five fits"),
+        session_id: SERVER_SESSION,
+        acks: None,
+        packet_id: Some(1),
+        payload: b"from a key we never had".to_vec(),
+    };
+    let datagram = TlsAuth::new(&key(), KeyDirection::Normal).wrap(&stray, 2, 0);
+
     assert_eq!(
         client.handle(&datagram, now).unwrap_err(),
-        Error::OtherKeyId(KeyId::new(1).expect("one fits"), KeyId::FIRST)
+        Error::OtherKeyId(KeyId::new(5).expect("five fits"), KeyId::FIRST)
     );
+}
 
-    // And the key we are running is untouched by it.
-    client.send_control(b"still working".to_vec());
-    let next = client.poll_transmit(now, 0).expect("something to send");
-    let (packet, _) = read(&next);
-    assert_eq!(packet.key_id, KeyId::FIRST);
-    assert_eq!(packet.payload, b"still working");
+#[test]
+fn the_old_generation_keeps_working_while_the_new_one_negotiates() {
+    // The whole point. A renegotiation that paused the tunnel would be a
+    // renegotiation nobody could afford to run mid-copy.
+    let now = Instant::now();
+    let (mut client, _) = handshaken(now);
+    let next = KeyId::new(1).expect("one fits");
+
+    let renegotiation = ControlPacket {
+        opcode: Opcode::ControlSoftResetV1,
+        key_id: next,
+        session_id: SERVER_SESSION,
+        acks: None,
+        packet_id: Some(0),
+        payload: Vec::new(),
+    };
+    client
+        .handle(
+            &TlsAuth::new(&key(), KeyDirection::Normal).wrap(&renegotiation, 2, 0),
+            now,
+        )
+        .expect("valid");
+
+    assert!(client.send_control(KeyId::FIRST, b"still carrying".to_vec()));
+    assert!(client.send_control(next, b"and negotiating".to_vec()));
+
+    // Both go out, each under its own key.
+    let mut seen = Vec::new();
+    while let Some(datagram) = client.poll_transmit(now, 0) {
+        let (packet, _) = read(&datagram);
+        if packet.opcode == Opcode::ControlV1 {
+            seen.push((packet.key_id, packet.payload));
+        }
+    }
+
+    assert!(seen.contains(&(KeyId::FIRST, b"still carrying".to_vec())));
+    assert!(seen.contains(&(next, b"and negotiating".to_vec())));
+}
+
+#[test]
+fn promoting_makes_the_new_generation_the_one_that_carries_traffic() {
+    let now = Instant::now();
+    let (mut client, _) = handshaken(now);
+    let next = KeyId::new(1).expect("one fits");
+
+    let renegotiation = ControlPacket {
+        opcode: Opcode::ControlSoftResetV1,
+        key_id: next,
+        session_id: SERVER_SESSION,
+        acks: None,
+        packet_id: Some(0),
+        payload: Vec::new(),
+    };
+    client
+        .handle(
+            &TlsAuth::new(&key(), KeyDirection::Normal).wrap(&renegotiation, 2, 0),
+            now,
+        )
+        .expect("valid");
+
+    client.promote();
+
+    assert_eq!(client.key_id(), next);
+    assert_eq!(client.pending_key_id(), None, "and there is only one again");
 }
 
 #[test]
@@ -342,7 +437,7 @@ fn an_acknowledgement_addressed_to_another_session_is_refused() {
     // messages of ours that are still in flight.
     let now = Instant::now();
     let (mut client, _) = handshaken(now);
-    client.send_control(b"in flight".to_vec());
+    client.send_control(KeyId::FIRST, b"in flight".to_vec());
     client.poll_transmit(now, 0).expect("sent");
 
     let elsewhere = ControlPacket {
@@ -563,5 +658,43 @@ fn a_forged_packet_never_reaches_the_reliability_layer() {
     assert!(
         client.poll_transmit(now + TLS_TIMEOUT, 0).is_some(),
         "the reset is still in flight, because that ack was never authentic"
+    );
+}
+
+#[test]
+fn a_second_attempt_replaces_an_abandoned_one() {
+    // A peer whose renegotiation stalls simply tries again under the next key
+    // id. Holding on to the abandoned generation would refuse every later
+    // attempt as `OtherKeyId`, and the session would then die when the key it
+    // is still using expires — the exact failure renegotiation prevents.
+    let now = Instant::now();
+    let (mut client, _) = handshaken(now);
+    let signer = TlsAuth::new(&key(), KeyDirection::Normal);
+
+    let soft_reset = |key_id: KeyId| ControlPacket {
+        opcode: Opcode::ControlSoftResetV1,
+        key_id,
+        session_id: SERVER_SESSION,
+        acks: None,
+        packet_id: Some(0),
+        payload: Vec::new(),
+    };
+
+    let first = KeyId::new(1).expect("one fits");
+    client
+        .handle(&signer.wrap(&soft_reset(first), 2, 0), now)
+        .expect("a new generation");
+    assert_eq!(client.pending_key_id(), Some(first));
+
+    // It stalls, and the peer tries again.
+    let second = KeyId::new(2).expect("two fits");
+    client
+        .handle(&signer.wrap(&soft_reset(second), 3, 0), now)
+        .expect("and another");
+
+    assert_eq!(
+        client.pending_key_id(),
+        Some(second),
+        "the newer attempt is the one being negotiated"
     );
 }

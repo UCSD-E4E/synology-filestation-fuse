@@ -156,10 +156,28 @@ enum Phase {
 }
 
 /// A TLS session and the control channel underneath it.
+/// A key generation being negotiated while the current one carries traffic.
+///
+/// Everything a handshake needs and nothing a session does: the push exchange
+/// happens once per session, not once per key.
+struct Renegotiation {
+    key_id: KeyId,
+    tls: ClientConnection,
+    outbox: Outbox,
+    source: KeySource2,
+    inbound: Zeroizing<Vec<u8>>,
+    sent_key_material: bool,
+}
+
 pub struct Session {
     channel: ControlChannel,
     tls: ClientConnection,
     outbox: Outbox,
+    /// Kept so a renegotiation can build a second connection to the same peer
+    /// on the same terms.
+    tls_config: Arc<ClientConfig>,
+    server_name: ServerName<'static>,
+    renegotiation: Option<Renegotiation>,
     phase: Phase,
     source: KeySource2,
     credentials: Option<Credentials>,
@@ -175,6 +193,9 @@ pub struct Session {
     push_first_requested_at: Option<Instant>,
     /// The tunnel itself, once there are keys to build it from.
     data: Option<DataChannel>,
+    /// The tunnel as it was before the last rotation, kept only long enough
+    /// for packets already in flight under those keys.
+    previous_data: Option<DataChannel>,
     /// When we last put anything on the wire, which is what a keepalive is
     /// measured from.
     last_sent: Option<Instant>,
@@ -191,20 +212,20 @@ impl Session {
             config.tls_timeout,
         );
 
-        let tls = ClientConnection::new(
-            Arc::new(client_config(&config)?),
-            ServerName::try_from(config.server_name.clone())
-                .map_err(|_| {
-                    Error::Tls(format!("{} is not a valid server name", config.server_name))
-                })?
-                .to_owned(),
-        )
-        .map_err(|error| Error::Tls(error.to_string()))?;
+        let tls_config = Arc::new(client_config(&config)?);
+        let server_name: ServerName<'static> = ServerName::try_from(config.server_name.clone())
+            .map_err(|_| Error::Tls(format!("{} is not a valid server name", config.server_name)))?
+            .to_owned();
+        let tls = ClientConnection::new(tls_config.clone(), server_name.clone())
+            .map_err(|error| Error::Tls(error.to_string()))?;
 
         let mut session = Self {
             channel,
             tls,
             outbox: Outbox::default(),
+            tls_config,
+            server_name,
+            renegotiation: None,
             phase: Phase::Tls,
             source: KeySource2::new_client(),
             credentials: config.credentials,
@@ -214,6 +235,7 @@ impl Session {
             push_requested_at: None,
             push_first_requested_at: None,
             data: None,
+            previous_data: None,
             last_sent: None,
             failure: None,
         };
@@ -275,7 +297,26 @@ impl Session {
     /// would splice them into whatever stream the caller is reassembling.
     pub fn receive_payload(&mut self, datagram: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let data = self.data.as_mut().ok_or(Error::NotReady)?;
-        let payload = data.decrypt(datagram)?;
+        let payload = match data.decrypt(datagram) {
+            Ok(payload) => {
+                // Something arrived under the new key, so nothing more will
+                // arrive under the old one.
+                self.previous_data = None;
+                payload
+            }
+            // A packet from before the rotation, still in flight. It is a
+            // packet, not an intruder.
+            Err(Error::OtherKeyId(..)) => match self.previous_data.as_mut() {
+                Some(previous) => previous.decrypt(datagram)?,
+                None => {
+                    return Err(Error::OtherKeyId(
+                        self.channel.key_id(),
+                        self.channel.key_id(),
+                    ))
+                }
+            },
+            Err(error) => return Err(error),
+        };
         if payload == crate::PING {
             return Ok(None);
         }
@@ -334,7 +375,21 @@ impl Session {
                 Ok(_) => self.outbox.push(&bytes),
             }
         }
-        self.outbox.drain_into(&mut self.channel);
+        let key_id = self.channel.key_id();
+        self.outbox.drain_into(&mut self.channel, key_id);
+
+        if let Some(pending) = &mut self.renegotiation {
+            while pending.tls.wants_write() {
+                let mut bytes = Vec::new();
+                match pending.tls.write_tls(&mut bytes) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => pending.outbox.push(&bytes),
+                }
+            }
+            let pending_key = pending.key_id;
+            let outbox = &mut pending.outbox;
+            outbox.drain_into(&mut self.channel, pending_key);
+        }
 
         if let Some(datagram) = self.channel.poll_transmit(now, net_time) {
             self.last_sent = Some(now);
@@ -378,6 +433,20 @@ impl Session {
         // `poll_transmit`, get nothing, and come straight back.
         if self.channel.can_send() && (self.tls.wants_write() || !self.outbox.is_empty()) {
             return Some(now);
+        }
+        // And about the other handshake, if one is running — under the same
+        // condition as the first. A fragment waiting in its outbox is work
+        // `poll_transmit` will do the moment it is asked, *if* that
+        // generation's window has room; if it has not, the thing to wait for
+        // is an acknowledgement, and answering `now` would be a busy loop
+        // rather than a wakeup. That is the mistake the primary's guard
+        // already exists to prevent, and this clause had made it again.
+        if let Some(pending) = &self.renegotiation {
+            if self.channel.can_send_for(pending.key_id)
+                && (pending.tls.wants_write() || !pending.outbox.is_empty())
+            {
+                return Some(now);
+            }
         }
 
         // Everything `poll_transmit` will do on a timer has to be here too.
@@ -423,14 +492,16 @@ impl Session {
         }
         self.channel.handle(datagram, now)?;
 
-        while let Some(record) = self.channel.poll_control() {
+        while let Some((key_id, record)) = self.channel.poll_control() {
+            let tls = match &mut self.renegotiation {
+                Some(pending) if pending.key_id == key_id => &mut pending.tls,
+                _ => &mut self.tls,
+            };
             let mut remaining = record.as_slice();
             while !remaining.is_empty() {
-                self.tls
-                    .read_tls(&mut remaining)
+                tls.read_tls(&mut remaining)
                     .map_err(|error| Error::Tls(error.to_string()))?;
-                self.tls
-                    .process_new_packets()
+                tls.process_new_packets()
                     .map_err(|error| Error::Tls(error.to_string()))?;
             }
         }
@@ -445,7 +516,139 @@ impl Session {
         // the buffer.
         self.drain_plaintext()?;
         self.receive_their_key_material()?;
-        self.receive_push_reply()
+        self.receive_push_reply()?;
+
+        self.begin_renegotiation()?;
+        self.advance_renegotiation()
+    }
+
+    /// Notice that the peer has started a new key generation.
+    ///
+    /// The peer decides when: `reneg-sec` is its timer as much as ours, and
+    /// this client keeps none of its own. What arrives is a soft reset under a
+    /// key id we do not have, which the channel has already turned into a
+    /// second key state by the time this runs.
+    fn begin_renegotiation(&mut self) -> Result<(), Error> {
+        let Some(key_id) = self.channel.pending_key_id() else {
+            return Ok(());
+        };
+        // A different key id means the peer gave up on its last attempt and
+        // started another. Ours has to start again with it, or we would be
+        // negotiating a generation nobody is listening for.
+        if self
+            .renegotiation
+            .as_ref()
+            .is_some_and(|pending| pending.key_id == key_id)
+        {
+            return Ok(());
+        }
+
+        self.renegotiation = Some(Renegotiation {
+            key_id,
+            tls: ClientConnection::new(self.tls_config.clone(), self.server_name.clone())
+                .map_err(|error| Error::Tls(error.to_string()))?,
+            outbox: Outbox::default(),
+            source: KeySource2::new_client(),
+            inbound: Zeroizing::new(Vec::new()),
+            sent_key_material: false,
+        });
+        Ok(())
+    }
+
+    /// Carry the new generation's handshake forward, and take over when it is
+    /// done.
+    ///
+    /// A whole second exchange — TLS, then key material — on the same control
+    /// channel and under a different key id. The tunnel keeps running on the
+    /// old keys throughout, which is the point: an hour into a copy is not a
+    /// moment to stop.
+    fn advance_renegotiation(&mut self) -> Result<(), Error> {
+        let Some(pending) = &mut self.renegotiation else {
+            return Ok(());
+        };
+
+        if !pending.tls.is_handshaking() && !pending.sent_key_material {
+            let empty = Zeroizing::new(String::new());
+            let (username, password) = match &self.credentials {
+                Some(credentials) => (credentials.username.as_str(), &credentials.password),
+                None => ("", &empty),
+            };
+            let message = ClientKeyMethod2 {
+                source: &pending.source,
+                options: OPTIONS,
+                username,
+                password,
+                peer_info: PEER_INFO,
+            }
+            .encode()?;
+            pending
+                .tls
+                .writer()
+                .write_all(&message)
+                .map_err(|error| Error::Tls(error.to_string()))?;
+            pending.sent_key_material = true;
+        }
+
+        let mut buffer = Zeroizing::new([0u8; 2048]);
+        loop {
+            match pending.tls.reader().read(buffer.as_mut()) {
+                Ok(read) if read > 0 => pending.inbound.extend_from_slice(&buffer[..read]),
+                Ok(_) => return Err(Error::PeerClosed),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(Error::Tls(error.to_string())),
+            }
+        }
+
+        let (reply, used) = match ServerMessage::decode(&pending.inbound) {
+            Err(Error::Truncated { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+            Ok((ServerMessage::Control(text), used)) => {
+                // Consumed even though it is an error. Left in the buffer it
+                // would be decoded again on every later datagram, and the key
+                // material queued behind it would never be reached — a
+                // renegotiation wedged for good by one message we had no use
+                // for.
+                pending.inbound = Zeroizing::new(pending.inbound[used..].to_vec());
+                return Err(match text.strip_prefix("AUTH_FAILED") {
+                    Some(detail) => Error::AuthFailed(detail.to_string()),
+                    None => Error::UnexpectedControlMessage(text),
+                });
+            }
+            Ok((ServerMessage::KeyMethod2(reply), used)) => (reply, used),
+        };
+
+        pending.source.server_random1 = reply.random1;
+        pending.source.server_random2 = reply.random2;
+        let keys = key_expansion(
+            &pending.source,
+            self.channel.local_session(),
+            self.channel
+                .remote_session()
+                .ok_or_else(|| Error::Tls("key material before a session id".into()))?,
+        );
+
+        // Everything swaps at once: the control channel's idea of which
+        // generation carries traffic, the keys, and the tunnel encrypting with
+        // them. A tunnel left on the old keys after the channel had moved on
+        // would encrypt under a key id the peer has retired.
+        let pending = self.renegotiation.take().expect("checked above");
+        self.channel.promote();
+        self.tls = pending.tls;
+        self.outbox = pending.outbox;
+        self.source = pending.source;
+        // Only what the key material used. A peer can put more behind it in
+        // the same flight — a deferred authentication answers that way — and
+        // discarding the remainder loses bytes TLS will not hand over twice.
+        self.inbound = Zeroizing::new(pending.inbound[used..].to_vec());
+        self.keys = Some(keys);
+
+        // The old keys stay reachable for a moment. Packets the peer sent
+        // under them may still be in flight, and a tunnel that forgot them the
+        // instant it re-keyed would drop the last few packets of every
+        // rotation — an hour apart, and indistinguishable from a lossy link.
+        self.previous_data = self.data.take();
+        self.open_tunnel()?;
+        Ok(())
     }
 
     /// The peer's session id, once it has told us.
@@ -504,7 +707,7 @@ impl Session {
         self.data = Some(DataChannel::new(
             DataKeys::for_client(keys)?,
             peer_id,
-            KeyId::FIRST,
+            self.channel.key_id(),
         ));
         Ok(())
     }
@@ -750,10 +953,10 @@ impl Outbox {
         self.pending.extend_from_slice(bytes);
     }
 
-    fn drain_into(&mut self, channel: &mut ControlChannel) {
+    fn drain_into(&mut self, channel: &mut ControlChannel, key_id: KeyId) {
         while !self.pending.is_empty() {
             let take = self.pending.len().min(MAX_TLS_FRAGMENT);
-            if !channel.send_control(self.pending[..take].to_vec()) {
+            if !channel.send_control(key_id, self.pending[..take].to_vec()) {
                 // The window is full. Everything still here goes out once the
                 // peer acknowledges enough for it to move.
                 return;
@@ -913,7 +1116,9 @@ mod tests {
         session
             .outbox
             .push(&vec![0u8; MAX_TLS_FRAGMENT * (SendWindow::CAPACITY + 1)]);
-        session.outbox.drain_into(&mut session.channel);
+        session
+            .outbox
+            .drain_into(&mut session.channel, KeyId::FIRST);
         while session.channel.poll_transmit(now, 0).is_some() {}
 
         assert!(!session.outbox.is_empty(), "a fragment is still waiting");
@@ -929,7 +1134,7 @@ mod tests {
         let mut outbox = Outbox::default();
         let mut channel = new_channel();
         outbox.push(&vec![0u8; MAX_TLS_FRAGMENT]);
-        outbox.drain_into(&mut channel);
+        outbox.drain_into(&mut channel, KeyId::FIRST);
         assert_eq!(
             datagrams(&mut channel),
             1,
@@ -939,7 +1144,7 @@ mod tests {
         let mut outbox = Outbox::default();
         let mut channel = new_channel();
         outbox.push(&vec![0u8; MAX_TLS_FRAGMENT + 1]);
-        outbox.drain_into(&mut channel);
+        outbox.drain_into(&mut channel, KeyId::FIRST);
 
         assert_eq!(outbox.pending(), 0, "all of it was handed over");
         assert_eq!(
@@ -956,7 +1161,7 @@ mod tests {
         // One fragment more than the window can hold.
         outbox.push(&vec![0u8; MAX_TLS_FRAGMENT * (SendWindow::CAPACITY + 1)]);
 
-        outbox.drain_into(&mut channel);
+        outbox.drain_into(&mut channel, KeyId::FIRST);
 
         assert_eq!(
             outbox.pending(),
