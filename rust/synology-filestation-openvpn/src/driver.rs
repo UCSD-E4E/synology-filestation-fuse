@@ -53,8 +53,13 @@ impl Tunnel {
     /// Bring a tunnel up, and return once it is carrying.
     pub async fn connect(config: SessionConfig, remote: SocketAddr) -> Result<Self, Error> {
         // Bound to whatever the OS gives us: this is a client, and `nobind` is
-        // what the published profile says.
-        let socket = UdpSocket::bind(("0.0.0.0", 0))
+        // what the published profile says. The family has to match the peer's,
+        // or `connect` fails with an errno that says nothing about why.
+        let unspecified: SocketAddr = match remote {
+            SocketAddr::V4(_) => ([0, 0, 0, 0], 0).into(),
+            SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+        };
+        let socket = UdpSocket::bind(unspecified)
             .await
             .map_err(|error| Error::Io(error.to_string()))?;
         socket
@@ -77,20 +82,30 @@ impl Tunnel {
             ready,
         ));
 
-        match tokio::time::timeout(CONNECT_TIMEOUT, is_ready).await {
-            Ok(Ok(Ok(()))) => Ok(Self {
-                outgoing: to_tunnel,
-                incoming: from_tunnel,
-                failure,
-                task,
-            }),
+        let outcome = match tokio::time::timeout(CONNECT_TIMEOUT, is_ready).await {
+            Ok(Ok(Ok(()))) => {
+                return Ok(Self {
+                    outgoing: to_tunnel,
+                    incoming: from_tunnel,
+                    failure,
+                    task,
+                })
+            }
             // The task reported why it could not.
-            Ok(Ok(Err(error))) => Err(error),
+            Ok(Ok(Err(error))) => error,
             // The task ended without saying anything, which is a bug in it
             // rather than in the peer.
-            Ok(Err(_)) => Err(Error::Io("the tunnel task stopped".into())),
-            Err(_) => Err(Error::HandshakeTimeout),
-        }
+            Ok(Err(_)) => Error::Io("the tunnel task stopped".into()),
+            Err(_) => Error::HandshakeTimeout,
+        };
+
+        // Every failing path takes the task with it. `Tunnel::drop` does this
+        // for a tunnel that was returned; a `connect` that returns an error
+        // returns no tunnel, so without this the task lives on with a bound
+        // socket, retransmitting into the dark — one per attempt, and a
+        // caller that retries makes a collection of them.
+        task.abort();
+        Err(outcome)
     }
 
     /// Put a payload through the tunnel.
@@ -134,6 +149,7 @@ async fn run(
 ) {
     let mut ready = Some(ready);
     let mut buffer = vec![0u8; 4096];
+    let mut last_heard = Instant::now();
 
     let outcome = loop {
         // Everything the session wants to say, before deciding how long to
@@ -144,8 +160,9 @@ async fn run(
                 break;
             };
             if let Err(error) = socket.send(&datagram).await {
-                break_with(&mut ready, Error::Io(error.to_string()));
-                return finish(failure, Error::Io("send failed".into()));
+                let error = Error::Io(error.to_string());
+                break_with(&mut ready, error.clone());
+                return finish(failure, error);
             }
         }
         if let Some(error) = session.failure() {
@@ -160,25 +177,51 @@ async fn run(
             }
         }
 
+        // A peer that has stopped answering. `ping-restart` is how long it
+        // waits before giving up on us, and it is the same question in the
+        // other direction — without asking it, a vanished peer leaves the
+        // tunnel reporting no failure, `recv` pending forever, and `send`
+        // returning `Ok` while every payload goes nowhere.
+        //
+        // The peer's own `ping-restart` when it pushed one, and a configured
+        // fallback when it did not — a peer that named no limit has not
+        // thereby promised to stay forever.
+        let limit = session.peer_timeout();
+        if last_heard.elapsed() >= limit {
+            break Error::PeerGone(limit);
+        }
+
         let wakeup = session
             .next_wakeup(Instant::now())
             .map(|at| at.saturating_duration_since(Instant::now()))
-            .unwrap_or(IDLE_POLL);
+            // Bounded so the dead-peer check above runs even when the session
+            // believes it has nothing to wait for.
+            .unwrap_or(IDLE_POLL)
+            .min(IDLE_POLL.max(Duration::from_secs(1)));
 
         tokio::select! {
             received = socket.recv(&mut buffer) => match received {
                 Ok(len) => {
+                    last_heard = Instant::now();
                     let datagram = &buffer[..len];
                     if Session::is_data(datagram) {
                         match session.receive_payload(datagram) {
                             // A keepalive: addressed to the tunnel, not
                             // through it.
                             Ok(None) => {}
-                            Ok(Some(payload)) => {
-                                if to_caller.send(payload).await.is_err() {
-                                    break Error::Io("nobody is reading the tunnel".into());
+                            Ok(Some(payload)) => match to_caller.try_send(payload) {
+                                Ok(()) => {}
+                                // The caller is behind. Dropping is what a
+                                // link does when a queue fills, and what
+                                // sits above this tunnel will ask again —
+                                // whereas waiting here stops the loop, and a
+                                // loop that stops sends no keepalives and is
+                                // dropped by the peer for silence.
+                                Err(mpsc::error::TrySendError::Full(_)) => {}
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    break Error::Io("nobody is reading the tunnel".into())
                                 }
-                            }
+                            },
                             Err(error) if error.is_fatal() => break error,
                             // One packet, not the session.
                             Err(_) => {}

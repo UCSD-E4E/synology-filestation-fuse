@@ -90,6 +90,15 @@ pub struct SessionConfig {
     pub session_id: SessionId,
     /// `--tls-timeout`, the first retransmission interval.
     pub tls_timeout: Duration,
+    /// How long the peer may be silent before we conclude it has gone, when
+    /// it has not told us itself.
+    ///
+    /// A server that pushes `ping-restart` has answered this question and its
+    /// answer is used instead. One that has not is not thereby promising to
+    /// stay forever — and a tunnel with no limit at all reports no failure,
+    /// never ends a `recv`, and accepts payload it silently discards. So
+    /// there is a number either way; this is ours.
+    pub peer_timeout: Duration,
     /// The credentials the server authenticates. e4e-nas takes an AD username
     /// and password; a peer that asks for neither is sent empty fields.
     pub credentials: Option<Credentials>,
@@ -132,6 +141,7 @@ impl SessionConfig {
             key_direction: KeyDirection::Inverse,
             session_id: SessionId::random(),
             tls_timeout: Duration::from_secs(2),
+            peer_timeout: Duration::from_secs(120),
             credentials: None,
             client_auth: None,
         }
@@ -187,6 +197,7 @@ pub struct Session {
     inbound: Zeroizing<Vec<u8>>,
     keys: Option<Zeroizing<Vec<u8>>>,
     push: Option<PushReply>,
+    peer_timeout: Duration,
     /// When the last `PUSH_REQUEST` went out, so it can go again.
     push_requested_at: Option<Instant>,
     /// When we first asked, so the asking can stop.
@@ -232,6 +243,7 @@ impl Session {
             inbound: Zeroizing::new(Vec::new()),
             keys: None,
             push: None,
+            peer_timeout: config.peer_timeout,
             push_requested_at: None,
             push_first_requested_at: None,
             data: None,
@@ -261,6 +273,17 @@ impl Session {
             self.phase,
             Phase::Established | Phase::AwaitingPush | Phase::Ready
         )
+    }
+
+    /// How long the peer may be silent before it counts as gone.
+    ///
+    /// Its own `ping-restart` if it pushed one, since it knows what it
+    /// intends; otherwise the configured fallback.
+    pub fn peer_timeout(&self) -> Duration {
+        self.push
+            .as_ref()
+            .and_then(|reply| reply.ping_restart)
+            .unwrap_or(self.peer_timeout)
     }
 
     /// What the server pushed, once it has.
@@ -306,14 +329,14 @@ impl Session {
             }
             // A packet from before the rotation, still in flight. It is a
             // packet, not an intruder.
-            Err(Error::OtherKeyId(..)) => match self.previous_data.as_mut() {
+            Err(Error::OtherKeyId(theirs, ours)) => match self.previous_data.as_mut() {
                 Some(previous) => previous.decrypt(datagram)?,
-                None => {
-                    return Err(Error::OtherKeyId(
-                        self.channel.key_id(),
-                        self.channel.key_id(),
-                    ))
-                }
+                // Nothing to fall back to, so the packet is exactly what the
+                // data channel said it was. Rebuilding the error here lost the
+                // pair and produced "belongs to key 1, and this session is
+                // running 1" — a message that tells a reader nothing except
+                // that something rebuilt it.
+                None => return Err(Error::OtherKeyId(theirs, ours)),
             },
             Err(error) => return Err(error),
         };

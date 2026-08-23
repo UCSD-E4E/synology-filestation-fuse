@@ -125,6 +125,9 @@ pub enum Error {
     #[error("the tunnel did not come up in time")]
     HandshakeTimeout,
 
+    #[error("the peer has not been heard from in {0:?}")]
+    PeerGone(std::time::Duration),
+
     #[error("socket: {0}")]
     Io(String),
 
@@ -197,6 +200,7 @@ impl Error {
             | Error::UnsupportedCompression(_)
             | Error::NoPushReply
             | Error::HandshakeTimeout
+            | Error::PeerGone(_)
             | Error::Io(_) => true,
         }
     }
