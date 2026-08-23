@@ -639,7 +639,13 @@ impl Session {
             // server says so in words rather than by failing the exchange.
             // Reading it as key material would report the first letters of
             // "AUTH_FAILED" as a key method number.
-            Ok((ServerMessage::Control(message), _)) => {
+            Ok((ServerMessage::Control(message), used)) => {
+                // Consumed either way. A message left in the buffer is one
+                // that is decoded again on the next datagram, and again after
+                // that: an error that repeats forever rather than being
+                // reported once, which a caller told it is not fatal would
+                // spin on.
+                self.inbound = Zeroizing::new(self.inbound[used..].to_vec());
                 Err(match message.strip_prefix("AUTH_FAILED") {
                     Some(detail) => Error::AuthFailed(detail.to_string()),
                     None => Error::UnexpectedControlMessage(message),

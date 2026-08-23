@@ -598,6 +598,105 @@ fn a_renegotiation_is_refused_rather_than_misread() {
     );
 }
 
+#[test]
+#[ignore = "spawns a real openvpn process"]
+fn a_real_openvpn_accepts_a_packet_we_encrypted() {
+    // Everything else here proves we can *read* what openvpn sends. Nothing
+    // proved it can read what we send — our encryption was checked only by our
+    // own decryption, which agrees with itself by construction. That is the
+    // half that matters for the keepalive: a packet openvpn cannot
+    // authenticate is dropped in silence, and the tunnel is then torn down at
+    // `ping-restart` for a reason indistinguishable from the network.
+    //
+    // openvpn says nothing when a packet is fine, so the test needs a control:
+    // a deliberately corrupted packet must produce the complaint, and a good
+    // one must not. Without the control, "no error in the log" would also be
+    // what a test that sent nothing at all looks like.
+    let server = OpenVpnServer::start();
+    let socket = connected_socket(server.port);
+
+    let mut config = SessionConfig::new(
+        server.pki.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.client_auth = Some(ClientAuth {
+        cert_chain_pem: server.pki.client_cert_pem.clone(),
+        private_key_pem: zeroize::Zeroizing::new(server.pki.client_key_pem.clone()),
+    });
+
+    let mut session = Session::new(config).expect("a client");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut buf = [0u8; 4096];
+    let mut tunnel: Option<DataChannel> = None;
+    let mut heard_from_it = false;
+
+    // Waiting for one of its keepalives, not merely for our own keys. The
+    // server generates its data-channel key a moment after we generate ours,
+    // and a packet sent into that gap is dropped as "Key not initialized
+    // (yet)" — which is neither an acceptance nor a refusal, and would make
+    // both halves of this test meaningless.
+    while Instant::now() < deadline && !heard_from_it {
+        let now = Instant::now();
+        while let Some(datagram) = session.poll_transmit(now, net_time()) {
+            let _ = socket.send(&datagram);
+        }
+
+        let len = match socket.recv(&mut buf) {
+            Ok(len) => len,
+            Err(_) => continue,
+        };
+
+        if is_data(&buf[..len]) {
+            let channel = tunnel.get_or_insert_with(|| {
+                // A point-to-point peer assigns no peer id, so `P_DATA_V1`.
+                DataChannel::new(
+                    DataKeys::for_client(session.keys().expect("keys by now")).expect("256 bytes"),
+                    None,
+                    KeyId::FIRST,
+                )
+            });
+            if channel.decrypt(&buf[..len]).is_ok() {
+                heard_from_it = true;
+            }
+            continue;
+        }
+
+        let _ = session.handle(&buf[..len], Instant::now());
+    }
+
+    let mut tunnel = tunnel.unwrap_or_else(|| {
+        panic!(
+            "the server never spoke on the data channel.\n--- its log ---\n{}",
+            server.log()
+        )
+    });
+    assert!(heard_from_it, "its key is ready, so ours can be judged");
+
+    let good = tunnel.encrypt(&PING).expect("encrypt");
+    socket.send(&good).expect("send");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !server.log().contains("Authenticate/Decrypt packet error"),
+        "openvpn refused a packet we encrypted.\n--- its log ---\n{}",
+        server.log()
+    );
+
+    // The control. One flipped bit in the ciphertext, and the complaint we
+    // just asserted the absence of must appear — otherwise its absence above
+    // meant nothing.
+    let mut bad = tunnel.encrypt(&PING).expect("encrypt");
+    let last = bad.len() - 1;
+    bad[last] ^= 0x01;
+    socket.send(&bad).expect("send");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        server.log().contains("Authenticate/Decrypt packet error"),
+        "openvpn accepted a corrupted packet, so its silence proves nothing.\n--- its log ---\n{}",
+        server.log()
+    );
+}
+
 /// A throwaway certificate authority and the two certificates it issues.
 ///
 /// A real hierarchy rather than one self-signed certificate used everywhere,
