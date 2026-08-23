@@ -257,16 +257,29 @@ impl Session {
     }
 
     /// Wrap a payload for the tunnel.
-    pub fn send_payload(&mut self, payload: &[u8]) -> Result<Vec<u8>, Error> {
+    pub fn send_payload(&mut self, now: Instant, payload: &[u8]) -> Result<Vec<u8>, Error> {
         let data = self.data.as_mut().ok_or(Error::NotReady)?;
         let datagram = data.encrypt(payload)?;
+        // The server's timer counts silence, and this was not silence. Without
+        // this a busy tunnel sends a keepalive every interval on top of its
+        // traffic, which the comment above already claimed it did not.
+        self.last_sent = Some(now);
         Ok(datagram)
     }
 
     /// Unwrap a datagram the tunnel carried.
-    pub fn receive_payload(&mut self, datagram: &[u8]) -> Result<Vec<u8>, Error> {
+    ///
+    /// `None` means it carried nothing for the caller — the peer sends a
+    /// keepalive on this channel every `ping` seconds, and those sixteen bytes
+    /// are addressed to the tunnel rather than through it. Handing them up
+    /// would splice them into whatever stream the caller is reassembling.
+    pub fn receive_payload(&mut self, datagram: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let data = self.data.as_mut().ok_or(Error::NotReady)?;
-        data.decrypt(datagram)
+        let payload = data.decrypt(datagram)?;
+        if payload == crate::PING {
+            return Ok(None);
+        }
+        Ok(Some(payload))
     }
 
     /// Whether a datagram belongs to the tunnel rather than to the handshake.
@@ -366,7 +379,41 @@ impl Session {
         if self.channel.can_send() && (self.tls.wants_write() || !self.outbox.is_empty()) {
             return Some(now);
         }
-        self.channel.next_wakeup(now)
+
+        // Everything `poll_transmit` will do on a timer has to be here too.
+        // The keepalive is the one that matters: once the handshake settles
+        // the channel has nothing outstanding and would answer `None`, so a
+        // caller sleeping on that would miss every ping and be dropped by the
+        // server — the exact failure the keepalive exists to prevent.
+        [
+            self.channel.next_wakeup(now),
+            self.keepalive_due(now),
+            self.push_retry_due(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// When the next keepalive falls due, if one is expected at all.
+    fn keepalive_due(&self, now: Instant) -> Option<Instant> {
+        let interval = self.push.as_ref()?.ping?;
+        self.data.as_ref()?;
+        Some(match self.last_sent {
+            Some(last) => last + interval,
+            // Nothing sent yet on a tunnel that exists: due immediately.
+            None => now,
+        })
+    }
+
+    /// When the push request goes again, or gives up.
+    fn push_retry_due(&self) -> Option<Instant> {
+        if self.phase != Phase::AwaitingPush {
+            return None;
+        }
+        let sent = self.push_requested_at?;
+        let first = self.push_first_requested_at?;
+        Some((sent + PUSH_REQUEST_INTERVAL).min(first + PUSH_REQUEST_TIMEOUT))
     }
 
     /// Take a datagram from the network and feed whatever it carried to TLS.
@@ -440,6 +487,17 @@ impl Session {
     }
 
     /// Build the data channel, now that everything it needs exists.
+    ///
+    /// Only reachable once the server has answered, which is deliberate: this
+    /// is a client that pulls its configuration, and the peer id in that
+    /// answer is what a `--mode server` peer expects on every data packet. A
+    /// peer that never answers is not a peer this client can carry traffic to,
+    /// and `NoPushReply` says so rather than leaving a tunnel that looks built
+    /// and is addressed to nobody.
+    ///
+    /// The point-to-point openvpn the interop tests spawn is exactly such a
+    /// peer. Those tests build a `DataChannel` from [`Session::keys`]
+    /// themselves for that reason.
     fn open_tunnel(&mut self) -> Result<(), Error> {
         let keys = self.keys.as_ref().ok_or(Error::NotReady)?;
         let peer_id = self.push.as_ref().and_then(|reply| reply.peer_id);

@@ -151,6 +151,12 @@ impl FakeServer {
     /// being handed the answer — which is what makes a payload test mean
     /// something: if either end derived differently, this would not decrypt.
     pub fn decrypt_payload(&mut self, datagram: &[u8]) -> Result<Vec<u8>, Error> {
+        self.tunnel().decrypt(datagram)
+    }
+
+    /// The peer's end of the data channel, derived the same way the client's
+    /// is — which is what makes a payload test mean anything.
+    fn tunnel(&mut self) -> &mut DataChannel {
         if self.data.is_none() {
             let source = self.client_source.clone().expect("the client's material");
             let expansion = key_expansion(
@@ -164,7 +170,13 @@ impl FakeServer {
                 KeyId::FIRST,
             ));
         }
-        self.data.as_mut().expect("built above").decrypt(datagram)
+        self.data.as_mut().expect("built above")
+    }
+
+    /// Wrap a payload the way the peer would, so the client has something to
+    /// receive.
+    pub fn encrypt_payload(&mut self, payload: &[u8]) -> Vec<u8> {
+        self.tunnel().encrypt(payload).expect("encrypt")
     }
 
     fn read_plaintext(&mut self) {
