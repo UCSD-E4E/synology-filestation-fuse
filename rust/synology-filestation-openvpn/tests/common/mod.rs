@@ -29,7 +29,8 @@ use std::time::{Duration, Instant};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection};
 use synology_filestation_openvpn::{
-    Acks, ControlPacket, KeyDirection, KeyId, Opcode, SessionId, StaticKey, TlsAuth,
+    key_expansion, Acks, ControlPacket, DataChannel, DataKeys, Error, KeyDirection, KeyId,
+    KeySource2, Opcode, SessionId, StaticKey, TlsAuth,
 };
 
 /// The same throwaway key the rest of the tests use.
@@ -71,6 +72,9 @@ pub struct FakeServer {
     answer: Answer,
     sent_key_material: bool,
     answered_push: bool,
+    /// Both ends' material, once the client has sent its half.
+    client_source: Option<KeySource2>,
+    data: Option<DataChannel>,
 }
 
 impl FakeServer {
@@ -102,6 +106,8 @@ impl FakeServer {
             answer,
             sent_key_material: false,
             answered_push: false,
+            client_source: None,
+            data: None,
         }
     }
 
@@ -139,6 +145,28 @@ impl FakeServer {
         out
     }
 
+    /// Decrypt a tunnel packet the client sent.
+    ///
+    /// The peer runs the same derivation over the same material rather than
+    /// being handed the answer — which is what makes a payload test mean
+    /// something: if either end derived differently, this would not decrypt.
+    pub fn decrypt_payload(&mut self, datagram: &[u8]) -> Result<Vec<u8>, Error> {
+        if self.data.is_none() {
+            let source = self.client_source.clone().expect("the client's material");
+            let expansion = key_expansion(
+                &source,
+                self.client_session.expect("the client's session id"),
+                SERVER_SESSION,
+            );
+            self.data = Some(DataChannel::new(
+                DataKeys::for_server(&expansion).expect("256 bytes"),
+                None,
+                KeyId::FIRST,
+            ));
+        }
+        self.data.as_mut().expect("built above").decrypt(datagram)
+    }
+
     fn read_plaintext(&mut self) {
         let mut buffer = [0u8; 4096];
         while let Ok(read) = self.tls.reader().read(&mut buffer) {
@@ -162,6 +190,7 @@ impl FakeServer {
 
         if has_key_material && !self.sent_key_material {
             self.sent_key_material = true;
+            self.client_source = Some(client_source_from(&self.plaintext));
             match &self.answer {
                 Answer::Refuse(message) => {
                     let text = format!("{message}\0");
@@ -326,4 +355,16 @@ pub fn exchange(
         }
     }
     Ok(())
+}
+
+/// The material both ends will derive from: the client's, out of its message,
+/// beside the randoms this peer always sends.
+fn client_source_from(key_method: &[u8]) -> KeySource2 {
+    let mut source = KeySource2::default();
+    source.pre_master.copy_from_slice(&key_method[5..53]);
+    source.client_random1.copy_from_slice(&key_method[53..85]);
+    source.client_random2.copy_from_slice(&key_method[85..117]);
+    source.server_random1 = [0x51; 32];
+    source.server_random2 = [0x62; 32];
+    source
 }

@@ -15,7 +15,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{exchange, Answer, FakeServer, TA_KEY_HEX};
-use synology_filestation_openvpn::{Error, Session, SessionConfig, StaticKey};
+use synology_filestation_openvpn::{Error, Session, SessionConfig, StaticKey, PING};
 
 fn session_against(server: &FakeServer) -> Session {
     let config = SessionConfig::new(
@@ -159,10 +159,18 @@ fn a_push_request_is_asked_again_until_it_is_answered() {
     exchange(&mut session, &mut server, start).expect("silence is not an error");
     assert_eq!(session.push_reply(), None, "nothing came back");
 
-    // A second later, the client asks again rather than waiting forever.
-    let later = start + Duration::from_secs(2);
+    // Not yet — asking every time round the loop would be a flood, not a
+    // retry.
+    assert!(session
+        .poll_transmit(start + Duration::from_secs(2), 0)
+        .is_none());
+
+    // But at OpenVPN's own interval, it asks again rather than waiting
+    // forever for an answer that is not coming on its own.
     assert!(
-        session.poll_transmit(later, 0).is_some(),
+        session
+            .poll_transmit(start + Duration::from_secs(6), 0)
+            .is_some(),
         "the request goes out again"
     );
 }
@@ -177,4 +185,103 @@ fn compression_the_server_pushes_stops_the_session() {
     let error = exchange(&mut session, &mut server, Instant::now()).unwrap_err();
 
     assert_eq!(error, Error::UnsupportedCompression("comp-lzo".to_string()));
+}
+
+#[test]
+fn a_ready_session_carries_payload_both_ways() {
+    // The point of all of it: bytes in, bytes out, under keys neither end
+    // sent.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
+    ));
+    let mut session = session_against(&server);
+    exchange(&mut session, &mut server, Instant::now()).expect("a whole handshake");
+
+    assert!(session.is_ready(), "there is a tunnel");
+    let datagram = session
+        .send_payload(b"a packet for the NAS")
+        .expect("wrapped");
+
+    assert!(
+        Session::is_data(&datagram),
+        "and it is data, not another handshake message"
+    );
+    assert_eq!(
+        server
+            .decrypt_payload(&datagram)
+            .expect("the peer reads it"),
+        b"a packet for the NAS"
+    );
+}
+
+#[test]
+fn a_session_with_no_tunnel_yet_refuses_payload_rather_than_inventing_one() {
+    let server = FakeServer::new(Answer::KeyMaterialOnly);
+    let mut session = session_against(&server);
+
+    assert_eq!(
+        session.send_payload(b"too early").unwrap_err(),
+        Error::NotReady
+    );
+}
+
+#[test]
+fn a_quiet_session_sends_the_keepalive_the_server_asked_for() {
+    // The server counts silence, not idleness: `ping-restart` is how long it
+    // waits before deciding we have gone. Without this the tunnel would work
+    // perfectly and then be torn down a minute into the first pause.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,ping 10,ping-restart 60".to_string(),
+    ));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+
+    // Nothing to say, and not long enough to need to say it.
+    assert!(session
+        .poll_transmit(start + Duration::from_secs(5), 0)
+        .is_none());
+
+    let datagram = session
+        .poll_transmit(start + Duration::from_secs(11), 0)
+        .expect("a keepalive is due");
+
+    assert!(Session::is_data(&datagram));
+    assert_eq!(
+        server
+            .decrypt_payload(&datagram)
+            .expect("the peer reads it"),
+        PING,
+        "and it is the keepalive openvpn recognises"
+    );
+}
+
+#[test]
+fn a_server_that_asked_for_no_keepalive_gets_none() {
+    let mut server = FakeServer::new(Answer::KeyMaterialThen("PUSH_REPLY,peer-id 4".to_string()));
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("a whole handshake");
+
+    assert!(
+        session
+            .poll_transmit(start + Duration::from_secs(600), 0)
+            .is_none(),
+        "silence was not asked for, so silence it is"
+    );
+}
+
+#[test]
+fn asking_for_a_configuration_forever_is_not_asking() {
+    // A client that pulls cannot work without the answer. Retrying is right;
+    // retrying without end is a session that is never usable and never says
+    // why.
+    let mut server = FakeServer::new(Answer::KeyMaterialOnly);
+    let mut session = session_against(&server);
+    let start = Instant::now();
+    exchange(&mut session, &mut server, start).expect("silence is not yet an error");
+
+    let much_later = start + Duration::from_secs(90);
+    assert!(session.poll_transmit(much_later, 0).is_none());
+    assert_eq!(session.failure(), Some(&Error::NoPushReply));
 }

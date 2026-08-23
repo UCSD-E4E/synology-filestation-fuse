@@ -22,8 +22,10 @@ use zeroize::Zeroizing;
 use std::io::{Read, Write};
 
 use crate::channel::ControlChannel;
+use crate::data::{DataChannel, DataKeys};
 use crate::key_method::{ClientKeyMethod2, ServerMessage};
 use crate::packet::SessionId;
+use crate::packet::{KeyId, Opcode};
 use crate::prf::{key_expansion, KeySource2};
 use crate::push::{PushReply, PUSH_REQUEST};
 use crate::static_key::{KeyDirection, StaticKey};
@@ -44,11 +46,15 @@ const CONTROL_MTU: usize = 1250;
 /// checked.
 const CONTROL_OVERHEAD: usize = 9 + 64 + 8 + 41 + 4;
 
-/// How often to ask again while the server has not answered a `PUSH_REQUEST`.
+/// How often to ask again while the server has not answered a `PUSH_REQUEST`
+/// — OpenVPN's `PUSH_REQUEST_INTERVAL`.
+const PUSH_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long to keep asking before giving up, matching `--hand-window`.
 ///
-/// Real clients retransmit at about this rate. A request sent once is a
-/// request never answered by a server that was not ready when it arrived.
-const PUSH_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+/// A client that pulls its configuration cannot work without the answer, so
+/// asking forever would be a session that is never usable and never says why.
+const PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The most TLS we can put in one control message.
 pub const MAX_TLS_FRAGMENT: usize = CONTROL_MTU - CONTROL_OVERHEAD;
@@ -165,6 +171,13 @@ pub struct Session {
     push: Option<PushReply>,
     /// When the last `PUSH_REQUEST` went out, so it can go again.
     push_requested_at: Option<Instant>,
+    /// When we first asked, so the asking can stop.
+    push_first_requested_at: Option<Instant>,
+    /// The tunnel itself, once there are keys to build it from.
+    data: Option<DataChannel>,
+    /// When we last put anything on the wire, which is what a keepalive is
+    /// measured from.
+    last_sent: Option<Instant>,
     /// A failure from a path that cannot return one — see
     /// [`Session::poll_transmit`].
     failure: Option<Error>,
@@ -199,6 +212,9 @@ impl Session {
             keys: None,
             push: None,
             push_requested_at: None,
+            push_first_requested_at: None,
+            data: None,
+            last_sent: None,
             failure: None,
         };
         // Opened here rather than by a separate call. rustls has a
@@ -233,6 +249,40 @@ impl Session {
     /// failure, it is what that kind of peer looks like.
     pub fn push_reply(&self) -> Option<&PushReply> {
         self.push.as_ref()
+    }
+
+    /// Whether the tunnel is ready to carry payload.
+    pub fn is_ready(&self) -> bool {
+        self.data.is_some()
+    }
+
+    /// Wrap a payload for the tunnel.
+    pub fn send_payload(&mut self, payload: &[u8]) -> Result<Vec<u8>, Error> {
+        let data = self.data.as_mut().ok_or(Error::NotReady)?;
+        let datagram = data.encrypt(payload)?;
+        Ok(datagram)
+    }
+
+    /// Unwrap a datagram the tunnel carried.
+    pub fn receive_payload(&mut self, datagram: &[u8]) -> Result<Vec<u8>, Error> {
+        let data = self.data.as_mut().ok_or(Error::NotReady)?;
+        data.decrypt(datagram)
+    }
+
+    /// Whether a datagram belongs to the tunnel rather than to the handshake.
+    ///
+    /// A caller reading a socket has to sort them out before handing either to
+    /// the wrong place: a data packet given to the control channel fails its
+    /// `tls-auth` check, and a control packet given to the tunnel fails to
+    /// decrypt.
+    pub fn is_data(datagram: &[u8]) -> bool {
+        match datagram.first() {
+            Some(&first) => {
+                let opcode = first >> 3;
+                opcode == Opcode::DataV1 as u8 || opcode == Opcode::DataV2 as u8
+            }
+            None => false,
+        }
     }
 
     /// The derived key material: two directions, each a cipher key then an
@@ -273,7 +323,33 @@ impl Session {
         }
         self.outbox.drain_into(&mut self.channel);
 
-        self.channel.poll_transmit(now, net_time)
+        if let Some(datagram) = self.channel.poll_transmit(now, net_time) {
+            self.last_sent = Some(now);
+            return Some(datagram);
+        }
+
+        self.poll_keepalive(now)
+    }
+
+    /// A keepalive, if the server asked for one and we have been quiet.
+    ///
+    /// The server counts silence, not idleness: `ping-restart` is how long it
+    /// waits before deciding we have gone. Ordinary traffic resets that too,
+    /// which is why this is measured from the last thing we sent rather than
+    /// on a fixed schedule.
+    fn poll_keepalive(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let interval = self.push.as_ref()?.ping?;
+        let due = match self.last_sent {
+            Some(last) => now.duration_since(last) >= interval,
+            None => true,
+        };
+        if !due {
+            return None;
+        }
+
+        let datagram = self.data.as_mut()?.encrypt(&crate::PING).ok()?;
+        self.last_sent = Some(now);
+        Some(datagram)
     }
 
     /// When [`Session::poll_transmit`] will next have something.
@@ -363,6 +439,18 @@ impl Session {
         Ok(())
     }
 
+    /// Build the data channel, now that everything it needs exists.
+    fn open_tunnel(&mut self) -> Result<(), Error> {
+        let keys = self.keys.as_ref().ok_or(Error::NotReady)?;
+        let peer_id = self.push.as_ref().and_then(|reply| reply.peer_id);
+        self.data = Some(DataChannel::new(
+            DataKeys::for_client(keys)?,
+            peer_id,
+            KeyId::FIRST,
+        ));
+        Ok(())
+    }
+
     /// Ask again, if the answer has not come.
     ///
     /// A server that is not yet ready to answer says nothing at all, and a
@@ -374,6 +462,15 @@ impl Session {
         if self.phase != Phase::AwaitingPush {
             return Ok(());
         }
+        // Giving up is part of asking. A client that pulls cannot work
+        // without the answer, so asking forever would be a session that is
+        // never usable and never says why.
+        if let Some(first) = self.push_first_requested_at {
+            if now.duration_since(first) >= PUSH_REQUEST_TIMEOUT {
+                return Err(Error::NoPushReply);
+            }
+        }
+
         match self.push_requested_at {
             Some(sent) if now.duration_since(sent) < PUSH_REQUEST_INTERVAL => Ok(()),
             _ => self.send_push_request(now),
@@ -386,6 +483,7 @@ impl Session {
             .write_all(format!("{PUSH_REQUEST}\0").as_bytes())
             .map_err(|error| Error::Tls(error.to_string()))?;
         self.push_requested_at = Some(now);
+        self.push_first_requested_at.get_or_insert(now);
         Ok(())
     }
 
@@ -436,7 +534,7 @@ impl Session {
         }
         self.push = Some(reply);
         self.phase = Phase::Ready;
-        Ok(())
+        self.open_tunnel()
     }
 
     /// Move whatever TLS has decrypted into `inbound`.
@@ -671,6 +769,9 @@ mod tests {
         // to produce real plaintext, which does not exist here yet.
         let mut session = test_session();
         session.phase = Phase::AwaitingPush;
+        // Consuming the reply also opens the tunnel, which needs the keys the
+        // exchange would have produced.
+        session.keys = Some(Zeroizing::new(vec![0u8; 256]));
         session.inbound = Zeroizing::new(b"PUSH_REPLY,peer-id 9,cipher AES-256-CBC\0".to_vec());
 
         session.receive_push_reply().expect("a well-formed reply");
@@ -682,6 +783,7 @@ mod tests {
             session.inbound.is_empty(),
             "and consumed, so the next message starts where it should"
         );
+        assert!(session.is_ready(), "and the tunnel exists");
     }
 
     #[test]
