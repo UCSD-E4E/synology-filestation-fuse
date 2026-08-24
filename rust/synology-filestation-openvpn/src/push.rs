@@ -114,8 +114,14 @@ impl PushReply {
                         interval => Some(interval),
                     }
                 }
+                // Zero is off, the same way it is for `ping`. Taken
+                // literally it is a deadline that has already passed, and the
+                // tunnel is torn down the moment the reply is read.
                 ("ping-restart", [seconds]) => {
-                    parsed.ping_restart = Some(seconds_from(seconds, directive)?)
+                    parsed.ping_restart = match seconds_from(seconds, directive)? {
+                        zero if zero.is_zero() => None,
+                        limit => Some(limit),
+                    }
                 }
                 // Routes, DNS, compression settings and whatever else a server
                 // chooses to say. Kept in `directives` and otherwise ignored:

@@ -166,3 +166,36 @@ fn a_server_saying_compression_is_off_asks_nothing_of_us() {
     assert!(reply.compression_is_supported());
     assert_eq!(reply.compression, None);
 }
+
+#[test]
+fn a_pushed_ifconfig_under_either_topology_gives_the_right_prefix() {
+    // The second address means different things under the two topologies, and
+    // nothing in the reply says which. OpenVPN 2.6 defaults to `subnet`; 2.5 —
+    // which is what e4e-nas runs — still defaults to `net30`, so this is not a
+    // legacy case, it is the likely one.
+    let subnet = PushReply::parse("PUSH_REPLY,ifconfig 10.90.24.6 255.255.255.0")
+        .expect("well formed")
+        .ifconfig
+        .expect("present");
+    assert_eq!(
+        synology_filestation_openvpn::Ifconfig::from_push(subnet.0, subnet.1),
+        synology_filestation_openvpn::Ifconfig {
+            address: Ipv4Addr::new(10, 90, 24, 6),
+            prefix: 24,
+        }
+    );
+
+    // Under net30 the second address is the peer, and reading it as a mask
+    // would put us on a subnet that does not exist.
+    let net30 = PushReply::parse("PUSH_REPLY,ifconfig 10.90.24.6 10.90.24.5")
+        .expect("well formed")
+        .ifconfig
+        .expect("present");
+    assert_eq!(
+        synology_filestation_openvpn::Ifconfig::from_push(net30.0, net30.1),
+        synology_filestation_openvpn::Ifconfig {
+            address: Ipv4Addr::new(10, 90, 24, 6),
+            prefix: 30,
+        }
+    );
+}

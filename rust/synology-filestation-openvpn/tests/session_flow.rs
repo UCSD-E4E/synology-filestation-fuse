@@ -705,3 +705,74 @@ fn the_wakeup_agrees_while_a_push_reply_is_outstanding() {
         );
     }
 }
+
+#[test]
+fn an_idle_tunnel_is_not_declared_dead_by_default() {
+    // The tunnel sends nothing and the peer sends nothing, because that is
+    // what was agreed. A deadline here would end a working idle tunnel for
+    // behaving exactly as arranged — `recv` returning `None` and `send`
+    // failing, on a link where nothing was wrong.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,cipher AES-256-CBC".to_string(),
+    ));
+    let mut session = session_against(&server);
+    exchange(&mut session, &mut server, Instant::now()).expect("a whole handshake");
+
+    assert_eq!(
+        session.peer_timeout(),
+        None,
+        "silence was agreed, so silence proves nothing"
+    );
+}
+
+#[test]
+fn the_servers_own_restart_interval_is_used_when_it_gives_one() {
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,ping 10,ping-restart 60".to_string(),
+    ));
+    let mut session = session_against(&server);
+    exchange(&mut session, &mut server, Instant::now()).expect("a whole handshake");
+
+    assert_eq!(session.peer_timeout(), Some(Duration::from_secs(60)));
+}
+
+#[test]
+fn a_caller_that_would_rather_not_wait_forever_can_say_so() {
+    // The local policy OpenVPN spells `--ping-restart`. A caller who prefers a
+    // bounded wait on a silent link is entitled to one, whatever the peer
+    // asked for.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen("PUSH_REPLY,peer-id 4".to_string()));
+    let mut config = SessionConfig::new(
+        server.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.peer_timeout = Some(Duration::from_secs(30));
+    let mut session = Session::new(config).expect("a client");
+    exchange(&mut session, &mut server, Instant::now()).expect("a whole handshake");
+
+    assert_eq!(session.peer_timeout(), Some(Duration::from_secs(30)));
+}
+
+#[test]
+fn a_restart_interval_of_zero_is_off_rather_than_immediate() {
+    // Zero is how OpenVPN spells "off" — the same rule the `ping` arm already
+    // followed. Read literally it is a deadline that expired before the reply
+    // was parsed, and the tunnel ends on the next turn of the loop.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,ping 10,ping-restart 0".to_string(),
+    ));
+    let mut session = session_against(&server);
+    exchange(&mut session, &mut server, Instant::now()).expect("a whole handshake");
+
+    assert_eq!(
+        session.push_reply().expect("answered").ping_restart,
+        None,
+        "off, not zero"
+    );
+    assert_eq!(
+        session.peer_timeout(),
+        None,
+        "and certainly not a deadline already past"
+    );
+}

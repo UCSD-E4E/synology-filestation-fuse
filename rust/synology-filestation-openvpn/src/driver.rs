@@ -183,12 +183,13 @@ async fn run(
         // tunnel reporting no failure, `recv` pending forever, and `send`
         // returning `Ok` while every payload goes nowhere.
         //
-        // The peer's own `ping-restart` when it pushed one, and a configured
-        // fallback when it did not — a peer that named no limit has not
-        // thereby promised to stay forever.
-        let limit = session.peer_timeout();
-        if last_heard.elapsed() >= limit {
-            break Error::PeerGone(limit);
+        // Only where silence means something. A server that asked for no
+        // keepalives is one nothing is expected from, and counting its quiet
+        // would end a tunnel that is working exactly as arranged.
+        if let Some(limit) = session.peer_timeout() {
+            if last_heard.elapsed() >= limit {
+                break Error::PeerGone(limit);
+            }
         }
 
         let wakeup = session

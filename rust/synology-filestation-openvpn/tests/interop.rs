@@ -932,9 +932,10 @@ async fn a_peer_that_vanishes_is_noticed() {
         cert_chain_pem: server.pki.client_cert_pem.clone(),
         private_key_pem: zeroize::Zeroizing::new(server.pki.client_key_pem.clone()),
     });
-    // This peer pushes no `ping-restart`, so the fallback is what applies —
-    // shortened here because the test is about noticing, not about waiting.
-    config.peer_timeout = Duration::from_secs(3);
+    // This peer pushes no `ping-restart`, so what applies is the local policy
+    // — set here, and shortened, because the test is about noticing rather
+    // than about waiting.
+    config.peer_timeout = Some(Duration::from_secs(3));
 
     let remote: std::net::SocketAddr = format!("127.0.0.1:{}", server.port)
         .parse()

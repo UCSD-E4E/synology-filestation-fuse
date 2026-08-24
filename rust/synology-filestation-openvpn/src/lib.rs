@@ -20,6 +20,7 @@
 mod channel;
 mod data;
 mod driver;
+mod ip;
 mod key_method;
 mod packet;
 mod prf;
@@ -27,12 +28,14 @@ mod push;
 mod reliable;
 mod replay;
 mod session;
+mod stack;
 mod static_key;
 mod tls_auth;
 
 pub use channel::ControlChannel;
 pub use data::{DataChannel, DataKeys, PeerId, PING};
 pub use driver::Tunnel;
+pub use ip::Ifconfig;
 pub use key_method::{ClientKeyMethod2, ServerKeyMethod2, ServerMessage};
 pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 pub use prf::{key_expansion, tls1_prf, KeySource2};
@@ -40,6 +43,7 @@ pub use push::{PushReply, PUSH_REQUEST, SUPPORTED_CIPHER};
 pub use reliable::{Delivery, Outgoing, RecvWindow, SendWindow};
 pub use replay::ReplayWindow;
 pub use session::{ClientAuth, Credentials, Session, SessionConfig, MAX_TLS_FRAGMENT};
+pub use stack::{TunnelDevice, TunnelStream};
 pub use static_key::{KeyDirection, StaticKey, STATIC_KEY_LEN};
 pub use tls_auth::{TlsAuth, TlsAuthHeader};
 
