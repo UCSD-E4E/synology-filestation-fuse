@@ -45,26 +45,14 @@ const BUFFER: usize = 64 * 1024;
 pub struct TunnelDevice {
     outbound: mpsc::Sender<Vec<u8>>,
     inbound: mpsc::Receiver<Vec<u8>>,
-    /// One packet, taken from `inbound` and not yet handed to `smoltcp`.
-    ///
-    /// `smoltcp` asks whether there is a packet and then asks for it, in two
-    /// calls, so something has to hold it in between.
-    peeked: Option<Vec<u8>>,
 }
 
 impl TunnelDevice {
     pub fn new(outbound: mpsc::Sender<Vec<u8>>, inbound: mpsc::Receiver<Vec<u8>>) -> Self {
-        Self {
-            outbound,
-            inbound,
-            peeked: None,
-        }
+        Self { outbound, inbound }
     }
 
     fn take(&mut self) -> Option<Vec<u8>> {
-        if let Some(packet) = self.peeked.take() {
-            return Some(packet);
-        }
         // Never blocking: `smoltcp` is asking whether anything has arrived,
         // and "not yet" is an answer.
         self.inbound.try_recv().ok()

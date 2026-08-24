@@ -90,15 +90,17 @@ pub struct SessionConfig {
     pub session_id: SessionId,
     /// `--tls-timeout`, the first retransmission interval.
     pub tls_timeout: Duration,
-    /// How long the peer may be silent before we conclude it has gone, when
-    /// it has not told us itself.
+    /// How long this client is willing to hear nothing before deciding the
+    /// peer has gone.
     ///
-    /// A server that pushes `ping-restart` has answered this question and its
-    /// answer is used instead. One that has not is not thereby promising to
-    /// stay forever — and a tunnel with no limit at all reports no failure,
-    /// never ends a `recv`, and accepts payload it silently discards. So
-    /// there is a number either way; this is ours.
-    pub peer_timeout: Duration,
+    /// `None` by default, and that default is the important part: a server
+    /// that asked for no keepalives is one nothing is expected from, and a
+    /// deadline would end a working idle tunnel for behaving exactly as
+    /// arranged. This is the local policy OpenVPN spells `--ping-restart`, and
+    /// like that option a pushed `ping-restart` takes precedence over it.
+    ///
+    /// A caller that would rather not wait forever on a silent link sets it.
+    pub peer_timeout: Option<Duration>,
     /// The credentials the server authenticates. e4e-nas takes an AD username
     /// and password; a peer that asks for neither is sent empty fields.
     pub credentials: Option<Credentials>,
@@ -141,7 +143,7 @@ impl SessionConfig {
             key_direction: KeyDirection::Inverse,
             session_id: SessionId::random(),
             tls_timeout: Duration::from_secs(2),
-            peer_timeout: Duration::from_secs(120),
+            peer_timeout: None,
             credentials: None,
             client_auth: None,
         }
@@ -197,7 +199,7 @@ pub struct Session {
     inbound: Zeroizing<Vec<u8>>,
     keys: Option<Zeroizing<Vec<u8>>>,
     push: Option<PushReply>,
-    peer_timeout: Duration,
+    peer_timeout: Option<Duration>,
     /// When the last `PUSH_REQUEST` went out, so it can go again.
     push_requested_at: Option<Instant>,
     /// When we first asked, so the asking can stop.
@@ -275,15 +277,22 @@ impl Session {
         )
     }
 
-    /// How long the peer may be silent before it counts as gone.
+    /// How long silence may last before the peer counts as gone, if there is
+    /// any such limit.
     ///
-    /// Its own `ping-restart` if it pushed one, since it knows what it
-    /// intends; otherwise the configured fallback.
-    pub fn peer_timeout(&self) -> Duration {
+    /// The server's own `ping-restart` if it pushed one, since it knows what
+    /// it intends; otherwise whatever the caller asked for; otherwise nothing.
+    ///
+    /// Nothing is the right answer more often than it looks. A server that
+    /// asked for no keepalives sends none and expects none, so quiet is what
+    /// a working idle tunnel looks like — I had a fallback here on the
+    /// reasoning that a peer naming no limit had not promised to stay forever,
+    /// and what it had actually done was agree to say nothing.
+    pub fn peer_timeout(&self) -> Option<Duration> {
         self.push
             .as_ref()
             .and_then(|reply| reply.ping_restart)
-            .unwrap_or(self.peer_timeout)
+            .or(self.peer_timeout)
     }
 
     /// What the server pushed, once it has.
