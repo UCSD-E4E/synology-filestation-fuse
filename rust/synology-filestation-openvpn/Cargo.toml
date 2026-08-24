@@ -22,6 +22,13 @@ zeroize = { version = "1", features = ["derive"] }
 # the rest of the workspace: aws-lc-rs wants a C toolchain that the Windows and
 # manylinux builds do not have.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The stack test builds the other end of the link out of the same pieces.
+smoltcp = { version = "0.14", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+] }
 rustls-pemfile = "2"
 # The key derivation is TLS 1.0's PRF, which is MD5 and SHA-1 in parallel.
 # Both are long dead as hashes; here they are a fixed part of a wire format we
@@ -55,3 +62,10 @@ rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Driving the tunnel in a test needs a runtime to drive it on.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# The stack test builds the other end of the link out of the same pieces.
+smoltcp = { version = "0.14", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+] }
