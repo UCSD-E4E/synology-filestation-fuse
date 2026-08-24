@@ -35,6 +35,10 @@ sha1 = "0.10"
 # Session ids have to be unpredictable, not merely distinct.
 rand = "0.9"
 thiserror = "2"
+# The driver owns the socket and the timers. Everything below it stays
+# sans-io, which is what let the rest of this crate be tested without a
+# network at all.
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 
 [dev-dependencies]
 hex = "0.4"
@@ -49,3 +53,5 @@ rcgen = "0.14"
 # The in-process peer in `tests/common` is a rustls server, so the tests need
 # rustls directly as well as through the library.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Driving the tunnel in a test needs a runtime to drive it on.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

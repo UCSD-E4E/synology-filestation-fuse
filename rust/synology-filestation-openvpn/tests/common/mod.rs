@@ -3,11 +3,11 @@
 //!
 //! The interop tests drive a real `openvpn`, which is the stronger check and
 //! the one that catches misunderstandings. But it is a *point-to-point* peer:
-//! it never assigns a peer id, never answers a `PUSH_REQUEST`, and cannot be
-//! told to refuse a password or to answer late. Whole branches of the session
-//! state machine have no way to be reached from there, and one of them held a
-//! bug that would have surfaced as the live pass failing in a way that looked
-//! like the network.
+//! it never assigns a peer id, and it cannot be told to refuse a password, to
+//! answer late, or to push something we cannot speak. Whole branches of the
+//! session state machine have no way to be reached from there, and one of
+//! them held a bug that would have surfaced as the live pass failing in a way
+//! that looked like the network.
 //!
 //! So this peer exists to reach them. It is deliberately simple — no
 //! retransmission, no windowing, no loss — because the tests drive it in

@@ -268,6 +268,13 @@ impl OpenVpnServer {
         );
     }
 
+    /// Stop the peer, so a test can watch what happens to a tunnel whose far
+    /// end has gone.
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     fn log(&self) -> String {
         std::fs::read_to_string(self.dir.join("openvpn.log")).unwrap_or_default()
     }
@@ -841,4 +848,119 @@ impl Pki {
             client_key_pem: client_key.serialize_pem(),
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "spawns a real openvpn process"]
+async fn the_driver_brings_a_tunnel_up_against_a_real_openvpn() {
+    // The first test in this crate with a socket in it, and the last thing
+    // that had never been exercised: everything else drives the state machine
+    // by hand — which is what made it testable at all — so nothing had run the
+    // whole thing end to end. Bind, hand it what arrives, send what it asks
+    // for, sleep as long as it says, and come back with a tunnel.
+    let server = OpenVpnServer::start();
+
+    let mut config = SessionConfig::new(
+        server.pki.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.client_auth = Some(ClientAuth {
+        cert_chain_pem: server.pki.client_cert_pem.clone(),
+        private_key_pem: zeroize::Zeroizing::new(server.pki.client_key_pem.clone()),
+    });
+
+    let remote: std::net::SocketAddr = format!("127.0.0.1:{}", server.port)
+        .parse()
+        .expect("a local address");
+
+    let tunnel = synology_filestation_openvpn::Tunnel::connect(config, remote)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "the tunnel did not come up: {error}\n--- openvpn log ---\n{}",
+                server.log()
+            )
+        });
+
+    // And it carries. The keepalive is the one payload whose acceptance
+    // openvpn will comment on if it is wrong.
+    let complaints_before = server
+        .log()
+        .matches("Authenticate/Decrypt packet error")
+        .count();
+    tunnel
+        .send(PING.to_vec())
+        .await
+        .expect("the tunnel carries");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        server
+            .log()
+            .matches("Authenticate/Decrypt packet error")
+            .count(),
+        complaints_before,
+        "openvpn refused what the driver sent.\n--- its log ---\n{}",
+        server.log()
+    );
+    assert!(
+        tunnel.failure().is_none(),
+        "the tunnel stopped: {:?}",
+        tunnel.failure()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real openvpn process"]
+async fn a_peer_that_vanishes_is_noticed() {
+    // Without this the tunnel is worse than broken, it is silent: `failure()`
+    // stays `None`, `recv()` waits forever, and `send()` returns `Ok` while
+    // every payload goes nowhere. A caller has no way to tell that from a
+    // quiet link.
+    //
+    // `ping-restart` is the peer's own answer to how long silence may last,
+    // so it is the number used here rather than one of ours.
+    let mut server = OpenVpnServer::start();
+
+    let mut config = SessionConfig::new(
+        server.pki.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.client_auth = Some(ClientAuth {
+        cert_chain_pem: server.pki.client_cert_pem.clone(),
+        private_key_pem: zeroize::Zeroizing::new(server.pki.client_key_pem.clone()),
+    });
+    // This peer pushes no `ping-restart`, so the fallback is what applies —
+    // shortened here because the test is about noticing, not about waiting.
+    config.peer_timeout = Duration::from_secs(3);
+
+    let remote: std::net::SocketAddr = format!("127.0.0.1:{}", server.port)
+        .parse()
+        .expect("a local address");
+
+    let mut tunnel = synology_filestation_openvpn::Tunnel::connect(config, remote)
+        .await
+        .unwrap_or_else(|error| panic!("the tunnel did not come up: {error}"));
+
+    // And now the far end simply stops.
+    server.kill();
+
+    // `recv` ends when the loop does, which is the signal a caller actually
+    // waits on.
+    let ended = tokio::time::timeout(Duration::from_secs(20), tunnel.recv()).await;
+
+    assert!(
+        matches!(ended, Ok(None)),
+        "the tunnel neither delivered nor ended after the peer vanished"
+    );
+    assert!(
+        matches!(
+            tunnel.failure(),
+            Some(synology_filestation_openvpn::Error::PeerGone(_))
+        ),
+        "and it should say why: {:?}",
+        tunnel.failure()
+    );
 }

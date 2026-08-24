@@ -19,6 +19,7 @@
 
 mod channel;
 mod data;
+mod driver;
 mod key_method;
 mod packet;
 mod prf;
@@ -31,6 +32,7 @@ mod tls_auth;
 
 pub use channel::ControlChannel;
 pub use data::{DataChannel, DataKeys, PeerId, PING};
+pub use driver::Tunnel;
 pub use key_method::{ClientKeyMethod2, ServerKeyMethod2, ServerMessage};
 pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 pub use prf::{key_expansion, tls1_prf, KeySource2};
@@ -120,6 +122,15 @@ pub enum Error {
     #[error("the server never answered the request for its configuration")]
     NoPushReply,
 
+    #[error("the tunnel did not come up in time")]
+    HandshakeTimeout,
+
+    #[error("the peer has not been heard from in {0:?}")]
+    PeerGone(std::time::Duration),
+
+    #[error("socket: {0}")]
+    Io(String),
+
     #[error("{context} is longer than the protocol can describe")]
     FieldTooLong {
         /// Which field, so the caller knows what to shorten.
@@ -187,7 +198,10 @@ impl Error {
             | Error::BadPushDirective(_)
             | Error::UnsupportedCipher(_)
             | Error::UnsupportedCompression(_)
-            | Error::NoPushReply => true,
+            | Error::NoPushReply
+            | Error::HandshakeTimeout
+            | Error::PeerGone(_)
+            | Error::Io(_) => true,
         }
     }
 }
