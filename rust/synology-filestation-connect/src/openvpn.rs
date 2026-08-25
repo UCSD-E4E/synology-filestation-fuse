@@ -20,12 +20,12 @@
 //! deciding when to tear it down, which is a question nothing here can answer
 //! and [`Chain`](crate::Chain) already answers in its own terms.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use synology_filestation_openvpn::{credentials, Profile, Tunnel as OpenVpn};
+use synology_filestation_openvpn::{credentials, Error as VpnError, Profile, Tunnel as OpenVpn};
 use tracing::{debug, info};
 use zeroize::Zeroizing;
 
@@ -70,12 +70,16 @@ impl OpenVpnTunnel {
         }
     }
 
-    /// Raise a tunnel and open a connection through it, however long that
-    /// takes.
-    async fn raise(&self, host: Ipv4Addr, port: u16) -> Result<Connection, TunnelUnavailable> {
+    /// Raise a tunnel and open a connection through it, by `deadline`.
+    async fn raise(
+        &self,
+        host: Ipv4Addr,
+        port: u16,
+        deadline: tokio::time::Instant,
+    ) -> Result<Connection, TunnelUnavailable> {
         let text = Zeroizing::new(read_profile(&self.profile).await?);
         let profile = Profile::parse(&text).map_err(|e| {
-            TunnelUnavailable(format!(
+            TunnelUnavailable::Transient(format!(
                 "the vpn profile is not one this client can use: {e}"
             ))
         })?;
@@ -87,35 +91,44 @@ impl OpenVpnTunnel {
                 self.username.clone(),
                 self.password.to_string(),
             )))
-            .map_err(|e| TunnelUnavailable(format!("the vpn profile is incomplete: {e}")))?;
+            .map_err(|e| {
+                TunnelUnavailable::Transient(format!("the vpn profile is incomplete: {e}"))
+            })?;
 
         // Resolved here rather than inside the tunnel, so a name that does not
         // resolve is reported as what it is rather than as a handshake nobody
         // answered.
-        let remote = tokio::net::lookup_host(dial)
-            .await
-            .map_err(|e| TunnelUnavailable(format!("cannot resolve the vpn server {server}: {e}")))?
-            .next()
-            .ok_or_else(|| {
-                TunnelUnavailable(format!("the vpn server {server} resolves to nothing"))
-            })?;
+        let resolved = tokio::net::lookup_host(dial).await.map_err(|e| {
+            TunnelUnavailable::Transient(format!("cannot resolve the vpn server {server}: {e}"))
+        })?;
+        let remote = pick_address(resolved).ok_or_else(|| {
+            TunnelUnavailable::Transient(format!("the vpn server {server} resolves to nothing"))
+        })?;
 
         debug!("tunnel: raising one to {server} for {host}:{port}");
         let tunnel = OpenVpn::connect(config, remote).await.map_err(|e| {
-            TunnelUnavailable(format!("the vpn tunnel to {server} did not come up: {e}"))
+            let why = format!("the vpn tunnel to {server} did not come up: {e}");
+            // A rejected password is not a blip. Every attempt is a real
+            // authentication against the domain controller, so a chain that
+            // re-probes on a timer works its way to a locked account.
+            match e {
+                VpnError::AuthFailed(_) => TunnelUnavailable::Refused(why),
+                _ => TunnelUnavailable::Transient(why),
+            }
         })?;
 
-        // The same patience again, which is not the same as what is left of
-        // it — the outer bound in `open` is what actually stops this, and this
-        // one only keeps the stack from waiting forever if that ever changes.
-        let stream = tunnel
-            .open_stream((host, port), self.patience)
-            .await
-            .map_err(|e| {
-                TunnelUnavailable(format!(
-                    "nothing answered at {host}:{port} inside the tunnel: {e}"
-                ))
-            })?;
+        // What is left of the budget, not the whole of it again. Handing the
+        // full patience here means the outer bound always fires first, so
+        // every failure is reported as the tunnel not coming up — erasing the
+        // difference between a tunnel that never came up and a NAS not
+        // listening behind one, which is the difference this layer exists to
+        // draw.
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let stream = tunnel.open_stream((host, port), left).await.map_err(|e| {
+            TunnelUnavailable::Transient(format!(
+                "the tunnel is up, but nothing answered at {host}:{port} inside it: {e}"
+            ))
+        })?;
 
         info!("tunnel: up, and {host}:{port} answered through it");
         Ok(Box::new(stream))
@@ -130,7 +143,7 @@ impl Tunnel for OpenVpnTunnel {
         // get around — which either fails, or succeeds and points somewhere
         // else entirely.
         let address: Ipv4Addr = host.parse().map_err(|_| {
-            TunnelUnavailable(format!(
+            TunnelUnavailable::Transient(format!(
                 "{host} is not an address, and a tunnel that pushes no DNS has no way to \
                  make it one"
             ))
@@ -139,9 +152,13 @@ impl Tunnel for OpenVpnTunnel {
         // The trait asks for a bounded wait, and this is where it is bounded:
         // the pieces below have their own deadlines, but nothing until here
         // knows how long the whole thing may take.
-        match tokio::time::timeout(self.patience, self.raise(address, port)).await {
+        // A backstop, not the mechanism: the steps inside share this deadline
+        // and each says what it was doing, so this only fires if one of them
+        // fails to bound itself.
+        let deadline = tokio::time::Instant::now() + self.patience;
+        match tokio::time::timeout_at(deadline, self.raise(address, port, deadline)).await {
             Ok(outcome) => outcome,
-            Err(_) => Err(TunnelUnavailable(format!(
+            Err(_) => Err(TunnelUnavailable::Transient(format!(
                 "the vpn tunnel did not come up within {:?}",
                 self.patience
             ))),
@@ -149,12 +166,69 @@ impl Tunnel for OpenVpnTunnel {
     }
 }
 
+/// Which of a name's addresses to dial.
+///
+/// IPv4 first, then whatever there is. Not a preference about protocols: the
+/// resolver's order is its own business, and a AAAA record in front of a
+/// working A record would otherwise fail the whole escalation on a machine
+/// with no IPv6 route — which describes most of the networks somebody is on
+/// when they need this at all.
+fn pick_address(resolved: impl Iterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    let mut first = None;
+    for address in resolved {
+        if address.is_ipv4() {
+            return Some(address);
+        }
+        first.get_or_insert(address);
+    }
+    first
+}
+
 /// The profile's text, with a failure that names the file.
 async fn read_profile(path: &Path) -> Result<String, TunnelUnavailable> {
     tokio::fs::read_to_string(path).await.map_err(|e| {
-        TunnelUnavailable(format!(
+        TunnelUnavailable::Transient(format!(
             "cannot read the vpn profile at {}: {e}",
             path.display()
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(text: &str) -> SocketAddr {
+        text.parse().expect("an address")
+    }
+
+    #[test]
+    fn an_ipv4_address_is_preferred_wherever_it_comes_in_the_list() {
+        // A resolver answering with the AAAA record first is ordinary. On a
+        // machine with no IPv6 route, taking whatever came first fails the
+        // whole escalation with a working A record sitting right behind it.
+        let resolved = [addr("[2001:db8::1]:1194"), addr("10.0.0.1:1194")];
+
+        assert_eq!(
+            pick_address(resolved.into_iter()),
+            Some(addr("10.0.0.1:1194"))
+        );
+    }
+
+    #[test]
+    fn an_ipv6_only_name_is_still_dialled() {
+        // Preferring one is not refusing the other: a server that really is
+        // v6-only should be tried, not skipped.
+        let resolved = [addr("[2001:db8::1]:1194")];
+
+        assert_eq!(
+            pick_address(resolved.into_iter()),
+            Some(addr("[2001:db8::1]:1194"))
+        );
+    }
+
+    #[test]
+    fn a_name_that_resolves_to_nothing_has_nothing_to_dial() {
+        assert_eq!(pick_address(std::iter::empty()), None);
+    }
 }

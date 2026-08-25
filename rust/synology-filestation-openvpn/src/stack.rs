@@ -354,6 +354,7 @@ impl TunnelStream {
                 inbound,
                 from_caller,
                 to_caller: Some(to_caller),
+                by: started + patience,
                 progress,
                 started,
             },
@@ -559,6 +560,15 @@ struct Driver {
     from_caller: mpsc::Receiver<Vec<u8>>,
     /// How much of what the caller wrote is still ours to deliver.
     progress: watch::Sender<Progress>,
+    /// When to give up if the connection has still not come up.
+    ///
+    /// The loop's own deadline, not the caller's. `connect` aborts this task
+    /// on every path it returns from — and can abort nothing on a path it
+    /// never returns from, which is what a caller that gives up leaves behind:
+    /// a stack still holding the sender into the tunnel below it, which keeps
+    /// that tunnel's pump, its authenticated session and its socket alive with
+    /// nobody left who wanted any of them.
+    by: StdInstant,
     /// Bytes that arrived for the caller, until the peer stops sending.
     ///
     /// Dropped at that point and not before: letting go of it is how a reader
@@ -604,6 +614,23 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
         driver
             .interface
             .poll(now, &mut driver.device, &mut driver.sockets);
+
+        // Nobody is waiting for this any more. A caller that gave up — a
+        // `timeout`, a `select!` losing the race — drops the future that would
+        // have told us, and dropping it closes the channel it was waiting on.
+        // That is the only signal there is, and without it this loop runs on
+        // holding a tunnel nobody wants.
+        if up.as_ref().is_some_and(|caller| caller.is_closed()) {
+            break;
+        }
+
+        // Or nobody ever answered. The caller has its own deadline and will
+        // abort this when that passes, but a caller generous enough to wait a
+        // long time should not mean a stack that waits that long to notice a
+        // peer that was never there.
+        if !established && StdInstant::now() >= driver.by {
+            break;
+        }
 
         // The moment it is carrying, whoever called `connect` is told.
         if driver.socket().may_send() {
@@ -704,6 +731,12 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
             .map(|delay| Duration::from_micros(delay.total_micros()))
             .unwrap_or(IDLE_POLL)
             .min(IDLE_POLL);
+        // Never past the point where the loop has decided to stop waiting.
+        let delay = if established {
+            delay
+        } else {
+            delay.min(driver.by.saturating_duration_since(StdInstant::now()))
+        };
 
         tokio::select! {
             packet = driver.inbound.recv(), if !link_gone => match packet {
