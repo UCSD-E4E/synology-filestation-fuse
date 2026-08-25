@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.4.0...synology-filestation-gui-v0.4.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* **gui:** stop the settings window drawing over itself ([6ce8500](https://github.com/UCSD-E4E/synology-filestation/commit/6ce85002c04e0e29e912db5ec3989c09c014bbbf))
+* **gui:** stop the settings window drawing over itself ([c431c12](https://github.com/UCSD-E4E/synology-filestation/commit/c431c123bb8904beff197e7d60fc175d28d00461))
+* stop assuming where a NAS keeps things, and which path was meant ([20899bf](https://github.com/UCSD-E4E/synology-filestation/commit/20899bfa013643f9584dbb5bd01a1c8214b46380))
+* stop assuming where a NAS keeps things, and which path was meant ([0ac1397](https://github.com/UCSD-E4E/synology-filestation/commit/0ac1397aff84a1d6ae74fd04749db85bdde58885))
+
 ## [0.4.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.3.1...synology-filestation-gui-v0.4.0) (2026-08-25)
 
 
