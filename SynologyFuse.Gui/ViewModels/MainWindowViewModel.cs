@@ -35,7 +35,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _cacheTtl = s.CacheTtl;
         _readCacheMb = s.ReadCacheMb;
         _logLevel = s.LogLevel;
-        _smbDomain = s.SmbDomain;
+        _domain = s.Domain;
         _vpnProfile = s.VpnProfile;
         _vpnHost = s.VpnHost;
         _vpnProfileNas = s.VpnProfileNas;
@@ -104,11 +104,13 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private string _logLevel = "info"; // overwritten by constructor; default satisfies nullable analysis
 
-    /// <summary>NetBIOS domain for SMB — `KRG` for an AD account, empty for a
-    /// local DSM user. Empty against an AD account is why a connection ends up
-    /// on the slower HTTP path without saying so.</summary>
+    /// <summary>NetBIOS domain the account lives in — `KRG` for an AD account,
+    /// empty for a local DSM user. Both directory-authenticated legs need it:
+    /// empty against an AD account is why a connection ends up on the slower
+    /// HTTP path without saying so, and why the VPN is refused before the
+    /// password is checked.</summary>
     [ObservableProperty]
-    private string _smbDomain = "";
+    private string _domain = "";
 
     /// <summary>The OpenVPN profile on this computer, if there is already one
     /// here. Left empty, one is downloaded to a copy kept beside the settings —
@@ -384,7 +386,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         CacheTtl = (ulong)CacheTtl,
         ReadCacheMb = (ulong)ReadCacheMb,
         LogLevel = LogLevel,
-        SmbDomain = SmbDomain,
+        Domain = Domain,
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
         VpnProfileNas = VpnProfileNas,
@@ -401,7 +403,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         CacheTtl = CacheTtl,
         ReadCacheMb = ReadCacheMb,
         LogLevel = LogLevel,
-        SmbDomain = SmbDomain,
+        Domain = Domain,
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
         VpnProfileNas = VpnProfileNas,

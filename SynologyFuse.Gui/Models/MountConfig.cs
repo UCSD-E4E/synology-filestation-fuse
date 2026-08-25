@@ -21,7 +21,7 @@ public sealed class MountConfig
     /// empty for a local DSM user. Without it an AD account is checked against
     /// the appliance's own accounts, fails, and SMB is silently skipped in
     /// favour of the slower HTTP path.</summary>
-    public string SmbDomain { get; init; } = "";
+    public string Domain { get; init; } = "";
 
     /// <summary>Where the OpenVPN profile is kept. Given it, a NAS that does
     /// not answer directly is reached through a tunnel raised inside this

@@ -71,7 +71,7 @@ public sealed class MountService : IDisposable
             var c = SynoClient.Connect(
                 config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
                 autoRelogin: true, verifySsl: config.VerifySsl,
-                smbDomain: Blank(config.SmbDomain),
+                domain: Blank(config.Domain),
                 vpnProfile: VpnProfileFor(config),
                 vpnHost: Blank(config.VpnHost),
                 vpnProfileRemote: Blank(config.VpnProfileNas));
@@ -119,7 +119,7 @@ public sealed class MountService : IDisposable
             using var client = SynoClient.Connect(
                 config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
                 autoRelogin: true, verifySsl: config.VerifySsl,
-                smbDomain: Blank(config.SmbDomain),
+                domain: Blank(config.Domain),
                 vpnProfile: VpnProfileFor(config),
                 vpnHost: Blank(config.VpnHost),
                 vpnProfileRemote: Blank(config.VpnProfileNas));
