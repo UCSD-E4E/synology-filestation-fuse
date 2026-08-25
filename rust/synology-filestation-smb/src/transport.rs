@@ -315,15 +315,24 @@ pub async fn auto_attach_as(
     domain: Option<&str>,
 ) -> SynologyClient {
     match auto_connect_as(host, username, password, domain).await {
-        Some(smb) => client
-            .with_read_transport(smb.clone())
-            .with_write_transport(smb.clone())
-            .with_stream_write_transport(smb.clone())
-            .with_stream_read_transport(smb.clone())
-            .with_metadata_transport(smb.clone())
-            .with_open_write_transport(smb),
+        Some(smb) => attach(client, smb),
         None => client,
     }
+}
+
+/// Put an SMB transport the caller built in front of the HTTP one.
+///
+/// Separate from [`auto_attach_as`] because how the SMB link was reached is
+/// not this function's business: dialled directly, or opened through a tunnel
+/// with [`SmbTransport::over`], it serves the same operations once it exists.
+pub fn attach(client: SynologyClient, smb: Arc<SmbTransport>) -> SynologyClient {
+    client
+        .with_read_transport(smb.clone())
+        .with_write_transport(smb.clone())
+        .with_stream_write_transport(smb.clone())
+        .with_stream_read_transport(smb.clone())
+        .with_metadata_transport(smb.clone())
+        .with_open_write_transport(smb)
 }
 
 /// Minimal file metadata — enough for the verify-once integrity check that
