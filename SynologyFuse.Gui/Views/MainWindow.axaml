@@ -222,9 +222,9 @@
           <TextBlock Grid.Column="0" Text="SMB domain" VerticalAlignment="Center" />
           <StackPanel Grid.Column="1">
             <TextBox Text="{Binding SmbDomain}"
-                     PlaceholderText="KRG  •  leave empty for a local DSM user"
+                     PlaceholderText="empty for a local DSM user"
                      IsEnabled="{Binding IsDisconnected}" />
-            <TextBlock Text="An Active Directory account needs its domain here. Without it SMB cannot authenticate and transfers quietly use the slower FileStation API instead."
+            <TextBlock Text="An account from a directory the NAS is joined to needs its domain here. Without it SMB cannot authenticate and transfers quietly use the slower FileStation API instead."
                        TextWrapping="Wrap"
                        FontSize="11"
                        Opacity="0.7"
@@ -233,12 +233,12 @@
         </Grid>
 
         <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
-          <TextBlock Grid.Column="0" Text="VPN profile" VerticalAlignment="Center" />
+          <TextBlock Grid.Column="0" Text="NAS address in VPN" VerticalAlignment="Center" />
           <StackPanel Grid.Column="1">
-            <TextBox Text="{Binding VpnProfile}"
-                     PlaceholderText="path to an .ovpn file  •  optional"
+            <TextBox Text="{Binding VpnHost}"
+                     PlaceholderText="the private address the NAS answers on inside the tunnel"
                      IsEnabled="{Binding IsDisconnected}" />
-            <TextBlock Text="For reaching the NAS from outside its network. The tunnel is raised inside this application — nothing is installed, and nothing else on the machine is affected. Downloaded from the NAS if the file is not there yet."
+            <TextBlock Text="Set this to reach the NAS through a VPN when it does not answer directly. The tunnel is raised inside this application — nothing is installed, and nothing else on the machine is affected. The address differs from the name above because the tunnel carries no DNS."
                        TextWrapping="Wrap"
                        FontSize="11"
                        Opacity="0.7"
@@ -246,20 +246,41 @@
           </StackPanel>
         </Grid>
 
-        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6"
-              IsVisible="{Binding VpnProfile, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
-          <TextBlock Grid.Column="0" Text="NAS address in VPN" VerticalAlignment="Center" />
-          <StackPanel Grid.Column="1">
-            <TextBox Text="{Binding VpnHost}"
-                     PlaceholderText="10.90.24.1"
-                     IsEnabled="{Binding IsDisconnected}" />
-            <TextBlock Text="The address the NAS answers on inside the tunnel. It differs from the name above because the tunnel carries no DNS."
-                       TextWrapping="Wrap"
-                       FontSize="11"
-                       Opacity="0.7"
-                       Margin="0,2,0,0" />
-          </StackPanel>
-        </Grid>
+        <!-- Two places, asked separately: one field for "the VPN profile"
+             invites the NAS's path into a setting that names a file on this
+             disk, and the connection then fails trying to create that
+             directory here. -->
+        <StackPanel IsVisible="{Binding VpnHost, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+
+          <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+            <TextBlock Grid.Column="0" Text="Profile on the NAS" VerticalAlignment="Center" />
+            <StackPanel Grid.Column="1">
+              <TextBox Text="{Binding VpnProfileNas}"
+                       PlaceholderText="path to the .ovpn file on the NAS"
+                       IsEnabled="{Binding IsDisconnected}" />
+              <TextBlock Text="Downloaded over the connection you are making now and kept with your settings, which is how you get the profile when you cannot yet reach the NAS any other way. Ask whoever set the NAS up where it is published."
+                         TextWrapping="Wrap"
+                         FontSize="11"
+                         Opacity="0.7"
+                         Margin="0,2,0,0" />
+            </StackPanel>
+          </Grid>
+
+          <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+            <TextBlock Grid.Column="0" Text="Profile on this computer" VerticalAlignment="Center" />
+            <StackPanel Grid.Column="1">
+              <TextBox Text="{Binding VpnProfile}"
+                       PlaceholderText="path to an .ovpn file you already have"
+                       IsEnabled="{Binding IsDisconnected}" />
+              <TextBlock Text="Use a file you were given instead of downloading one. Leave empty to use the downloaded copy."
+                         TextWrapping="Wrap"
+                         FontSize="11"
+                         Opacity="0.7"
+                         Margin="0,2,0,0" />
+            </StackPanel>
+          </Grid>
+
+        </StackPanel>
 
         <!-- Advanced section -->
         <Expander Header="Advanced" Margin="0,10,0,0" IsEnabled="{Binding IsDisconnected}">

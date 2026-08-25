@@ -37,8 +37,8 @@ public static class TransportPresenter
         SynoTransport.Https =>
             "SMB could not be reached, so transfers use the FileStation API: slower, "
             + "and an interrupted one starts again rather than resuming. "
-            + "An AD account needs its domain set for SMB to authenticate; "
-            + "off campus it also needs a VPN profile.",
+            + "An account from a directory the NAS is joined to needs its domain set "
+            + "for SMB to authenticate; from outside the NAS's network it also needs a VPN.",
         _ => "",
     };
 }

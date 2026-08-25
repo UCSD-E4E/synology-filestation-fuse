@@ -38,6 +38,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _smbDomain = s.SmbDomain;
         _vpnProfile = s.VpnProfile;
         _vpnHost = s.VpnHost;
+        _vpnProfileNas = s.VpnProfileNas;
 
         _mountService.OutputReceived += OnOutput;
 
@@ -109,11 +110,20 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private string _smbDomain = "";
 
-    /// <summary>Where the OpenVPN profile is kept. With one, a NAS that does
-    /// not answer directly is reached through a tunnel raised inside this
-    /// process. Fetched from the NAS if the file is not there.</summary>
+    /// <summary>The OpenVPN profile on this computer, if there is already one
+    /// here. Left empty, one is downloaded to a copy kept beside the settings —
+    /// provided <see cref="VpnProfileNas"/> says where to find it.</summary>
     [ObservableProperty]
     private string _vpnProfile = "";
+
+    /// <summary>The same profile's path on the NAS, to download it from.
+    ///
+    /// Separate from <see cref="VpnProfile"/> because they are different
+    /// places: one field asking for "the VPN profile" invites the NAS's path
+    /// into a setting that names a file on this disk, and the connection then
+    /// fails trying to create that directory here.</summary>
+    [ObservableProperty]
+    private string _vpnProfileNas = "";
 
     /// <summary>The NAS's address inside that tunnel, which its public name
     /// does not resolve to.</summary>
@@ -366,6 +376,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         SmbDomain = SmbDomain,
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
+        VpnProfileNas = VpnProfileNas,
     };
 
     private void PersistSettings() => SettingsService.Save(new PersistedSettings
@@ -382,6 +393,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         SmbDomain = SmbDomain,
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
+        VpnProfileNas = VpnProfileNas,
     });
 
     // ── Event handlers ────────────────────────────────────────────────────────

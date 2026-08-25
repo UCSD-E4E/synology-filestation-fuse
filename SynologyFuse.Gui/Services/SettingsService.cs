@@ -36,6 +36,11 @@ public sealed class PersistedSettings
 
     /// <summary>The NAS's address inside that tunnel.</summary>
     public string VpnHost { get; set; } = "";
+
+    /// <summary>The same profile's path on the NAS, to download it from when
+    /// there is no copy on this computer yet. Empty to use only what is
+    /// already here.</summary>
+    public string VpnProfileNas { get; set; } = "";
 }
 
 public static class SettingsService
@@ -46,6 +51,39 @@ public static class SettingsService
         "settings.json");
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    /// <summary>Where a downloaded VPN profile is kept, beside the settings.
+    ///
+    /// Chosen for the user rather than asked of them. The profile has two
+    /// locations — where it lives on the NAS and where the copy is kept here —
+    /// and a single field asking for "the VPN profile" invites the first,
+    /// which is a path this machine cannot write to.</summary>
+    public static string DefaultVpnProfilePath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "SynologyFuse",
+        "vpn-profile.ovpn");
+
+    /// <summary>Where to keep the profile for this connection, or null when no
+    /// tunnel is wanted.
+    ///
+    /// A tunnel needs somewhere inside it to go, so <paramref name="vpnHost"/>
+    /// is what says one is wanted at all. Then either the profile is already on
+    /// this computer — <paramref name="localPath"/> — or it is on the NAS at
+    /// <paramref name="nasPath"/>, in which case it is downloaded and kept
+    /// <see cref="DefaultVpnProfilePath">alongside the settings</see>.
+    ///
+    /// The two are asked separately because they are different places, and one
+    /// field asking for "the VPN profile" invites the NAS's path into a
+    /// setting that names a file on this disk.</summary>
+    public static string? ResolveVpnProfile(string? localPath, string? nasPath, string? vpnHost)
+    {
+        if (string.IsNullOrWhiteSpace(vpnHost)) return null;
+        if (!string.IsNullOrWhiteSpace(localPath)) return localPath;
+        // Somewhere to put what is about to be downloaded. Only meaningful if
+        // there is somewhere to download it from: without either, there is no
+        // profile and no tunnel.
+        return string.IsNullOrWhiteSpace(nasPath) ? null : DefaultVpnProfilePath;
+    }
 
     public static PersistedSettings Load(string? path = null)
     {

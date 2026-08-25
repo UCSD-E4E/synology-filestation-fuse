@@ -93,6 +93,7 @@ synology-filestation-fuse \
   --host e4e-nas.ucsd.edu \
   --vpn-host 10.90.24.1 \
   --vpn-profile ~/e4e-nas-vpn.ovpn \
+  --vpn-profile-nas /installers/e4e-nas-vpn.ovpn \
   --smb-domain KRG \
   --username <ad-user> \
   ~/mnt
@@ -107,10 +108,13 @@ worked is the line:
 Transport: SMB, through a tunnel to 10.90.24.1
 ```
 
-If `--vpn-profile` names a path that does not exist yet, it is fetched from the
-NAS over the session just authenticated — which is worth testing on purpose,
-since it is what somebody off campus with no tunnel has to do to get the file
-that gives them one.
+`--vpn-profile` is where the copy lives on *this machine*; `--vpn-profile-nas`
+is where it lives on the NAS. If the first does not exist yet it is fetched
+from the second, over the session just authenticated — worth testing on
+purpose, since it is what somebody off campus with no tunnel has to do to get
+the file that gives them one. There is no default for the NAS path: where an
+appliance publishes such a file is a local decision, and this client does not
+assume one.
 
 Then copy a large file in. This is the first real exercise of three things that
 have only ever run against a container: the replacing rename,
@@ -145,7 +149,7 @@ running them in order is that the first one to fail is the one to fix.
 | Step 2 never reaches `TLS: Initial packet` | 1194 is not open from where you are, or `ta.key` does not match. Nothing downstream is worth trying. |
 | Step 2 reaches `AUTH_FAILED` | The credentials, or the DC behind them. The tunnel itself is fine. |
 | Step 3's `smbclient` fails | DSM's SMB, not ours: the dialect, the signing, or the AD account. Step 4 was never going to work. |
-| `VPN profile: cannot read … ; the tunnel leg will not be available` | The profile is not where `--vpn-profile` says and could not be fetched. The mount is on HTTP. |
+| `VPN profile: cannot read … ; the tunnel leg will not be available` | The profile is not where `--vpn-profile` says and could not be fetched. Check `--vpn-profile-nas`, and that the local path is one you can write to. The mount is on HTTP. |
 | `the vpn tunnel to … did not come up` | Our client could not do what step 2 did. That is a client bug, and step 2 passing is what makes it one. |
 | `the tunnel is up, but nothing answered at 10.90.24.1:445 inside it` | The tunnel carried packets and SMB did not answer through it. Different problem, deliberately worded to be a different sentence. |
 | `SMB through the tunnel: … ; using the HTTP API` | The connection was made and the SMB session failed on top of it — credentials, dialect, signing. |

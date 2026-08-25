@@ -44,6 +44,15 @@ public sealed class MountService : IDisposable
     internal static string? Blank(string value) =>
         string.IsNullOrWhiteSpace(value) ? null : value;
 
+    /// <summary>Where the profile lives on this computer for this connection:
+    /// the file the user pointed at, or the copy a download is kept in.</summary>
+    internal static string? VpnProfileFor(MountConfig config)
+    {
+        var resolved = SettingsService.ResolveVpnProfile(
+            config.VpnProfile, config.VpnProfileNas, config.VpnHost);
+        return resolved is null ? null : ExpandPath(resolved);
+    }
+
     /// <summary>
     /// Connect and mount in one step. Throws <see cref="OtpRequiredException"/>
     /// when the account needs a 2FA code (prompt and retry with
@@ -63,8 +72,9 @@ public sealed class MountService : IDisposable
                 config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
                 autoRelogin: true, verifySsl: config.VerifySsl,
                 smbDomain: Blank(config.SmbDomain),
-                vpnProfile: Blank(ExpandPath(config.VpnProfile)),
-                vpnHost: Blank(config.VpnHost));
+                vpnProfile: VpnProfileFor(config),
+                vpnHost: Blank(config.VpnHost),
+                vpnProfileRemote: Blank(config.VpnProfileNas));
             try
             {
                 c.Mount(mountpoint, config.CacheTtl, config.ReadCacheMb);
@@ -110,8 +120,9 @@ public sealed class MountService : IDisposable
                 config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
                 autoRelogin: true, verifySsl: config.VerifySsl,
                 smbDomain: Blank(config.SmbDomain),
-                vpnProfile: Blank(ExpandPath(config.VpnProfile)),
-                vpnHost: Blank(config.VpnHost));
+                vpnProfile: VpnProfileFor(config),
+                vpnHost: Blank(config.VpnHost),
+                vpnProfileRemote: Blank(config.VpnProfileNas));
             Transport = client.Transport;
             // Dispose logs out immediately; reaching here means success.
         });

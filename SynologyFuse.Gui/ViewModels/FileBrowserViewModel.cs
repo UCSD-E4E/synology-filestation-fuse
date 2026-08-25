@@ -109,8 +109,9 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
                 _config.Host, _config.Port, _config.UseHttps, _config.Username, _config.Password, otp,
                 autoRelogin: true, verifySsl: _config.VerifySsl,
                 smbDomain: MountService.Blank(_config.SmbDomain),
-                vpnProfile: MountService.Blank(MountService.ExpandPath(_config.VpnProfile)),
-                vpnHost: MountService.Blank(_config.VpnHost)));
+                vpnProfile: MountService.VpnProfileFor(_config),
+                vpnHost: MountService.Blank(_config.VpnHost),
+                vpnProfileRemote: MountService.Blank(_config.VpnProfileNas)));
             // If the window was closed (Dispose ran) while the login was in
             // flight, the handle would otherwise leak — dispose it and bail.
             // The await resumed on the UI thread, so this can't race Dispose().
