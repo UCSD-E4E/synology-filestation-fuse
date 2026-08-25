@@ -19,7 +19,18 @@ async-trait = "0.1"
 # The tunnel profile is fetched over the same authenticated session the rest
 # of the chain uses, so this crate speaks to the NAS as well as about it.
 synology-filestation-core = { path = "../synology-filestation-core" }
+# The tunnel itself. This crate is where the decision layer meets the thing
+# that carries out the escalation, so it is the one place that knows both.
+synology-filestation-openvpn = { path = "../synology-filestation-openvpn" }
+# A password held for as long as a tunnel may need re-raising.
+zeroize = "1"
+
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
+tempfile = "3"
+# The bounded-wait test has to get as far as a TLS handshake, so the profile it
+# writes needs a certificate that actually parses. Generating one here beats
+# committing a real key to a repository.
+rcgen = "0.14"

@@ -25,7 +25,10 @@
 //! `synology-filestation-core`, which is what makes a dead link cheap instead
 //! of a ten-second timeout per call.
 
+pub mod openvpn;
 pub mod profile;
+
+pub use openvpn::OpenVpnTunnel;
 
 use std::sync::Mutex;
 use std::time::Duration;
