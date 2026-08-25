@@ -31,7 +31,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection};
 use synology_filestation_openvpn::{
     key_expansion, Acks, ControlPacket, DataChannel, DataKeys, Error, KeyDirection, KeyId,
-    KeySource2, Opcode, SessionId, StaticKey, TlsAuth,
+    KeySource2, Opcode, PeerId, SessionId, StaticKey, TlsAuth,
 };
 
 /// The same throwaway key the rest of the tests use.
@@ -90,6 +90,13 @@ pub struct FakeServer {
     /// arrival order is a decryption failure, not a reordering.
     next_expected: u32,
     early: BTreeMap<u32, Vec<u8>>,
+    /// The peer id this server hands out, if it hands one out.
+    ///
+    /// A real DSM pushes one, which puts three extra bytes on every data
+    /// packet and changes the opcode from `P_DATA_V1` to `P_DATA_V2`. Off by
+    /// default because most tests here are about something else, and the
+    /// framing is pinned in `tests/data_channel.rs`.
+    peer_id: Option<PeerId>,
     /// The generation being negotiated, once this peer has started one.
     ///
     /// A second everything: its own TLS session, its own message numbering
@@ -111,6 +118,13 @@ struct Renegotiation {
 }
 
 impl FakeServer {
+    /// The same peer, addressing its data packets the way a DSM does.
+    pub fn with_peer_id(answer: Answer, peer_id: u32) -> Self {
+        let mut server = Self::new(answer);
+        server.peer_id = Some(PeerId::new(peer_id).expect("three bytes"));
+        server
+    }
+
     pub fn new(answer: Answer) -> Self {
         let key = KeyPairAndCert::generate();
 
@@ -145,6 +159,7 @@ impl FakeServer {
             data: None,
             next_expected: 0,
             early: BTreeMap::new(),
+            peer_id: None,
             reneg: None,
         }
     }
@@ -264,9 +279,10 @@ impl FakeServer {
                 self.client_session.expect("the client's session id"),
                 SERVER_SESSION,
             );
+            let peer_id = self.peer_id;
             self.data = Some(DataChannel::new(
                 DataKeys::for_server(&expansion).expect("256 bytes"),
-                None,
+                peer_id,
                 KeyId::FIRST,
             ));
         }
