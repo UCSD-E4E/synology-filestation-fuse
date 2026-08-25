@@ -4,8 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use synology_filestation_connect::{
-    Chain, Endpoints, NoTunnel, TcpProber, Transport, TransportPolicy, DEFAULT_RECHECK,
+    profile::ProfileSource, Chain, Endpoints, NoTunnel, OpenVpnTunnel, SmbRoute, TcpProber,
+    TransportPolicy, Tunnel, DEFAULT_RECHECK,
 };
+use synology_filestation_smb::{SmbConfig, SmbTransport};
 
 use clap::Parser;
 use tracing::{info, warn};
@@ -127,6 +129,49 @@ struct Args {
     /// `SYNOLOGY_FS_SMB_DOMAIN`, then to none for a local DSM user
     #[arg(long, env = "SYNOLOGY_FS_SMB_DOMAIN")]
     smb_domain: Option<String>,
+
+    /// Where the OpenVPN profile is kept.
+    ///
+    /// Given this, a NAS that does not answer directly is reached through a
+    /// tunnel this process raises itself — no tun device, no privileged
+    /// helper, and no effect on anything else the machine is doing. If the
+    /// file is not there it is fetched from the NAS over the session
+    /// authenticated below, which is what makes it possible to get the profile
+    /// while off campus with no tunnel yet.
+    ///
+    /// The file embeds `ta.key`, so it is a shared secret: it is written
+    /// readable only by its owner, and never logged.
+    #[arg(long)]
+    vpn_profile: Option<PathBuf>,
+
+    /// Where that profile lives on the NAS, for when it has to be fetched
+    #[arg(long, default_value = "/installers/e4e-nas-vpn.ovpn")]
+    vpn_profile_remote: String,
+}
+
+/// How long the whole tunnel attempt may take, handshake included.
+///
+/// Only reached when SMB did not answer directly, and the alternative is the
+/// HTTP leg — so this is the wait somebody pays once, before a decision that
+/// is then remembered.
+const VPN_PATIENCE: Duration = Duration::from_secs(30);
+
+/// The tunnel these arguments describe, or one that never comes up.
+///
+/// A profile is what makes an escalation possible: without one there is
+/// nothing to dial, nothing to authenticate against, and no address to be
+/// given. Saying so with [`NoTunnel`] means the chain falls from SMB straight
+/// to HTTP with nothing to wait for.
+fn tunnel_from(args: &Args, username: &str, password: &str) -> Box<dyn Tunnel> {
+    match &args.vpn_profile {
+        Some(profile) => Box::new(OpenVpnTunnel::new(
+            profile,
+            username,
+            password,
+            VPN_PATIENCE,
+        )),
+        None => Box::new(NoTunnel),
+    }
 }
 
 /// Predates `--disable-smb`; mounts in the field are configured with it.
@@ -279,40 +324,62 @@ fn main() -> anyhow::Result<()> {
         Box::new(TcpProber::new(probe_timeout(
             std::env::var(SMB_TIMEOUT_ENV).ok(),
         ))),
-        // Driving OpenVPN needs a privileged component per platform and is not
-        // built yet, so an escalation is currently something a user arranges
-        // themselves — the probe then finds SMB at `--vpn-host` and this mount
-        // uses it.
-        Box::new(NoTunnel),
+        tunnel_from(&args, &args.username, &password),
         DEFAULT_RECHECK,
     );
-    let route = rt
-        .block_on(chain.route())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    info!("Transport: {}", route.transport);
 
-    // SMB is attached only when the route says so, and only on the leg whose
-    // address this process can actually dial. The tunnel leg's address lives
-    // inside a tunnel that terminates here, so it is reached with
-    // `Chain::reach_smb`, which hands back the connection it already opened —
-    // matched on explicitly rather than left to `smb_host`, because dialling
-    // that address would ask the operating system about a network it has never
-    // heard of.
-    let client = Arc::new(match (route.transport, &route.smb_host) {
-        (Transport::SmbDirect, Some(smb_host)) => {
+    // The profile is fetched before anything asks for a tunnel, over the
+    // session just authenticated — which is the point of fetching rather than
+    // shipping it: somebody off campus with no tunnel can still get the file
+    // that gives them one.
+    if let Some(local) = &args.vpn_profile {
+        let source = ProfileSource {
+            remote: args.vpn_profile_remote.clone(),
+            local: local.clone(),
+        };
+        if let Err(e) = rt.block_on(source.ensure(&client)) {
+            warn!("VPN profile: {e}; the tunnel leg will not be available");
+        }
+    }
+
+    // SMB is reached by whichever leg answers. Direct is an address to dial;
+    // through the tunnel it is a connection already open, because opening it
+    // was the only way to know the leg works — and because nothing on this
+    // machine has a route to the address at the far end of it.
+    let reached = rt
+        .block_on(chain.reach_smb())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let client = Arc::new(match reached {
+        SmbRoute::Direct { host } => {
+            info!("Transport: SMB, direct to {host}");
             rt.block_on(synology_filestation_smb::auto_attach_as(
                 client,
-                smb_host,
+                &host,
                 &args.username,
                 &password,
                 args.smb_domain.as_deref(),
             ))
         }
-        (Transport::SmbOverVpn, _) => {
-            warn!("Transport: the tunnel leg is not wired into the CLI yet; using the HTTP API");
+        SmbRoute::Tunnelled { host, connection } => {
+            info!("Transport: SMB, through a tunnel to {host}");
+            let mut cfg = SmbConfig::new(&host, &args.username, &password);
+            cfg.domain = args.smb_domain.clone().unwrap_or_default();
+            match rt.block_on(SmbTransport::over(connection, &cfg)) {
+                Ok(smb) => synology_filestation_smb::attach(client, Arc::new(smb)),
+                // The tunnel carried a connection and SMB behind it would not
+                // talk. Not a reason to fail the mount: the HTTP leg is there,
+                // and saying which of the two failed is the difference between
+                // a fix and a shrug.
+                Err(e) => {
+                    warn!("SMB through the tunnel: {e}; using the HTTP API");
+                    client
+                }
+            }
+        }
+        SmbRoute::Unavailable => {
+            info!("Transport: the HTTP API");
             client
         }
-        _ => client,
     });
 
     let opts = MountOptions {
@@ -339,8 +406,64 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_umask, probe_timeout, smb_disabled};
+    use super::{parse_umask, probe_timeout, smb_disabled, tunnel_from, Args};
+    use clap::Parser;
     use std::time::Duration;
+
+    /// The arguments a mount is given, with the profile flag set or not.
+    fn args_with(profile: Option<&str>) -> Args {
+        let mut argv = vec![
+            "synology-fuse",
+            "--host",
+            "nas.example",
+            "--username",
+            "someone",
+            // Positional, and required.
+            "/mnt/nas",
+        ];
+        if let Some(profile) = profile {
+            argv.extend(["--vpn-profile", profile]);
+        }
+        Args::try_parse_from(argv).expect("the arguments parse")
+    }
+
+    #[tokio::test]
+    async fn without_a_profile_there_is_no_tunnel_to_wait_for() {
+        // A tunnel needs a profile: without one there is nothing to dial,
+        // nothing to authenticate against, and no address to be given. Saying
+        // so lets the chain fall from SMB straight to HTTP with nothing to
+        // wait for, rather than timing out on an escalation that was never
+        // possible.
+        let tunnel = tunnel_from(&args_with(None), "someone", "hunter2");
+
+        let Err(refused) = tunnel.open("10.90.24.1", 445).await else {
+            panic!("there is no tunnel to open");
+        };
+        assert!(
+            refused.to_string().contains("no tunnel is configured"),
+            "and it says why: {refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_makes_the_escalation_possible() {
+        // The other half: given a profile, what the chain gets is something
+        // that will actually try — here it fails on the file, which is the
+        // real tunnel talking rather than the placeholder.
+        let tunnel = tunnel_from(
+            &args_with(Some("/nowhere/e4e-nas-vpn.ovpn")),
+            "someone",
+            "hunter2",
+        );
+
+        let Err(refused) = tunnel.open("10.90.24.1", 445).await else {
+            panic!("that profile is not there");
+        };
+        assert!(
+            refused.to_string().contains("e4e-nas-vpn.ovpn"),
+            "it got as far as looking for the profile: {refused}"
+        );
+    }
 
     /// `--umask 022` must mean 0o022. Parsed as decimal it would be 0o026,
     /// quietly stripping group/other permissions the user never asked to drop.
