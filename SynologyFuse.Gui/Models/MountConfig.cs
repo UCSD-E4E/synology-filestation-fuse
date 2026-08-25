@@ -33,4 +33,9 @@ public sealed class MountConfig
     /// <summary>The NAS's address inside that tunnel, which its public name
     /// does not resolve to: the tunnel pushes no DNS.</summary>
     public string VpnHost { get; init; } = "";
+
+    /// <summary>The same profile's path on the NAS, to download it from when
+    /// there is no copy on this computer yet. Empty to use only what is
+    /// already here.</summary>
+    public string VpnProfileNas { get; init; } = "";
 }

@@ -36,9 +36,6 @@ mod logging;
 
 const DOWNLOAD_CHUNK: u64 = 4 * 1024 * 1024;
 
-/// Where the profile lives on the NAS when the caller does not say.
-const DEFAULT_VPN_PROFILE: &str = "/installers/e4e-nas-vpn.ovpn";
-
 /// How long the whole tunnel attempt may take, handshake included.
 const VPN_PATIENCE: Duration = Duration::from_secs(30);
 
@@ -304,8 +301,13 @@ struct Reachable<'a> {
     /// The NAS's address inside that tunnel, which its public name does not
     /// resolve to — the tunnel pushes no DNS.
     vpn_host: Option<&'a str>,
-    /// Where that profile lives on the NAS, for when it has to be fetched.
-    vpn_profile_remote: &'a str,
+    /// Where that profile lives on the NAS, if it should be fetched from
+    /// there when it is not on disk yet.
+    ///
+    /// No default: where an appliance keeps such a file is a decision whoever
+    /// set it up made, and guessing one would be this client asserting a
+    /// layout it has no business knowing.
+    vpn_profile_remote: Option<&'a str>,
 }
 
 /// Put SMB in front of the HTTP client if SMB can be reached.
@@ -315,12 +317,14 @@ struct Reachable<'a> {
 /// public host, so a NAS reachable only through a tunnel was invisible to it.
 async fn reach(client: SynologyClient, settings: Reachable<'_>) -> (SynologyClient, SynoTransport) {
     // Fetched before anything asks for a tunnel, over the session just
-    // authenticated. That is the point of fetching rather than shipping it:
-    // somebody off campus with no tunnel can still get the file that gives them
-    // one — which the settings field promises and nothing was doing.
-    if let Some(local) = settings.vpn_profile {
+    // authenticated — which is what lets somebody outside the NAS's network
+    // get the file that gets them inside it.
+    //
+    // Only when told where it lives, though. Without that, whatever is already
+    // on disk is what there is.
+    if let (Some(local), Some(remote)) = (settings.vpn_profile, settings.vpn_profile_remote) {
         let source = ProfileSource {
-            remote: settings.vpn_profile_remote.to_string(),
+            remote: remote.to_string(),
             local: PathBuf::from(local),
         };
         if let Err(e) = source.ensure(&client).await {
@@ -455,18 +459,19 @@ pub unsafe extern "C" fn syno_connect(
     // so the GUI exposes this as a per-connection checkbox — but it makes the
     // connection encrypted without being authenticated, so it is opt-in.
     verify_ssl: bool,
-    // The NetBIOS domain SMB authenticates in — `KRG` for an AD account, null
-    // for a local DSM user. Without it an AD account is checked against the
-    // appliance's own accounts, fails, and SMB is silently skipped: the reason
-    // this consumer has been on the HTTP path even on campus.
+    // The NetBIOS domain SMB authenticates in, for an appliance joined to a
+    // directory; null for a local DSM user. Without it a directory account is
+    // checked against the appliance's own accounts, fails, and SMB is silently
+    // skipped — the reason this consumer has been on the HTTP path even on a
+    // network where the NAS answers directly.
     smb_domain: *const c_char,
     // Where the OpenVPN profile is kept, and where the NAS answers inside the
     // tunnel it describes. Both null means no escalation is possible, and a
     // NAS that does not answer directly is reached over HTTP as before.
     vpn_profile: *const c_char,
     vpn_host: *const c_char,
-    // Where that profile lives on the NAS, when it is not on disk yet. Null for
-    // the published location.
+    // Where that profile lives on the NAS, if it should be fetched from there
+    // when it is not on disk yet. Null to use only what is already on disk.
     vpn_profile_remote: *const c_char,
     out: *mut *mut SynoClient,
     err: *mut SynoError,
@@ -488,7 +493,7 @@ pub unsafe extern "C" fn syno_connect(
         let smb_domain = opt_str(smb_domain);
         let vpn_profile = opt_str(vpn_profile);
         let vpn_host = opt_str(vpn_host);
-        let vpn_profile_remote = opt_str(vpn_profile_remote).unwrap_or(DEFAULT_VPN_PROFILE);
+        let vpn_profile_remote = opt_str(vpn_profile_remote);
         if out.is_null() {
             return set_err(err, SynoStatus::NullArg, 0, "out pointer must not be null");
         }
@@ -1386,10 +1391,10 @@ mod tests {
                 // is right to — so the fix is not to write one.
                 username: "",
                 password: "",
-                smb_domain: Some("KRG"),
+                smb_domain: Some("EXAMPLE"),
                 vpn_profile: None,
                 vpn_host: None,
-                vpn_profile_remote: DEFAULT_VPN_PROFILE,
+                vpn_profile_remote: None,
             },
         )
         .await;

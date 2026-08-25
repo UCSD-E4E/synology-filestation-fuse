@@ -109,7 +109,8 @@ struct Args {
     disable_smb: bool,
 
     /// Never bring up the tunnel. SMB is still tried directly, so a mount on
-    /// campus is unaffected; off campus this falls straight to HTTPS with no
+    /// a network where the NAS answers directly is unaffected; elsewhere this
+    /// falls straight to HTTPS with no
     /// tunnel prompt
     #[arg(long)]
     disable_vpn: bool,
@@ -121,32 +122,38 @@ struct Args {
     disable_https: bool,
 
     /// The NAS's address *inside* the tunnel, which its public name does not
-    /// resolve to (the tunnel pushes no DNS). On e4e-nas this is 10.90.24.1
+    /// resolve to — an OpenVPN server that pushes no DNS is the ordinary case,
+    /// and the address is whatever it hands out on its own subnet
     #[arg(long)]
     vpn_host: Option<String>,
 
-    /// NetBIOS domain for SMB, e.g. `KRG` for an AD account. Falls back to
-    /// `SYNOLOGY_FS_SMB_DOMAIN`, then to none for a local DSM user
+    /// NetBIOS domain for SMB, for an appliance joined to a directory. Falls
+    /// back to `SYNOLOGY_FS_SMB_DOMAIN`, then to none for a local DSM user
     #[arg(long, env = "SYNOLOGY_FS_SMB_DOMAIN")]
     smb_domain: Option<String>,
 
-    /// Where the OpenVPN profile is kept.
+    /// The OpenVPN profile on *this computer*.
     ///
     /// Given this, a NAS that does not answer directly is reached through a
     /// tunnel this process raises itself — no tun device, no privileged
-    /// helper, and no effect on anything else the machine is doing. If the
-    /// file is not there it is fetched from the NAS over the session
-    /// authenticated below, which is what makes it possible to get the profile
-    /// while off campus with no tunnel yet.
+    /// helper, and no effect on anything else the machine is doing.
+    ///
+    /// Used as-is if the file is there. If it is not, and `--vpn-profile-nas`
+    /// says where to find it, it is fetched over the session authenticated
+    /// below — which is what lets somebody outside the NAS's network get the
+    /// file that gets them inside it.
     ///
     /// The file embeds `ta.key`, so it is a shared secret: it is written
     /// readable only by its owner, and never logged.
     #[arg(long)]
     vpn_profile: Option<PathBuf>,
 
-    /// Where that profile lives on the NAS, for when it has to be fetched
-    #[arg(long, default_value = "/installers/e4e-nas-vpn.ovpn")]
-    vpn_profile_remote: String,
+    /// The same profile's path on *the NAS*, to fetch it from.
+    ///
+    /// No default: where an appliance keeps such a file is a decision whoever
+    /// set it up made, and this client has no business assuming a layout.
+    #[arg(long)]
+    vpn_profile_nas: Option<String>,
 }
 
 /// How long the whole tunnel attempt may take, handshake included.
@@ -329,12 +336,13 @@ fn main() -> anyhow::Result<()> {
     );
 
     // The profile is fetched before anything asks for a tunnel, over the
-    // session just authenticated — which is the point of fetching rather than
-    // shipping it: somebody off campus with no tunnel can still get the file
-    // that gives them one.
-    if let Some(local) = &args.vpn_profile {
+    // session just authenticated — which is what lets somebody outside the
+    // NAS's network get the file that gets them inside it. Only when told
+    // where it lives on the NAS; otherwise whatever is on disk is what there
+    // is.
+    if let (Some(local), Some(remote)) = (&args.vpn_profile, &args.vpn_profile_nas) {
         let source = ProfileSource {
-            remote: args.vpn_profile_remote.clone(),
+            remote: remote.clone(),
             local: local.clone(),
         };
         if let Err(e) = rt.block_on(source.ensure(&client)) {
@@ -498,7 +506,7 @@ mod tests {
         assert!(no_smb.allows_https());
 
         let no_vpn = TransportPolicy::from_flags(false, true, false).unwrap();
-        assert!(no_vpn.allows_smb(), "on campus this is unaffected");
+        assert!(no_vpn.allows_smb(), "a reachable NAS is unaffected");
         assert!(!no_vpn.allows_vpn());
 
         // Nothing left to carry the data: refused at startup rather than

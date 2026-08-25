@@ -32,13 +32,14 @@ public class TransportPresenterTests
     public void TheSlowLegSaysWhatToDoAboutIt()
     {
         // Landing on the HTTP API is usually one unset field away from not
-        // happening: an AD account with no domain cannot authenticate SMB, and
-        // off campus there is no tunnel without a profile. A badge that only
-        // named the leg would leave a user to guess which.
+        // happening: a directory account with no domain cannot authenticate
+        // SMB, and outside the NAS's network there is no tunnel without one
+        // configured. A badge that only named the leg would leave a user to
+        // guess which.
         var detail = TransportPresenter.Detail(SynoTransport.Https);
 
         Assert.Contains("domain", detail);
-        Assert.Contains("VPN profile", detail);
+        Assert.Contains("VPN", detail);
         Assert.Contains("resum", detail);
     }
 
