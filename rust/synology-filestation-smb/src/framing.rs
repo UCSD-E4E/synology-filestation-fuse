@@ -21,13 +21,18 @@ use smb2::transport::{TransportReceive, TransportSend};
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 
-/// The largest message the framing can describe, and what `smb2`'s own TCP
-/// transport enforces.
+/// The largest message the framing can describe.
 ///
-/// Three bytes of length stop here. A message beyond it would be framed as its
-/// own remainder — a length that quietly wraps, after which the far end reads
-/// a body that is not one, and every message after that is nonsense.
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+/// Three bytes of length stop here — one short of 16 MiB, not at it. A message
+/// beyond this is framed as its own remainder: 16 MiB exactly becomes the
+/// header `[00, 00, 00, 00]`, an empty frame followed by 16 MiB of body the
+/// peer reads as headers, and every message after that is nonsense.
+///
+/// The same arithmetic as the missing check in `receive`, which is what makes
+/// getting it wrong here easy: three bytes cannot say 16 MiB, so a limit
+/// written as 16 MiB is one value too generous in one direction and could
+/// never fire in the other.
+const MAX_FRAME_SIZE: usize = 0xFF_FFFF;
 
 /// An `smb2` transport over one byte stream.
 ///

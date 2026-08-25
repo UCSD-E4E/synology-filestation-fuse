@@ -82,9 +82,8 @@ async fn two_frames_in_one_read_are_two_messages() {
 
 #[tokio::test]
 async fn a_frame_of_no_length_is_a_message_of_no_bytes() {
-    // A header with a zero length is how NetBIOS spells a keep-alive. It is a
-    // complete frame carrying nothing, not a stream that has ended, and the
-    // next message follows it as normal.
+    // A header saying zero is a complete frame carrying nothing, not a stream
+    // that has ended, and the next message follows it as normal.
     let (ours, mut theirs) = tokio::io::duplex(4096);
     let transport = StreamTransport::new(ours);
 
@@ -130,16 +129,79 @@ async fn a_stream_that_ends_mid_message_is_not_a_short_message() {
     assert!(transport.receive().await.is_err(), "it never all arrived");
 }
 
+/// The largest a three-byte length can describe.
+const LARGEST_FRAME: usize = 0xFF_FFFF;
+
 #[tokio::test]
 async fn a_message_too_large_to_frame_is_refused_before_it_is_sent() {
-    // Three bytes of length cannot say more than 16 MB, so a larger message
+    // Three bytes of length cannot say more than this, so a larger message
     // would be framed as its own remainder — a length field that quietly
     // wraps is how a stream desynchronises.
     let (ours, _theirs) = tokio::io::duplex(4096);
     let transport = StreamTransport::new(ours);
 
-    let enormous = vec![0u8; 16 * 1024 * 1024 + 1];
-    assert!(transport.send(&enormous).await.is_err());
+    let enormous = vec![0u8; LARGEST_FRAME + 1];
+    assert!(
+        // A timeout, because the failure this guards against is not a wrong
+        // answer but no answer: unrefused, the write blocks against a pipe
+        // nobody is reading.
+        tokio::time::timeout(Duration::from_secs(10), transport.send(&enormous))
+            .await
+            .expect("refused rather than attempted")
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn the_first_length_that_does_not_fit_is_the_first_one_refused() {
+    // Exactly 16 MiB is the value the arithmetic goes wrong on, and the
+    // obvious test — 16 MiB plus one — steps straight over it. Framed, its
+    // length becomes `[00, 00, 00]`: an empty frame followed by 16 MiB of
+    // body that the peer reads as headers, which is a desynchronised stream
+    // rather than a rejected message.
+    let (ours, _theirs) = tokio::io::duplex(4096);
+    let transport = StreamTransport::new(ours);
+
+    let over = vec![0xAAu8; 16 * 1024 * 1024];
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), transport.send(&over))
+            .await
+            .expect("refused rather than attempted")
+            .is_err(),
+        "one byte more than the header can describe"
+    );
+}
+
+#[tokio::test]
+async fn the_largest_message_that_does_fit_is_sent() {
+    // And the other side of the boundary, because a limit corrected too far
+    // would refuse a message that is perfectly describable.
+    let (ours, mut theirs) = tokio::io::duplex(64 * 1024);
+    let transport = StreamTransport::new(ours);
+
+    // The header comes back on its own channel rather than as the task's
+    // return value: the task goes on draining for as long as the transport
+    // holds the writing half, so waiting for it to finish would wait forever.
+    let (found, framing) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut header = [0u8; 4];
+        theirs.read_exact(&mut header).await.expect("framing");
+        let _ = found.send(header);
+        let mut sink = tokio::io::sink();
+        let _ = tokio::io::copy(&mut theirs, &mut sink).await;
+    });
+
+    let largest = vec![0u8; LARGEST_FRAME];
+    tokio::time::timeout(Duration::from_secs(30), transport.send(&largest))
+        .await
+        .expect("in reasonable time")
+        .expect("sent");
+
+    assert_eq!(
+        framing.await.expect("the header arrived"),
+        [0x00, 0xFF, 0xFF, 0xFF],
+        "the largest length the header can carry"
+    );
 }
 
 #[tokio::test]
