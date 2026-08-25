@@ -197,6 +197,36 @@ struct Progress {
     ended_cleanly: bool,
 }
 
+/// Why the link under a stream stopped, when something below knows.
+///
+/// A stream can only report what it saw: bytes stopped. The layer underneath
+/// often knows considerably more — that authentication was refused, that the
+/// peer went silent, that the cipher was one we cannot speak — and a caller
+/// told only "the connection ended" goes looking in the wrong place. Passed to
+/// [`TunnelStream::explaining`], that reason is added to the errors this
+/// stream reports.
+#[derive(Clone, Default)]
+pub struct LinkFailure(std::sync::Arc<std::sync::Mutex<Option<Error>>>);
+
+impl LinkFailure {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record why the link stopped. The first reason stands: it is the one
+    /// that explains everything after it.
+    pub fn set(&self, error: Error) {
+        if let Ok(mut held) = self.0.lock() {
+            held.get_or_insert(error);
+        }
+    }
+
+    /// The reason, if the link has stopped and said one.
+    pub fn reason(&self) -> Option<Error> {
+        self.0.lock().ok().and_then(|held| held.clone())
+    }
+}
+
 /// One TCP connection over the tunnel, as a stream.
 pub struct TunnelStream {
     writes: PollSender<Vec<u8>>,
@@ -209,6 +239,8 @@ pub struct TunnelStream {
     /// waits to see acknowledged.
     written: u64,
     progress: watch::Receiver<Progress>,
+    /// What the layer below says about why it stopped, when it knows.
+    cause: LinkFailure,
     /// Waits in progress, because these are polled repeatedly and the wait has
     /// to survive between calls.
     ///
@@ -336,6 +368,7 @@ impl TunnelStream {
                 taken: 0,
                 written: 0,
                 progress: watching,
+                cause: LinkFailure::new(),
                 flushing: None,
                 shutting_down: None,
                 task,
@@ -357,6 +390,27 @@ impl TunnelStream {
                     remote.0, remote.1
                 )))
             }
+        }
+    }
+}
+
+impl TunnelStream {
+    /// Have this stream's errors say what stopped underneath it.
+    ///
+    /// Without this a tunnel that failed to authenticate and a peer that hung
+    /// up are the same "the connection ended", and the caller looks at the
+    /// wrong end of the problem.
+    pub fn explaining(mut self, cause: LinkFailure) -> Self {
+        self.cause = cause;
+        self
+    }
+
+    /// An error saying what the stream saw, and what the link below says
+    /// about why.
+    fn ended(&self, kind: io::ErrorKind, what: &str) -> io::Error {
+        match self.cause.reason() {
+            Some(reason) => io::Error::new(kind, format!("{what}: {reason}")),
+            None => io::Error::new(kind, what.to_string()),
         }
     }
 }
@@ -389,7 +443,7 @@ impl AsyncRead for TunnelStream {
                     return Poll::Ready(if me.progress.borrow().ended_cleanly {
                         Ok(())
                     } else {
-                        Err(io::Error::new(
+                        Err(me.ended(
                             io::ErrorKind::ConnectionReset,
                             "the connection ended before the peer closed it",
                         ))
@@ -417,14 +471,13 @@ impl AsyncWrite for TunnelStream {
 
         match me.writes.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(_)) => return Poll::Ready(Err(gone())),
+            Poll::Ready(Err(_)) => return Poll::Ready(Err(me.gone())),
             Poll::Pending => return Poll::Pending,
         }
 
         let taking = buf.len().min(WRITE_CHUNK);
-        me.writes
-            .send_item(buf[..taking].to_vec())
-            .map_err(|_| gone())?;
+        let chunk = buf[..taking].to_vec();
+        me.writes.send_item(chunk).map_err(|_| me.gone())?;
         me.written += taking as u64;
         Poll::Ready(Ok(taking))
     }
@@ -475,14 +528,23 @@ fn poll_wait(
             // The stack stopped before it could. Whatever was outstanding is
             // gone, and a caller told `Ok` would go on to the next thing
             // believing this one landed.
-            Poll::Ready(if met { Ok(()) } else { Err(gone()) })
+            Poll::Ready(if met {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the tunnel stack has stopped",
+                ))
+            })
         }
         Poll::Pending => Poll::Pending,
     }
 }
 
-fn gone() -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "the tunnel stack has stopped")
+impl TunnelStream {
+    fn gone(&self) -> io::Error {
+        self.ended(io::ErrorKind::BrokenPipe, "the tunnel stack has stopped")
+    }
 }
 
 /// Everything the loop owns.

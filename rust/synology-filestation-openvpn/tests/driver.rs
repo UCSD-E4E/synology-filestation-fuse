@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use common::{Answer, FakeServer, TA_KEY_HEX};
-use synology_filestation_openvpn::{Session, SessionConfig, StaticKey, Tunnel};
+use synology_filestation_openvpn::{Error, Session, SessionConfig, StaticKey, Tunnel};
 
 const PUSH: &str = "PUSH_REPLY,ifconfig 10.90.24.6 255.255.255.0,peer-id 4,cipher AES-256-CBC";
 
@@ -23,6 +23,100 @@ fn a_free_port() -> u16 {
         .local_addr()
         .expect("bound")
         .port()
+}
+
+/// Answer whatever arrives until told to stop, then say nothing at all.
+///
+/// A peer that goes quiet rather than closing is what a tunnel actually meets:
+/// UDP has no hang-up, so a NAS that reboots or a route that disappears simply
+/// stops answering.
+fn serve_until_quiet(
+    mut server: FakeServer,
+    port: u16,
+) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let quiet = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watching = std::sync::Arc::clone(&quiet);
+    tokio::spawn(async move {
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", port))
+            .await
+            .expect("the port is free");
+        let mut buffer = vec![0u8; 4096];
+        loop {
+            let Ok((len, from)) = socket.recv_from(&mut buffer).await else {
+                return;
+            };
+            if watching.load(std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
+            for answer in server.handle(&buffer[..len]) {
+                let _ = socket.send_to(&answer, from).await;
+            }
+        }
+    });
+    quiet
+}
+
+/// A tunnel whose peer stops answering shortly after it comes up.
+async fn tunnel_that_will_be_abandoned() -> (Tunnel, std::sync::Arc<std::sync::atomic::AtomicBool>)
+{
+    let server = FakeServer::new(Answer::KeyMaterialThen(PUSH.to_string()));
+    let mut config = config_for(&server);
+    config.peer_timeout = Some(Duration::from_millis(300));
+    let port = a_free_port();
+    let quiet = serve_until_quiet(server, port);
+
+    let remote: SocketAddr = ([127, 0, 0, 1], port).into();
+    let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
+    (tunnel, quiet)
+}
+
+#[tokio::test]
+async fn a_tunnel_that_already_died_is_not_blamed_on_the_far_end() {
+    // The failure this exists to prevent. Asked for a connection, a dead
+    // tunnel used to answer with a stream that timed out — reported as nobody
+    // answering at 10.90.24.1:445, which blames the NAS's SMB port for a VPN
+    // that was not there. The reason is known; it should be the one given.
+    let (tunnel, quiet) = tunnel_that_will_be_abandoned().await;
+    quiet.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Wait for the tunnel to notice.
+    for _ in 0..100 {
+        if tunnel.failure().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(matches!(tunnel.failure(), Some(Error::PeerGone(_))));
+
+    let refused = tunnel
+        .open_stream((Ipv4Addr::new(10, 90, 24, 1), 445), Duration::from_secs(5))
+        .await;
+
+    assert!(
+        matches!(refused, Err(Error::PeerGone(_))),
+        "the tunnel's own reason, not the stream's guess: {refused:?}",
+        refused = refused.map(|_| ())
+    );
+}
+
+#[tokio::test]
+async fn a_tunnel_that_dies_while_connecting_says_what_died() {
+    // The same distinction, arrived at from the other direction: the tunnel is
+    // alive when asked and gone before the connection can be made. A patience
+    // timeout would name the address inside the tunnel; what actually happened
+    // is that the tunnel stopped.
+    let (tunnel, quiet) = tunnel_that_will_be_abandoned().await;
+    quiet.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let outcome = tunnel
+        .open_stream((Ipv4Addr::new(10, 90, 24, 1), 445), Duration::from_secs(3))
+        .await;
+
+    assert!(
+        matches!(outcome, Err(Error::PeerGone(_))),
+        "what stopped is what is reported: {outcome:?}",
+        outcome = outcome.map(|_| ())
+    );
 }
 
 /// Answer whatever arrives, from `port`, starting `after`.

@@ -18,7 +18,7 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
-use synology_filestation_openvpn::{Ifconfig, TunnelDevice, TunnelStream};
+use synology_filestation_openvpn::{Error, Ifconfig, LinkFailure, TunnelDevice, TunnelStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -528,4 +528,30 @@ async fn what_is_still_in_the_window_when_the_connection_ends_is_still_read() {
 
     assert_eq!(received.len(), sent.len(), "nothing was discarded");
     assert_eq!(received, sent);
+}
+
+#[tokio::test]
+async fn a_stream_says_what_stopped_underneath_it() {
+    // A stream can only report what it saw: bytes stopped. The layer below
+    // often knows why — authentication refused, the peer gone, a cipher we
+    // cannot speak — and a caller told only "the connection ended" goes
+    // looking at the wrong end of the problem.
+    let (stream, ask, _heard) = connected().await;
+    let cause = LinkFailure::new();
+    let mut stream = stream.explaining(cause.clone());
+
+    // The link goes, and the layer that owns it knows what happened.
+    cause.set(Error::AuthFailed("wrong password".into()));
+    ask.send(Ask::Vanish).await.expect("the link fails");
+
+    let mut rest = Vec::new();
+    let failed = tokio::time::timeout(PATIENCE, stream.read_to_end(&mut rest))
+        .await
+        .expect("it does not wait forever")
+        .expect_err("a link that died is not a peer that finished");
+
+    assert!(
+        failed.to_string().contains("wrong password"),
+        "the reason from below reaches the caller: {failed}"
+    );
 }
