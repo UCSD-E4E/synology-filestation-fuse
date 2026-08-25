@@ -12,11 +12,17 @@
 # change that takes the new lints together, rather than whichever pull request
 # is unlucky.
 #
-# ⚠️ This is ahead of the flake's devshell, which nixpkgs currently holds at
-# 1.96 (unstable has 1.97). Nix ignores this file, so
-# `nix develop -c cargo clippy` asks an older question than CI does and cannot
-# see every lint CI can. Closing that gap means bumping the flake's nixpkgs to
-# a channel carrying 1.98, and is worth doing when one exists.
+# The flake reads this file too (`rust-bin.fromRustupToolchainFile`), so
+# `nix develop -c cargo clippy` and `nix flake check` ask exactly the question
+# CI asks. Before that they did not: the devshell followed
+# `rust-bin.stable.latest`, which tracks whenever `rust-overlay` was last
+# updated, and the two had drifted far enough that a lint CI failed on could
+# not be reproduced locally on any channel.
+#
+# Raising the version means editing this file and running
+# `nix flake update rust-overlay` so the overlay knows about it.
 [toolchain]
 channel = "1.98.0"
-components = ["clippy", "rustfmt"]
+# `rust-src` for the devshell (rust-analyzer); the other two are what
+# `cargo fmt --check` and `cargo clippy -- -D warnings` need.
+components = ["clippy", "rustfmt", "rust-src"]

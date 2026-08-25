@@ -39,15 +39,14 @@
           isLinux = pkgs.stdenv.hostPlatform.isLinux;
           isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
 
-          # Pinned stable toolchain. rust-src/clippy/rustfmt are bundled so the
-          # dev shell and `cargo clippy --workspace` (per CLAUDE.md) work as-is.
-          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [
-              "rust-src"
-              "clippy"
-              "rustfmt"
-            ];
-          };
+          # The toolchain, read from the same file CI is pinned by.
+          #
+          # Not `stable.latest`: that follows whenever `rust-overlay` was last
+          # updated, which is its own clock and not CI's. The two drifted far
+          # enough apart that a lint CI failed on could not be reproduced here
+          # at all — which is a poor way to find out, and the reason
+          # `rust-toolchain.toml` exists. One file, both answers.
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 

@@ -22,8 +22,9 @@
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": false,
       "exclude-paths": [
-        "rust",
-        "python",
+        "rust/synology-filestation-core",
+        "rust/synology-filestation-fuse",
+        "python/synology_filestation",
         ".github",
         "nix"
       ],
