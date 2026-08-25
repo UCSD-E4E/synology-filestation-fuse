@@ -32,7 +32,7 @@ use std::time::{Duration, Instant as StdInstant};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
+use smoltcp::socket::tcp::{self, State};
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpCidr};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -181,8 +181,20 @@ impl TxToken for TunnelTx<'_> {
 struct Progress {
     /// Bytes from the caller the far end has acknowledged.
     acknowledged: u64,
-    /// Our half is closed and everything written went out before the FIN.
+    /// Our half is closed and the far end has acknowledged the goodbye.
     closed: bool,
+    /// The stack has stopped. Nothing outstanding will ever be sent now, so
+    /// anyone waiting is waiting for something that is not going to happen.
+    stopped: bool,
+    /// The peer closed its half in an orderly way and everything it sent has
+    /// been handed over.
+    ///
+    /// The difference between this and any other ending is the difference
+    /// between a message that finished and one that was cut off, and a reader
+    /// cannot tell them apart from the bytes alone — which is exactly how a
+    /// truncated SMB response would be read as a server with nothing more to
+    /// say.
+    ended_cleanly: bool,
 }
 
 /// One TCP connection over the tunnel, as a stream.
@@ -209,8 +221,14 @@ pub struct TunnelStream {
     task: JoinHandle<()>,
 }
 
-/// A wait on the stack's progress, kept across polls.
-type Wait = Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>;
+/// A wait on the stack's progress, kept across polls, and what it is waiting
+/// for.
+///
+/// The threshold is kept beside the future because a wait that is abandoned —
+/// a timeout, a `select!` losing the race — stays in its slot, and answering
+/// the *next* caller's question with the previous one's is how a write still
+/// sitting in the window gets reported as delivered.
+type Wait = Option<(u64, Pin<Box<dyn std::future::Future<Output = bool> + Send>>)>;
 
 /// Wait until the stack says what the caller is waiting for is true.
 ///
@@ -219,11 +237,20 @@ type Wait = Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>;
 fn until(
     mut progress: watch::Receiver<Progress>,
     done: impl Fn(Progress) -> bool + Send + 'static,
-) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+) -> Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
     Box::pin(async move {
-        while !done(*progress.borrow_and_update()) {
+        loop {
+            {
+                let now = *progress.borrow_and_update();
+                if done(now) {
+                    return true;
+                }
+                if now.stopped {
+                    return false;
+                }
+            }
             if progress.changed().await.is_err() {
-                return;
+                return false;
             }
         }
     })
@@ -282,6 +309,8 @@ impl TunnelStream {
         let (progress, watching) = watch::channel(Progress {
             acknowledged: 0,
             closed: false,
+            stopped: false,
+            ended_cleanly: false,
         });
 
         let task = tokio::spawn(drive(
@@ -354,8 +383,18 @@ impl AsyncRead for TunnelStream {
                 }
                 // The connection is over. Zero bytes means exactly this and
                 // nothing else, which is what lets a framing layer above tell
-                // "the peer hung up" from "not yet".
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                // "the peer hung up" from "not yet" — and it is only an
+                // ending if the peer actually said goodbye.
+                Poll::Ready(None) => {
+                    return Poll::Ready(if me.progress.borrow().ended_cleanly {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "the connection ended before the peer closed it",
+                        ))
+                    })
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -393,9 +432,13 @@ impl AsyncWrite for TunnelStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let me = self.get_mut();
         let written = me.written;
-        poll_wait(&mut me.flushing, &me.progress, cx, move |progress| {
-            progress.acknowledged >= written
-        })
+        poll_wait(
+            &mut me.flushing,
+            &me.progress,
+            cx,
+            written,
+            move |progress| progress.acknowledged >= written,
+        )
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -405,7 +448,7 @@ impl AsyncWrite for TunnelStream {
         // so, because a shutdown that returns before the bytes went out is
         // the thing a shutdown exists to prevent.
         me.writes.close();
-        poll_wait(&mut me.shutting_down, &me.progress, cx, |progress| {
+        poll_wait(&mut me.shutting_down, &me.progress, cx, 0, |progress| {
             progress.closed
         })
     }
@@ -416,13 +459,23 @@ fn poll_wait(
     slot: &mut Wait,
     progress: &watch::Receiver<Progress>,
     cx: &mut Context<'_>,
+    target: u64,
     done: impl Fn(Progress) -> bool + Send + 'static,
 ) -> Poll<io::Result<()>> {
-    let waiting = slot.get_or_insert_with(|| until(progress.clone(), done));
+    if slot
+        .as_ref()
+        .is_none_or(|(waiting_for, _)| *waiting_for != target)
+    {
+        *slot = Some((target, until(progress.clone(), done)));
+    }
+    let (_, waiting) = slot.as_mut().expect("just put there");
     match waiting.as_mut().poll(cx) {
-        Poll::Ready(()) => {
+        Poll::Ready(met) => {
             *slot = None;
-            Poll::Ready(Ok(()))
+            // The stack stopped before it could. Whatever was outstanding is
+            // gone, and a caller told `Ok` would go on to the next thing
+            // believing this one landed.
+            Poll::Ready(if met { Ok(()) } else { Err(gone()) })
         }
         Poll::Pending => Poll::Pending,
     }
@@ -475,6 +528,11 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
     let mut queued: Vec<u8> = Vec::new();
     // How many bytes have been taken from the caller's queue, ever.
     let mut accepted: u64 = 0;
+    // What was last said about all this, so that stopping can say it again
+    // with the truth about having stopped attached.
+    let mut last = *driver.progress.borrow();
+    // Whether the tunnel underneath is still there.
+    let mut link_gone = false;
     // Whether the caller has finished writing, so the connection should be
     // closed once what it wrote has gone.
     let mut closing = false;
@@ -503,18 +561,6 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
         if closing && queued.is_empty() && driver.socket().may_send() {
             driver.socket().close();
         }
-
-        // What anyone waiting on `flush` or `shutdown` is waiting for. What
-        // has been taken from the caller, less what is still waiting for the
-        // window and what the far end has not acknowledged — so this counts
-        // bytes that *arrived*, rather than bytes that merely left.
-        let outstanding = (queued.len() + driver.socket().send_queue()) as u64;
-        let acknowledged = accepted.saturating_sub(outstanding);
-        let closed = closing && outstanding == 0 && !driver.socket().may_send();
-        driver.progress.send_replace(Progress {
-            acknowledged,
-            closed,
-        });
 
         // In: only as much as there is somewhere to put. Bytes left in the
         // socket are the window closing, which is how a reader that has
@@ -548,10 +594,42 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
         // than on the connection being finished is what stops a peer that
         // closes politely from leaving a reader waiting forever, which is
         // exactly how SMB servers end a session.
-        if established && !driver.socket().may_recv() && !driver.socket().can_recv() {
+        let finished_reading =
+            established && !driver.socket().may_recv() && !driver.socket().can_recv();
+
+        // What anyone waiting on `flush` or `shutdown` is waiting for. What
+        // has been taken from the caller, less what is still waiting for the
+        // window and what the far end has not acknowledged — so this counts
+        // bytes that *arrived*, rather than bytes that merely left.
+        //
+        // And `closed` waits for the goodbye to have been acknowledged, not
+        // merely asked for: `close` only queues the FIN, and `Drop` stops this
+        // task, so a shutdown that returned in between would leave the far end
+        // holding a connection nobody is coming back to finish.
+        let outstanding = (queued.len() + driver.socket().send_queue()) as u64;
+        last = Progress {
+            acknowledged: accepted.saturating_sub(outstanding),
+            closed: closing
+                && outstanding == 0
+                && matches!(
+                    driver.socket().state(),
+                    State::FinWait2 | State::TimeWait | State::Closed
+                ),
+            stopped: false,
+            ended_cleanly: last.ended_cleanly || finished_reading,
+        };
+        driver.progress.send_replace(last);
+
+        if finished_reading {
             driver.to_caller = None;
         }
-        if !driver.socket().is_active() {
+
+        // Everything having finished is not the same as everything having
+        // been read: the stack holds far more than fits between it and a
+        // reader, and what is still in there is owed to whoever is coming for
+        // it.
+        let unread = driver.socket().can_recv() && driver.to_caller.is_some();
+        if (!driver.socket().is_active() || link_gone) && !unread {
             break;
         }
 
@@ -566,11 +644,14 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
             .min(IDLE_POLL);
 
         tokio::select! {
-            packet = driver.inbound.recv() => match packet {
+            packet = driver.inbound.recv(), if !link_gone => match packet {
                 Some(packet) => driver.device.push(packet),
-                // The tunnel has stopped, so the connection through it has
-                // too.
-                None => break,
+                // The tunnel has stopped. Not a reason to throw away what
+                // already arrived through it: a peer that said goodbye before
+                // the link went is a peer that finished, and the difference
+                // is decided above from what the socket saw, once the last of
+                // it has been handed over.
+                None => link_gone = true,
             },
 
             written = driver.from_caller.recv(), if accepting_writes => match written {
@@ -595,11 +676,13 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
         }
     }
 
-    // Nothing more will be sent, whatever anyone is waiting for. Saying so
-    // beats leaving a `flush` waiting on a stack that has stopped.
+    // Nothing more will be sent or received, whatever anyone is waiting for.
+    // Said as it is rather than as anyone would like it: a `flush` waiting on
+    // bytes this stack still had is a `flush` that failed, and a reader whose
+    // peer never said goodbye was cut off rather than finished.
     driver.progress.send_replace(Progress {
-        acknowledged: u64::MAX,
-        closed: true,
+        stopped: true,
+        ..last
     });
 
     // Whoever is waiting on `connect` hears why, rather than waiting out the

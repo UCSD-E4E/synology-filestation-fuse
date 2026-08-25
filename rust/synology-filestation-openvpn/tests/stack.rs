@@ -37,6 +37,12 @@ const PATIENCE: Duration = Duration::from_secs(5);
 enum Ask {
     Send(Vec<u8>),
     Close,
+    /// Stop and start answering, without going away. A stalled peer
+    /// acknowledges nothing, which is how a write is held in flight for as
+    /// long as a test needs it there.
+    Stall(bool),
+    /// Go away without a word, as a link does when it fails.
+    Vanish,
 }
 
 /// The other end of the link: an interface that listens where the NAS would,
@@ -102,11 +108,16 @@ impl Peer {
         tokio::spawn(async move {
             let mut queued: Vec<u8> = Vec::new();
             let mut closing = false;
+            let mut stalled = false;
+            let mut established = false;
             loop {
                 while let Ok(packet) = self.inbound.try_recv() {
                     self.device.push(packet);
                 }
-                self.poll();
+                if !stalled {
+                    self.poll();
+                }
+                established |= self.socket().may_send();
 
                 if !queued.is_empty() && self.socket().can_send() {
                     let sent = self.socket().send_slice(&queued).unwrap_or(0);
@@ -128,14 +139,36 @@ impl Peer {
                     }
                 }
 
-                match asked.try_recv() {
-                    Ok(Ask::Send(bytes)) => queued.extend_from_slice(&bytes),
-                    Ok(Ask::Close) => closing = true,
-                    // Nothing more will be asked, which is not the same as
-                    // being finished: what has been handed to `smoltcp` is
-                    // not yet on the wire, and a peer that returns here drops
-                    // the link out from under its own last segments.
-                    Err(_) => {}
+                // The other side has closed its half. That is an answer to
+                // give in kind, not an instruction to stop: it says nothing
+                // more is coming, and nothing at all about what is still owed
+                // in this direction. So it joins the ordinary close path,
+                // which waits until everything queued has gone.
+                if established && !self.socket().may_recv() && !self.socket().can_recv() {
+                    closing = true;
+                }
+                // And leaving is for when the exchange is over — letting go of
+                // the channel is how a test learns the goodbye arrived.
+                if established && !self.socket().is_active() {
+                    return;
+                }
+
+                // Everything asked for so far, not one thing per turn: an
+                // instruction still sitting in the channel is work owed, and
+                // a peer that decides it has finished while its backlog is
+                // unread stops in the middle of what it was told to do.
+                loop {
+                    match asked.try_recv() {
+                        Ok(Ask::Send(bytes)) => queued.extend_from_slice(&bytes),
+                        Ok(Ask::Close) => closing = true,
+                        Ok(Ask::Stall(now)) => stalled = now,
+                        Ok(Ask::Vanish) => return,
+                        // Nothing more will be asked, which is not the same as
+                        // being finished: what has been handed to `smoltcp` is
+                        // not yet on the wire, and a peer that returns here
+                        // drops the link out from under its own last segments.
+                        Err(_) => break,
+                    }
                 }
 
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -363,4 +396,136 @@ async fn a_shutdown_waits_for_what_it_is_shutting_down() {
             .expect("a chunk"),
         b"goodbye"
     );
+}
+
+#[tokio::test]
+async fn a_stream_cut_off_is_an_error_rather_than_an_ending() {
+    // The distinction the reader above depends on. A peer that closed politely
+    // and a link that died both stop the bytes; only one of them means the
+    // message was complete. Reported as a clean end of stream, a truncated SMB
+    // response reads as a server that had nothing more to say.
+    let (mut stream, ask, _heard) = connected().await;
+
+    ask.send(Ask::Vanish).await.expect("the link fails");
+
+    let mut rest = Vec::new();
+    let read = tokio::time::timeout(PATIENCE, stream.read_to_end(&mut rest))
+        .await
+        .expect("it does not wait forever");
+
+    assert!(
+        read.is_err(),
+        "a link that died is not a peer that finished"
+    );
+}
+
+#[tokio::test]
+async fn a_flush_on_a_stream_that_died_is_not_a_success() {
+    // `flush` returning `Ok` is a promise the bytes arrived. Once the stack
+    // has stopped they never will, and saying so beats a caller that goes on
+    // to the next thing believing the last one landed.
+    let (mut stream, ask, _heard) = connected().await;
+
+    ask.send(Ask::Stall(true)).await.expect("stop answering");
+    stream.write_all(b"into the dark").await.expect("queued");
+    ask.send(Ask::Vanish).await.expect("and then nothing");
+
+    let flushed = tokio::time::timeout(PATIENCE, stream.flush())
+        .await
+        .expect("it does not wait forever");
+
+    assert!(flushed.is_err(), "nothing was flushed anywhere");
+}
+
+#[tokio::test]
+async fn a_flush_that_was_given_up_on_does_not_satisfy_the_next_one() {
+    // A `flush` abandoned by a timeout or a `select!` leaves its wait behind.
+    // Reused, it answers the *next* flush's question with the previous one's —
+    // a smaller threshold, already met — so a later write is reported as
+    // delivered while it is still sitting in the window.
+    let (mut stream, ask, mut heard) = connected().await;
+
+    ask.send(Ask::Stall(true)).await.expect("stop answering");
+    stream.write_all(b"first").await.expect("queued");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.flush())
+            .await
+            .is_err(),
+        "nothing is acknowledged while the peer is stalled"
+    );
+
+    // The first write lands — but nobody flushes again, so the abandoned wait
+    // is still sitting there with the first write's threshold in it.
+    ask.send(Ask::Stall(false)).await.expect("answer again");
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, heard.recv())
+            .await
+            .expect("delivered")
+            .expect("a chunk"),
+        b"first"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    ask.send(Ask::Stall(true)).await.expect("and stop again");
+
+    stream.write_all(b"second").await.expect("queued");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), stream.flush())
+            .await
+            .is_err(),
+        "the second write has not been acknowledged by anybody"
+    );
+}
+
+#[tokio::test]
+async fn a_shutdown_is_over_only_once_the_goodbye_has_gone() {
+    // Dropping the stream stops the task, so a `shutdown` that returns while
+    // the FIN is still queued leaves the far end holding a connection nobody
+    // is going to finish. The peer reports the goodbye by letting go of its
+    // own channel.
+    let (mut stream, _ask, mut heard) = connected().await;
+
+    stream.write_all(b"goodbye").await.expect("queued");
+    tokio::time::timeout(PATIENCE, stream.shutdown())
+        .await
+        .expect("it does not wait forever")
+        .expect("shut down");
+    drop(stream);
+
+    let mut collected = Vec::new();
+    while let Some(chunk) = tokio::time::timeout(PATIENCE, heard.recv())
+        .await
+        .expect("the peer is not left waiting")
+    {
+        collected.extend_from_slice(&chunk);
+    }
+    assert_eq!(collected, b"goodbye");
+}
+
+#[tokio::test]
+async fn what_is_still_in_the_window_when_the_connection_ends_is_still_read() {
+    // Both sides having closed is not the same as everything having been read.
+    // The stack holds far more than fits between it and a reader, and a reader
+    // that arrives late is entitled to all of it — otherwise a response is
+    // truncated and reported as a successful read.
+    let (mut stream, ask, _heard) = connected().await;
+
+    let sent: Vec<u8> = (0..120_000u32).map(|i| (i % 251) as u8).collect();
+    for chunk in sent.chunks(8 * 1024) {
+        ask.send(Ask::Send(chunk.to_vec())).await.expect("queued");
+    }
+    ask.send(Ask::Close).await.expect("and goodbye");
+
+    // Our half closes too, so the connection finishes rather than sitting
+    // half-open — and it finishes while nobody has read a byte.
+    stream.shutdown().await.expect("our half");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut received = Vec::new();
+    tokio::time::timeout(PATIENCE, stream.read_to_end(&mut received))
+        .await
+        .expect("in reasonable time")
+        .expect("readable");
+
+    assert_eq!(received.len(), sent.len(), "nothing was discarded");
+    assert_eq!(received, sent);
 }
