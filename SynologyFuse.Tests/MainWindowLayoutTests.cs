@@ -37,6 +37,7 @@ public class MainWindowLayoutTests
     [InlineData(400.0, 14.0)]
     [InlineData(520.0, 14.0)]
     [InlineData(520.0, 17.0)]
+    [InlineData(520.0, 24.0)]
     public Task NoCellIsPaintedOverAnother(double width, double fontSize) => TestAppBuilder.RunOnUiThread(() =>
     {
         var window = Show(width, fontSize);
@@ -70,6 +71,7 @@ public class MainWindowLayoutTests
     [InlineData(400.0, 14.0)]
     [InlineData(520.0, 14.0)]
     [InlineData(520.0, 17.0)]
+    [InlineData(520.0, 24.0)]
     public Task NoCellIsPlacedOutsideItsGrid(double width, double fontSize) => TestAppBuilder.RunOnUiThread(() =>
     {
         var window = Show(width, fontSize);
@@ -91,6 +93,35 @@ public class MainWindowLayoutTests
         Assert.True(problems.Count == 0,
             $"At {width}px wide with a {fontSize}pt font, cells escape their grid:\n  " +
             string.Join("\n  ", problems));
+    });
+
+    [Theory]
+    [InlineData(400.0, 14.0)]
+    [InlineData(520.0, 14.0)]
+    [InlineData(520.0, 17.0)]
+    [InlineData(520.0, 24.0)]
+    public Task NoTextIsDrawnOutsideItsOwnBox(double width, double fontSize) => TestAppBuilder.RunOnUiThread(() =>
+    {
+        var window = Show(width, fontSize);
+
+        // A TextBlock too narrow for its text does not shrink the text and does
+        // not clip it: the glyphs are drawn past the edge of the control, over
+        // whatever is next to it. Bounds alone cannot see this — the control is
+        // arranged at its cell's width whatever the text does — so the laid-out
+        // text is compared against the box it was given.
+        var problems =
+            from label in window.GetVisualDescendants().OfType<TextBlock>()
+            where label.TemplatedParent is null && label.IsVisible && label.Bounds.Width > 0
+            let text = label.TextLayout.Width
+            let box = label.Bounds.Width - label.Padding.Left - label.Padding.Right
+            where text > box + Epsilon
+            select $"{Describe(label)} needs {text:0.#}px but was given {box:0.#}px";
+
+        var found = problems.ToList();
+
+        Assert.True(found.Count == 0,
+            $"At {width}px wide with a {fontSize}pt font, text spills out of its cell:\n  " +
+            string.Join("\n  ", found));
     });
 
     // ── helpers ───────────────────────────────────────────────────────────────
