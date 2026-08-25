@@ -6,6 +6,11 @@ tunnel and mount SMB through it. The SMB backend has met mocks and a Docker
 Samba container; it has not met DSM. Until this page has been walked through
 once, treat the tunnel work as unvalidated.
 
+The client that does this without `sudo` is now built, so this page has two
+halves: step 3 proves SMB works over the NAS's tunnel at all, and step 4 proves
+our own client can be that tunnel. Running them in that order is what makes a
+failure in the second one mean something.
+
 It needs a human, off campus, with AD credentials. It is the last open item on
 the server side too — `spec/e4e-nas/vpn.yml` in `KastnerRG/krg-infra` lists it
 as bring-up step 7, the only one not yet done.
@@ -30,7 +35,11 @@ reachable US-wide.
 Keep it `0600`. Do not paste it into a terminal transcript, an issue, or a
 chat log.
 
-## 2. Bring the tunnel up
+## 2. Bring the tunnel up with the system client
+
+Not because the driver needs it — it does not, and step 4 is the one that
+matters — but because this stage fails for reasons that have nothing to do with
+any of our code. Doing it first means a failure later has one fewer explanation.
 
 ```bash
 nix shell nixpkgs#openvpn -c sudo openvpn --config e4e-nas-vpn.ovpn
@@ -51,27 +60,65 @@ Two checkpoints, in order:
 Do not test with `ping`: ICMP is dropped by the `vpn` firewall adapter by
 design. A silent `10.90.24.1` is expected and proves nothing either way.
 
-## 3. Mount through it
+## 3. Check SMB over that tunnel, without this driver
+
+With the tunnel from step 2 still up, `10.90.24.1:445` is reachable by anything
+on the machine. Ask something that is not us:
+
+```bash
+smbclient -L //10.90.24.1 -U 'KRG\<ad-user>'
+smbclient //10.90.24.1/<share> -U 'KRG\<ad-user>' -c 'ls'
+```
+
+What this settles is the half of the question that has nothing to do with our
+code: that DSM answers SMB3 on the far side of its own tunnel, to an AD account,
+with NTLMv2 and server signing. If this fails, step 4 was never going to work
+and the reason is not ours.
+
+> **Not this driver's mount, deliberately.** Pointing
+> `synology-filestation-fuse` at a tunnel somebody else raised does not
+> currently pick the SMB leg: the chain probes SMB at `--host`, which is the
+> public name, and the tunnel routes only `10.90.24.0/24` — so the probe fails
+> and the mount falls to HTTP. An externally-raised tunnel is a case the chain
+> does not model, and it is worth deciding whether it should before somebody
+> discovers it the hard way. Step 4 is the supported shape.
+
+## 4. Mount with no tunnel at all
+
+Stop the `openvpn` from step 2 — including whatever it did to the routing table
+— and confirm `10.90.24.1` is unreachable again. Then:
 
 ```bash
 synology-filestation-fuse \
   --host e4e-nas.ucsd.edu \
   --vpn-host 10.90.24.1 \
+  --vpn-profile ~/e4e-nas-vpn.ovpn \
   --smb-domain KRG \
   --username <ad-user> \
   ~/mnt
 ```
 
-`--host` is where FileStation is authenticated and where the fallback lives;
-`--vpn-host` is where the NAS answers *inside* the tunnel. They differ because
-the tunnel pushes no DNS. The mount logs which leg it chose — that line is the
-result of this test.
+No `sudo`, no `tun0`, nothing in `ip route` that was not there before, and
+nothing changed for anything else the machine is doing. The tunnel is inside
+this process and so is the TCP stack that speaks through it. What proves it
+worked is the line:
+
+```
+Transport: SMB, through a tunnel to 10.90.24.1
+```
+
+If `--vpn-profile` names a path that does not exist yet, it is fetched from the
+NAS over the session just authenticated — which is worth testing on purpose,
+since it is what somebody off campus with no tunnel has to do to get the file
+that gives them one.
 
 Then copy a large file in. This is the first real exercise of three things that
-have only ever run against a container: the replacing rename, `set_end_of_file`
-truncation, and streamed write-through.
+have only ever run against a container: the replacing rename,
+`set_end_of_file` truncation, and streamed write-through. Step 3 proved DSM
+answers SMB; this is the first time our own SMB code has spoken to it, over a
+tunnel our own code is carrying.
 
-## 4. What to watch for
+## 5. What to watch for
 
 * **Kerberos → NTLMv2 fallback.** Clients cannot reach the DC through this
   tunnel, by design, so an SPN cannot be acquired and SMB falls back to NTLMv2,
@@ -88,10 +135,32 @@ truncation, and streamed write-through.
   runs longer renegotiates mid-transfer. A copy that dies at roughly the
   one-hour mark is that, not the network.
 
-## Why this gates the in-process client
+## Reading a failure
 
-`rust/synology-filestation-openvpn` exists to remove the `sudo openvpn` step
-above — same tunnel, no tun device, no privileged helper, no effect on the
-machine's other traffic. Every line of it is spent on the assumption that what
-is on the far side is worth reaching. If SMB over this tunnel does not work
-against real DSM, that is worth knowing before the protocol work, not after.
+Four stages that can fail, and each says so in its own words. The point of
+running them in order is that the first one to fail is the one to fix.
+
+| What you see | What it means |
+|---|---|
+| Step 2 never reaches `TLS: Initial packet` | 1194 is not open from where you are, or `ta.key` does not match. Nothing downstream is worth trying. |
+| Step 2 reaches `AUTH_FAILED` | The credentials, or the DC behind them. The tunnel itself is fine. |
+| Step 3's `smbclient` fails | DSM's SMB, not ours: the dialect, the signing, or the AD account. Step 4 was never going to work. |
+| `VPN profile: cannot read … ; the tunnel leg will not be available` | The profile is not where `--vpn-profile` says and could not be fetched. The mount is on HTTP. |
+| `the vpn tunnel to … did not come up` | Our client could not do what step 2 did. That is a client bug, and step 2 passing is what makes it one. |
+| `the tunnel is up, but nothing answered at 10.90.24.1:445 inside it` | The tunnel carried packets and SMB did not answer through it. Different problem, deliberately worded to be a different sentence. |
+| `SMB through the tunnel: … ; using the HTTP API` | The connection was made and the SMB session failed on top of it — credentials, dialect, signing. |
+| `Transport: the HTTP API` with nothing above it | No leg was reachable, which is the fallback working. |
+
+## Why this gated the in-process client
+
+`rust/synology-filestation-openvpn` exists to remove the `sudo openvpn` of step
+2 — same tunnel, no tun device, no privileged helper, no effect on the machine's
+other traffic. Every line of it was written on the assumption that what is on
+the far side is worth reaching, which is why this page came first.
+
+It is now built, and steps 3 and 4 are the difference: the same mount, over a
+tunnel the operating system joined and over one this process holds by itself.
+Until step 4 has been walked through once against real DSM, treat it as
+unvalidated — it has been proved against captured bytes, against OpenSSL,
+against a real `openvpn` process, and against a peer in this process that
+encrypts and decrypts a whole TCP conversation. None of those is a NAS.
