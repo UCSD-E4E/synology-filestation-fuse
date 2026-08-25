@@ -5,6 +5,9 @@
 
 ### Bug Fixes
 
+* **gui:** report a slow disconnect without pretending it finished ([2b6c0b3](https://github.com/UCSD-E4E/synology-filestation/commit/2b6c0b3aacdeef4374b36c078c806ebdb5e02f02))
+* **gui:** say where a disconnect has got to, instead of "Working…" ([a3ed0d4](https://github.com/UCSD-E4E/synology-filestation/commit/a3ed0d41db1b1efb6f848a2184a31c5101f1307c))
+* **gui:** say where a disconnect has got to, instead of "Working…" ([8f51707](https://github.com/UCSD-E4E/synology-filestation/commit/8f51707d254e07202f0a1ef88a748a4599b5a9de))
 * **gui:** stop the settings window drawing over itself ([6ce8500](https://github.com/UCSD-E4E/synology-filestation/commit/6ce85002c04e0e29e912db5ec3989c09c014bbbf))
 * **gui:** stop the settings window drawing over itself ([c431c12](https://github.com/UCSD-E4E/synology-filestation/commit/c431c123bb8904beff197e7d60fc175d28d00461))
 * stop assuming where a NAS keeps things, and which path was meant ([20899bf](https://github.com/UCSD-E4E/synology-filestation/commit/20899bfa013643f9584dbb5bd01a1c8214b46380))
