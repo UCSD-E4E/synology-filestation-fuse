@@ -45,7 +45,10 @@ thiserror = "2"
 # The driver owns the socket and the timers. Everything below it stays
 # sans-io, which is what let the rest of this crate be tested without a
 # network at all.
-tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+# `PollSender`: what makes the stack's write half an ordinary `AsyncWrite`
+# without hand-rolling a reserve-and-poll state machine.
+tokio-util = "0.7"
 
 [dev-dependencies]
 hex = "0.4"
