@@ -40,6 +40,11 @@
     "hash": "sha256-7lChqcimsELWLlx3J1VhHJq3V0AoZ5iSHstZrT7ItBA="
   },
   {
+    "pname": "Avalonia.Headless",
+    "version": "12.1.1",
+    "hash": "sha256-KbuU968K5xFXVIRu2VYKdFinuOTD9r4//u6sBqvIYu8="
+  },
+  {
     "pname": "Avalonia.Native",
     "version": "12.1.1",
     "hash": "sha256-1VfWF3vFifgBiuM1LV6v6s6Dbh0uUQ+CHL3PxmtWlVI="
