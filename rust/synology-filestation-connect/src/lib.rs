@@ -31,8 +31,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// How long a degraded choice is trusted before the chain looks for a better
 /// one. Steady state on the best leg never re-probes, so this is not a poll
@@ -179,8 +180,15 @@ impl Endpoints {
 pub struct Route {
     /// Which leg of the chain this is.
     pub transport: Transport,
-    /// The host SMB should connect to. `None` on the HTTP leg, which carries
-    /// no SMB at all.
+    /// The host SMB is reached at on this leg.
+    ///
+    /// **Not always dialable.** On [`Transport::SmbOverVpn`] this is an
+    /// address inside a tunnel that terminates in this process, which no
+    /// socket on this machine has a route to — dialling it reaches the
+    /// operating system's idea of the network, which has never heard of it.
+    /// Use [`Chain::reach_smb`], which hands back the connection it already
+    /// had to open to know the leg works. `None` on the HTTP leg, which
+    /// carries no SMB at all.
     pub smb_host: Option<String>,
 }
 
@@ -194,15 +202,39 @@ pub trait Prober: Send + Sync {
     async fn smb_reachable(&self, host: &str) -> bool;
 }
 
+/// A byte stream to the NAS, however it was arrived at.
+///
+/// Boxed and named only by what it does, so this crate stays a decision layer:
+/// what actually satisfies it is a TCP connection inside a userspace stack
+/// inside an OpenVPN tunnel, and nothing here needs to know that.
+pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
+
+/// An open connection to the NAS through a tunnel.
+pub type Connection = Box<dyn AsyncStream>;
+
 /// Something that can make an unreachable NAS reachable.
 #[async_trait]
 pub trait Tunnel: Send + Sync {
-    /// Bring the tunnel up, or say why not.
+    /// Bring the tunnel up and open a connection to `host:port` through it.
+    ///
+    /// Opening it **is** the probe. There is no separate "is it reachable"
+    /// question to ask first: a tunnel that terminates inside this process has
+    /// no address the operating system can be asked about, so the only way to
+    /// find out whether the NAS answers is to talk to it — and having done
+    /// that, throwing the connection away to open another one would be a
+    /// second handshake to learn what the first already proved.
+    ///
+    /// Implementations must bound their own wait, as [`Prober`] must: this
+    /// runs while a user watches a spinner, and the HTTP leg is one branch
+    /// below. A tunnel that hangs holds up the answer for everybody, and the
+    /// chain cannot bound it from outside without inventing a deadline that
+    /// belongs to whoever knows what the tunnel is doing.
     ///
     /// Must not prompt: this can run at a cache expiry, and a dialog in the
     /// middle of someone's copy is worse than staying on the slower leg. A
     /// tunnel needing input reports failure and waits to be asked explicitly.
-    async fn bring_up(&self) -> Result<(), TunnelUnavailable>;
+    async fn open(&self, host: &str, port: u16) -> Result<Connection, TunnelUnavailable>;
 }
 
 /// A tunnel that could not be established, with a reason worth logging.
@@ -223,7 +255,7 @@ pub struct NoTunnel;
 
 #[async_trait]
 impl Tunnel for NoTunnel {
-    async fn bring_up(&self) -> Result<(), TunnelUnavailable> {
+    async fn open(&self, _host: &str, _port: u16) -> Result<Connection, TunnelUnavailable> {
         Err(TunnelUnavailable("no tunnel is configured".into()))
     }
 }
@@ -286,6 +318,30 @@ struct Decision {
     expires_at: Option<Instant>,
 }
 
+/// The SMB port, which is not configurable: it is what SMB is.
+const SMB_PORT: u16 = 445;
+
+/// How SMB can be reached right now.
+///
+/// Two of these are addresses and one is an open connection, because that is
+/// the honest shape of the answer. A NAS reachable directly is dialled by
+/// whoever wants it; one reachable only through a tunnel was *already* dialled
+/// to find that out, and handing back the connection is what stops the same
+/// work being done twice.
+pub enum SmbRoute {
+    /// It answers directly. Dial this host.
+    Direct { host: String },
+    /// It answers through a tunnel, and this is the connection to it.
+    Tunnelled {
+        /// The address inside the tunnel, which still names the server on the
+        /// wire even though it has already been dialled.
+        host: String,
+        connection: Connection,
+    },
+    /// SMB cannot be reached; the chain has fallen to the HTTP API.
+    Unavailable,
+}
+
 /// Picks a transport, remembers it, and looks again when the answer could have
 /// improved.
 pub struct Chain {
@@ -325,9 +381,88 @@ impl Chain {
         if let Some(cached) = self.cached(Instant::now()) {
             return Ok(cached);
         }
-        let chosen = self.decide().await?;
+        // The tunnel leg proves itself by opening a connection, and a caller
+        // asking only which transport to use has nowhere to put one. Dropped
+        // rather than avoided: there is no cheaper question to ask.
+        let (chosen, _proof) = self.decide().await?;
         self.remember(chosen.clone(), Instant::now());
         Ok(chosen)
+    }
+
+    /// Reach SMB by the best route there is.
+    ///
+    /// This is what a mount calls. [`route`](Self::route) answers *which*
+    /// transport; this answers *with* one — and on the tunnel leg that is a
+    /// connection already open, because opening it was the only way to know
+    /// the leg works.
+    pub async fn reach_smb(&self) -> Result<SmbRoute, NoTransport> {
+        if let Some(cached) = self.cached(Instant::now()) {
+            match cached.transport {
+                Transport::SmbDirect => {
+                    if let Some(host) = cached.smb_host {
+                        return Ok(SmbRoute::Direct { host });
+                    }
+                }
+                Transport::Https => return Ok(SmbRoute::Unavailable),
+                Transport::SmbOverVpn => {
+                    if let Some(host) = cached.smb_host.clone() {
+                        match self.tunnel.open(&host, SMB_PORT).await {
+                            Ok(connection) => return Ok(SmbRoute::Tunnelled { host, connection }),
+                            // What was remembered no longer holds. Falling
+                            // through re-decides rather than reporting a
+                            // failure the chain has other answers to.
+                            // Falling through re-decides rather than
+                            // reporting a failure the chain has other answers
+                            // to — but without asking the tunnel again,
+                            // because it has just been asked, and a second
+                            // attempt in one call is a second wait for an
+                            // answer already given.
+                            Err(e) => {
+                                debug!("transport: the remembered tunnel no longer opens ({e})");
+                                self.forget(&cached);
+                                let (chosen, _) = self.decide_without_the_tunnel().await?;
+                                self.remember(chosen.clone(), Instant::now());
+                                return Ok(match (chosen.transport, chosen.smb_host) {
+                                    (Transport::SmbDirect, Some(host)) => SmbRoute::Direct { host },
+                                    _ => SmbRoute::Unavailable,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let (chosen, opened) = self.decide().await?;
+        self.remember(chosen.clone(), Instant::now());
+        Ok(match (chosen.transport, chosen.smb_host, opened) {
+            (Transport::SmbOverVpn, Some(host), Some(connection)) => {
+                SmbRoute::Tunnelled { host, connection }
+            }
+            (Transport::SmbDirect, Some(host), _) => SmbRoute::Direct { host },
+            _ => SmbRoute::Unavailable,
+        })
+    }
+
+    /// Tell the chain that the route it handed out has stopped working.
+    ///
+    /// The best leg is remembered without an expiry, because there is nothing
+    /// better to look for — which also means nothing ever asks again. A laptop
+    /// carried off the campus network keeps being told SMB answers directly
+    /// until something says otherwise, and the only thing that knows is
+    /// whoever tried to use it.
+    pub fn reconsider(&self) {
+        *self.decision.lock().unwrap() = None;
+    }
+
+    /// Drop a remembered decision, but only if it is still the one we acted
+    /// on. A concurrent caller may have written a fresher answer between our
+    /// reading it and finding it wanting, and that one is not ours to discard.
+    fn forget(&self, acted_on: &Route) {
+        let mut guard = self.decision.lock().unwrap();
+        if guard.as_ref().is_some_and(|held| &held.route == acted_on) {
+            *guard = None;
+        }
     }
 
     /// The current choice without deciding one, for a status line that must
@@ -360,33 +495,59 @@ impl Chain {
         *self.decision.lock().unwrap() = Some(Decision { route, expires_at });
     }
 
-    async fn decide(&self) -> Result<Route, NoTransport> {
+    /// The best leg available, and — on the tunnel leg — the connection that
+    /// proved it.
+    async fn decide(&self) -> Result<(Route, Option<Connection>), NoTransport> {
+        self.decide_with_tunnel(true).await
+    }
+
+    /// The same ladder with the tunnel rung missing, for a caller that has
+    /// just tried it.
+    async fn decide_without_the_tunnel(&self) -> Result<(Route, Option<Connection>), NoTransport> {
+        self.decide_with_tunnel(false).await
+    }
+
+    async fn decide_with_tunnel(
+        &self,
+        may_open: bool,
+    ) -> Result<(Route, Option<Connection>), NoTransport> {
         if self.policy.allows_smb() {
             let public = &self.endpoints.public_host;
             if self.prober.smb_reachable(public).await {
                 debug!("transport: SMB answers directly at {public}");
-                return Ok(Route {
-                    transport: Transport::SmbDirect,
-                    smb_host: Some(public.clone()),
-                });
+                return Ok((
+                    Route {
+                        transport: Transport::SmbDirect,
+                        smb_host: Some(public.clone()),
+                    },
+                    None,
+                ));
             }
             match (self.policy.allows_vpn(), &self.endpoints.tunnel_host) {
-                (true, Some(inside)) => match self.tunnel.bring_up().await {
-                    // Probe the address *inside* the tunnel, not the public
-                    // name: the tunnel pushes no DNS, and the public name is
-                    // exactly the one that just failed.
-                    Ok(()) if self.prober.smb_reachable(inside).await => {
-                        info!("transport: SMB reachable through the tunnel at {inside}");
-                        return Ok(Route {
-                            transport: Transport::SmbOverVpn,
-                            smb_host: Some(inside.clone()),
-                        });
+                // The address *inside* the tunnel, not the public name: the
+                // tunnel pushes no DNS, and the public name is exactly the one
+                // that just failed. A tunnel that comes up without reaching
+                // SMB and one that never comes up are now the same answer
+                // here — the error says which, and it is the tunnel's to
+                // explain rather than this layer's to guess.
+                (true, Some(inside)) if may_open => {
+                    match self.tunnel.open(inside, SMB_PORT).await {
+                        Ok(connection) => {
+                            info!("transport: SMB reachable through the tunnel at {inside}");
+                            return Ok((
+                                Route {
+                                    transport: Transport::SmbOverVpn,
+                                    smb_host: Some(inside.clone()),
+                                },
+                                Some(connection),
+                            ));
+                        }
+                        Err(e) => debug!("transport: no SMB through a tunnel ({e})"),
                     }
-                    // A tunnel that came up without making SMB reachable is
-                    // not a tunnel to here; say so rather than blaming SMB.
-                    Ok(()) => warn!("transport: tunnel is up but SMB still does not answer"),
-                    Err(e) => debug!("transport: no tunnel ({e})"),
-                },
+                }
+                // Just tried, and it did not open. Asking again in the same
+                // call buys a second wait for an answer already given.
+                (true, Some(_)) => {}
                 // Nowhere for an escalation to land. Raising the tunnel would
                 // still leave us with no address to mount, so don't.
                 (true, None) => {
@@ -398,10 +559,13 @@ impl Chain {
 
         if self.policy.allows_https() {
             info!("transport: falling back to the HTTP API");
-            return Ok(Route {
-                transport: Transport::Https,
-                smb_host: None,
-            });
+            return Ok((
+                Route {
+                    transport: Transport::Https,
+                    smb_host: None,
+                },
+                None,
+            ));
         }
         Err(NoTransport)
     }
@@ -410,8 +574,9 @@ impl Chain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const PUBLIC: &str = "e4e-nas.ucsd.edu";
     const INSIDE: &str = "10.90.24.1";
@@ -454,52 +619,58 @@ mod tests {
     }
 
     struct FakeTunnel {
-        works: bool,
-        /// The host the tunnel makes reachable, if any.
-        reveals: Option<(&'static str, Arc<FakeProber>)>,
+        /// Whether a connection through it can be opened at all.
+        works: AtomicBool,
         opens: AtomicUsize,
+        /// Every host it was asked to open a connection to, in order.
+        asked: StdMutex<Vec<String>>,
+        /// The far end of whatever it last handed out, so a test can see what
+        /// was written to it.
+        far_end: StdMutex<Option<tokio::io::DuplexStream>>,
     }
 
     impl FakeTunnel {
+        fn new(works: bool) -> Arc<Self> {
+            Arc::new(Self {
+                works: AtomicBool::new(works),
+                opens: AtomicUsize::new(0),
+                asked: StdMutex::new(Vec::new()),
+                far_end: StdMutex::new(None),
+            })
+        }
+        /// A tunnel that cannot be raised.
         fn absent() -> Arc<Self> {
-            Arc::new(Self {
-                works: false,
-                reveals: None,
-                opens: AtomicUsize::new(0),
-            })
+            Self::new(false)
         }
-        /// A tunnel that comes up and makes `host` answer.
-        fn reaching(host: &'static str, prober: Arc<FakeProber>) -> Arc<Self> {
-            Arc::new(Self {
-                works: true,
-                reveals: Some((host, prober)),
-                opens: AtomicUsize::new(0),
-            })
-        }
-        /// A tunnel that comes up but reaches nothing useful.
-        fn to_nowhere() -> Arc<Self> {
-            Arc::new(Self {
-                works: true,
-                reveals: None,
-                opens: AtomicUsize::new(0),
-            })
+        /// A tunnel that opens a connection to the NAS.
+        fn reaching() -> Arc<Self> {
+            Self::new(true)
         }
         fn opens(&self) -> usize {
             self.opens.load(Ordering::SeqCst)
+        }
+        fn stops_working(&self) {
+            self.works.store(false, Ordering::SeqCst);
+        }
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+        fn take_far_end(&self) -> tokio::io::DuplexStream {
+            self.far_end.lock().unwrap().take().expect("one was opened")
         }
     }
 
     #[async_trait]
     impl Tunnel for Arc<FakeTunnel> {
-        async fn bring_up(&self) -> Result<(), TunnelUnavailable> {
+        async fn open(&self, host: &str, port: u16) -> Result<Connection, TunnelUnavailable> {
             self.opens.fetch_add(1, Ordering::SeqCst);
-            if !self.works {
+            self.asked.lock().unwrap().push(format!("{host}:{port}"));
+            if !self.works.load(Ordering::SeqCst) {
                 return Err(TunnelUnavailable("no route".into()));
             }
-            if let Some((host, prober)) = &self.reveals {
-                prober.starts_answering(host);
-            }
-            Ok(())
+            let (ours, theirs) = tokio::io::duplex(4096);
+            *self.far_end.lock().unwrap() = Some(theirs);
+            Ok(Box::new(ours))
         }
     }
 
@@ -549,7 +720,7 @@ mod tests {
         // DNS, so the public name still fails inside it. Probing that name
         // again would report the escalation as useless and fall to HTTP.
         let prober = FakeProber::nothing_answers();
-        let tunnel = FakeTunnel::reaching(INSIDE, prober.clone());
+        let tunnel = FakeTunnel::reaching();
         let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
 
         let route = chain.route().await.unwrap();
@@ -561,8 +732,14 @@ mod tests {
         );
         assert_eq!(
             prober.asked(),
-            vec![PUBLIC, INSIDE],
-            "public first, then inside the tunnel"
+            vec![PUBLIC],
+            "the public name is asked once, and not again inside the tunnel"
+        );
+        assert_eq!(
+            tunnel.asked(),
+            vec![format!("{INSIDE}:445")],
+            "the connection is opened to the in-tunnel address, which is what \
+             proves the leg — the public name is exactly the one that just failed"
         );
         assert_eq!(tunnel.opens(), 1);
     }
@@ -572,7 +749,7 @@ mod tests {
         // Raising a tunnel we have no address to mount through would cost the
         // user a connection and change nothing.
         let prober = FakeProber::nothing_answers();
-        let tunnel = FakeTunnel::to_nowhere();
+        let tunnel = FakeTunnel::absent();
         let chain = Chain::new(
             TransportPolicy::default(),
             Endpoints::public_only(PUBLIC),
@@ -586,11 +763,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tunnel_that_comes_up_without_reaching_smb_is_not_the_answer() {
-        // Connected to *a* network is not connected to *this* NAS. Reporting
-        // SmbOverVpn here would blame SMB for a routing problem.
+    async fn a_tunnel_that_cannot_reach_smb_is_not_the_answer() {
+        // Connected to *a* network is not connected to *this* NAS, and now
+        // that opening the connection is the probe, those two failures are one
+        // — a tunnel that does not come up and one that comes up somewhere
+        // useless both fail to hand back a connection. Reporting SmbOverVpn
+        // for either would blame SMB for a routing problem.
         let prober = FakeProber::nothing_answers();
-        let tunnel = FakeTunnel::to_nowhere();
+        let tunnel = FakeTunnel::absent();
         let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
 
         let route = chain.route().await.unwrap();
@@ -600,9 +780,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stale_tunnel_route_is_not_asked_twice_in_one_breath() {
+        // Re-deciding after a remembered tunnel stops opening is right; asking
+        // the tunnel again inside the same call is not. Every attempt is a
+        // wait, and this one has just been made.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert!(matches!(
+            chain.reach_smb().await.unwrap(),
+            SmbRoute::Tunnelled { .. }
+        ));
+        tunnel.stops_working();
+
+        assert!(matches!(
+            chain.reach_smb().await.unwrap(),
+            SmbRoute::Unavailable
+        ));
+        assert_eq!(
+            tunnel.opens(),
+            2,
+            "the first call opened one, the second attempted one — not two"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_can_say_the_route_stopped_working() {
+        // The best leg is remembered without an expiry, so nothing ever asks
+        // again on its own. A laptop carried off the campus network would keep
+        // being told SMB answers directly, and the only thing that knows
+        // otherwise is whoever tried to use it.
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::absent();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert_eq!(chain.route().await.unwrap().transport, Transport::SmbDirect);
+        let probes = prober.probes();
+        assert_eq!(
+            chain.route().await.unwrap().transport,
+            Transport::SmbDirect,
+            "remembered, and not asked again"
+        );
+        assert_eq!(prober.probes(), probes);
+
+        chain.reconsider();
+        assert_eq!(chain.route().await.unwrap().transport, Transport::SmbDirect);
+        assert!(prober.probes() > probes, "told otherwise, it looks again");
+    }
+
+    #[tokio::test]
     async fn a_disabled_tunnel_falls_straight_to_http() {
         let prober = FakeProber::nothing_answers();
-        let tunnel = FakeTunnel::reaching(INSIDE, prober.clone());
+        let tunnel = FakeTunnel::reaching();
         let policy = TransportPolicy::from_flags(false, true, false).unwrap();
         let chain = chain(policy, prober.clone(), tunnel.clone());
 
@@ -694,5 +924,92 @@ mod tests {
             Some(Transport::SmbDirect)
         );
         assert_eq!(prober.probes(), 1, "asking what is live decided nothing");
+    }
+
+    #[tokio::test]
+    async fn the_tunnel_leg_hands_back_the_connection_it_opened() {
+        // The point of the whole shape. Opening it was the only way to learn
+        // the leg works, so the caller gets that connection rather than an
+        // address it would have to dial through a tunnel it cannot see.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        let reached = chain.reach_smb().await.unwrap();
+        let SmbRoute::Tunnelled {
+            host,
+            mut connection,
+        } = reached
+        else {
+            panic!("the tunnel leg should have been taken");
+        };
+        assert_eq!(host, INSIDE, "and it still names the server");
+
+        // A real connection, not a token: what goes in comes out the far end.
+        connection.write_all(b"smb2 would go here").await.unwrap();
+        let mut far = tunnel.take_far_end();
+        let mut heard = [0u8; 18];
+        far.read_exact(&mut heard).await.unwrap();
+        assert_eq!(&heard, b"smb2 would go here");
+
+        assert_eq!(tunnel.opens(), 1, "and it was opened once, not twice");
+    }
+
+    #[tokio::test]
+    async fn a_remembered_tunnel_route_opens_a_fresh_connection() {
+        // The decision is cacheable; a connection is not. A second caller gets
+        // its own, without the ladder being climbed again.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        let _first = chain.reach_smb().await.unwrap();
+        let probes = prober.probes();
+        let second = chain.reach_smb().await.unwrap();
+
+        assert!(matches!(second, SmbRoute::Tunnelled { .. }));
+        assert_eq!(tunnel.opens(), 2, "a connection each");
+        assert_eq!(
+            prober.probes(),
+            probes,
+            "and the public host was not asked again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_stops_opening_makes_the_chain_look_again() {
+        // A remembered answer that no longer holds is not a failure to report:
+        // the chain has other legs, and the whole point of remembering is that
+        // it can stop.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert!(matches!(
+            chain.reach_smb().await.unwrap(),
+            SmbRoute::Tunnelled { .. }
+        ));
+        tunnel.stops_working();
+
+        assert!(
+            matches!(chain.reach_smb().await.unwrap(), SmbRoute::Unavailable),
+            "it falls to HTTP rather than insisting on what it remembered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reachable_nas_is_dialled_by_whoever_wants_it() {
+        // Nothing is opened on this leg: the caller can reach the address
+        // itself, and opening a connection here would be one it did not ask
+        // for.
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::absent();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        match chain.reach_smb().await.unwrap() {
+            SmbRoute::Direct { host } => assert_eq!(host, PUBLIC),
+            _ => panic!("SMB answers directly"),
+        }
+        assert_eq!(tunnel.opens(), 0);
     }
 }

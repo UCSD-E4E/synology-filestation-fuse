@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use synology_filestation_connect::{
-    Chain, Endpoints, NoTunnel, TcpProber, TransportPolicy, DEFAULT_RECHECK,
+    Chain, Endpoints, NoTunnel, TcpProber, Transport, TransportPolicy, DEFAULT_RECHECK,
 };
 
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_fuse::{is_otp_required, spawn_mount, MountOptions};
@@ -291,17 +291,28 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     info!("Transport: {}", route.transport);
 
-    // SMB is attached only when the route says so, and at the address the route
-    // gives — inside the tunnel that is not the host the user typed.
-    let client = Arc::new(match &route.smb_host {
-        Some(smb_host) => rt.block_on(synology_filestation_smb::auto_attach_as(
-            client,
-            smb_host,
-            &args.username,
-            &password,
-            args.smb_domain.as_deref(),
-        )),
-        None => client,
+    // SMB is attached only when the route says so, and only on the leg whose
+    // address this process can actually dial. The tunnel leg's address lives
+    // inside a tunnel that terminates here, so it is reached with
+    // `Chain::reach_smb`, which hands back the connection it already opened —
+    // matched on explicitly rather than left to `smb_host`, because dialling
+    // that address would ask the operating system about a network it has never
+    // heard of.
+    let client = Arc::new(match (route.transport, &route.smb_host) {
+        (Transport::SmbDirect, Some(smb_host)) => {
+            rt.block_on(synology_filestation_smb::auto_attach_as(
+                client,
+                smb_host,
+                &args.username,
+                &password,
+                args.smb_domain.as_deref(),
+            ))
+        }
+        (Transport::SmbOverVpn, _) => {
+            warn!("Transport: the tunnel leg is not wired into the CLI yet; using the HTTP API");
+            client
+        }
+        _ => client,
     });
 
     let opts = MountOptions {
