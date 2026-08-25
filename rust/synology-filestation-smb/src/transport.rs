@@ -53,15 +53,41 @@ fn is_connection_lost(kind: smb2::ErrorKind) -> bool {
 
 /// Tracks whether the SMB link needs re-establishing. Isolated from `SmbClient`
 /// so the reconnect decision is unit-testable without a live connection.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ReconnectState {
     needs: AtomicBool,
+    /// Whether reconnecting is something this transport can do at all.
+    ///
+    /// False for a transport built on a stream the caller supplied: only they
+    /// know how the stream was made. Without this the flag below is a one-way
+    /// door — a single transient `TimedOut` sets it, the reconnect that would
+    /// clear it is refused because there is nothing to redial, and
+    /// `reconnect_if_needed` re-sets it on that refusal. Every later operation
+    /// then fails on a session that was never actually dead.
+    possible: bool,
+}
+
+impl Default for ReconnectState {
+    fn default() -> Self {
+        Self {
+            needs: AtomicBool::new(false),
+            possible: true,
+        }
+    }
 }
 
 impl ReconnectState {
+    /// For a transport with no way to reopen its own link.
+    fn never() -> Self {
+        Self {
+            needs: AtomicBool::new(false),
+            possible: false,
+        }
+    }
+
     /// Flag for reconnect if `kind` means the link is dead.
     fn flag_if_lost(&self, kind: smb2::ErrorKind) {
-        if is_connection_lost(kind) {
+        if self.possible && is_connection_lost(kind) {
             self.needs.store(true, Ordering::SeqCst);
         }
     }
@@ -75,7 +101,7 @@ impl ReconnectState {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(), smb2::Error>>,
     {
-        if !self.needs.swap(false, Ordering::SeqCst) {
+        if !self.possible || !self.needs.swap(false, Ordering::SeqCst) {
             return Ok(false);
         }
         match reconnect().await {
@@ -356,9 +382,15 @@ impl SmbTransport {
     /// one is a stream rather than an address. Everything above this line is
     /// then ordinary SMB; the only difference is where the bytes go.
     ///
-    /// `cfg.host` still names the server. Nothing here dials it, but it is
-    /// what tree connects are attributed to and what a DFS referral's path
-    /// would be built from.
+    /// `cfg.host` still names the server, and is still required. Nothing here
+    /// dials it, but it is what tree connects are attributed to and what a DFS
+    /// referral's path would be built from — an empty one becomes a malformed
+    /// UNC at the first tree connect, a long way from here.
+    ///
+    /// `cfg.timeout` is **not** used on this path. It bounds the dial, and
+    /// there is no dial; the deadline on each response afterwards belongs to
+    /// the SMB client and is the same either way. A caller who wants the whole
+    /// attempt bounded — a reachability probe, say — should wrap this call.
     ///
     /// # This one cannot bring itself back
     ///
@@ -370,8 +402,21 @@ impl SmbTransport {
     /// the tunnel: bring a new stream and build a new transport.
     pub async fn over<S>(stream: S, cfg: &SmbConfig) -> Result<Self, SynoFsError>
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'static,
+        // `Send` and not `Sync`: the stream this exists for holds boxed
+        // futures, so it is one and not the other, and the halves are behind
+        // mutexes here anyway. Requiring `Sync` excluded the only caller.
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
     {
+        if cfg.host.is_empty() {
+            // Logged because `InvalidArg` carries no message, and a malformed
+            // UNC at the first tree connect is a long way from the cause.
+            tracing::warn!(
+                "SMB over a supplied stream still needs a host: it names the server on the \
+                 wire, whether or not anything dials it"
+            );
+            return Err(SynoFsError::InvalidArg);
+        }
+
         let framed = Arc::new(crate::framing::StreamTransport::new(stream));
         // The host without its port: `Connection` names the server, and the
         // port is not part of a server's name.
@@ -406,7 +451,9 @@ impl SmbTransport {
                 client,
                 trees: HashMap::new(),
             })),
-            reconnect: Arc::new(ReconnectState::default()),
+            // Nothing here knows how to reopen that stream, so nothing here
+            // will pretend it might.
+            reconnect: Arc::new(ReconnectState::never()),
         })
     }
 
@@ -852,6 +899,22 @@ mod tests {
         assert!(!is_connection_lost(smb2::ErrorKind::NotFound));
         assert!(!is_connection_lost(smb2::ErrorKind::AccessDenied));
         assert!(!is_connection_lost(smb2::ErrorKind::SharingViolation));
+    }
+
+    #[tokio::test]
+    async fn a_transport_that_cannot_redial_is_not_wedged_by_a_blip() {
+        // The flag is a one-way door when the reconnect that clears it cannot
+        // run: `reconnect_if_needed` re-sets it on failure, so one transient
+        // timeout on a perfectly live tunnel would fail every operation from
+        // then on. There is nothing to reconnect, so there is nothing to owe.
+        let state = ReconnectState::never();
+        state.flag_if_lost(smb2::ErrorKind::ConnectionLost);
+
+        let outcome = state
+            .reconnect_if_needed(|| async { panic!("there is nothing to redial") })
+            .await;
+
+        assert!(matches!(outcome, Ok(false)), "no attempt, and no error");
     }
 
     #[tokio::test]

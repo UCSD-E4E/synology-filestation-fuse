@@ -130,3 +130,98 @@ async fn an_smb_session_starts_on_a_stream_we_were_handed() {
         .expect("the task finished")
         .is_err());
 }
+
+/// A stream shaped like the one this exists for.
+///
+/// `TunnelStream` keeps its in-flight `flush`/`shutdown` waits as boxed
+/// futures, and `dyn Future + Send` is `Send` and not `Sync` — so the tunnel's
+/// stream is `Send` and not `Sync` either. A `Sync` bound on [`SmbTransport::over`]
+/// therefore excluded the only caller it was written for, and nothing noticed,
+/// because nothing calls it yet. This mirrors that shape so the compiler
+/// notices instead.
+///
+/// The real proof lands when `synology-filestation-connect` hands a genuine
+/// `TunnelStream` to `over`; until then this stands in for it, here rather
+/// than in the tunnel's own crate because an SMB crate has no business
+/// depending on a VPN client.
+struct SendNotSync {
+    inner: DuplexStream,
+    #[allow(dead_code)]
+    waiting: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+}
+
+impl tokio::io::AsyncRead for SendNotSync {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for SendNotSync {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn a_stream_that_is_send_but_not_sync_is_accepted() {
+    // This test is about whether it compiles. Running it only shows the bound
+    // is not merely satisfiable in principle.
+    let (ours, mut theirs) = tokio::io::duplex(64 * 1024);
+    let ours = SendNotSync {
+        inner: ours,
+        waiting: None,
+    };
+
+    tokio::spawn(async move {
+        let first = take_frame(&mut theirs).await;
+        let mut cursor = ReadCursor::new(&first);
+        let header = Header::unpack(&mut cursor).expect("a real SMB2 header");
+        assert_eq!(header.command, Command::Negotiate);
+    });
+
+    let cfg = SmbConfig::new("nas.example", "user", "hunter2");
+    let attempt = tokio::time::timeout(Duration::from_secs(20), SmbTransport::over(ours, &cfg));
+
+    assert!(
+        attempt.await.expect("it does not hang").is_err(),
+        "nobody answered"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_still_needs_a_host_to_name_the_server() {
+    // `host` is not only where `connect` dials — it names the server on the
+    // wire. `cfg.addr()` always appends a port, so an empty one sails past the
+    // SMB client's own guard and surfaces as a malformed UNC path much later.
+    let (ours, _theirs) = tokio::io::duplex(64 * 1024);
+    let mut cfg = SmbConfig::new("", "user", "hunter2");
+    cfg.host = String::new();
+
+    let refused = tokio::time::timeout(Duration::from_secs(5), SmbTransport::over(ours, &cfg))
+        .await
+        .expect("refused before any of it is attempted");
+
+    assert!(refused.is_err());
+}
