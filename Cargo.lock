@@ -2605,13 +2605,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "wiremock",
  "zeroize",
 ]
 
 [[package]]
 name = "synology-filestation-core"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2645,7 +2646,7 @@ dependencies = [
 
 [[package]]
 name = "synology-filestation-fuse"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2709,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "synology_filestation"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
