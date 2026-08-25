@@ -57,20 +57,21 @@ impl Profile {
             let rest: Vec<&str> = words.collect();
 
             match (name, rest.as_slice()) {
-                ("remote", [host]) => remote = Some((*host).to_string()),
-                ("remote", [host, given]) => {
+                // `remote host`, `remote host port`, and `remote host port
+                // proto` are all written. The third form is common enough that
+                // failing it produced "no remote", which is true and useless.
+                ("remote", [host, rest @ ..]) => {
                     remote = Some((*host).to_string());
-                    port = given
-                        .parse()
-                        .map_err(|_| Error::BadProfile(line.to_string()))?;
-                }
-                ("proto", [protocol]) => {
-                    // TCP is a different framing, and this client speaks one
-                    // of them. Refusing beats connecting and going quiet.
-                    if !protocol.eq_ignore_ascii_case("udp") {
-                        return Err(Error::UnsupportedProfileOption(line.to_string()));
+                    if let Some(given) = rest.first() {
+                        port = given
+                            .parse()
+                            .map_err(|_| Error::BadProfile(line.to_string()))?;
+                    }
+                    if let Some(protocol) = rest.get(1) {
+                        require_udp(protocol, line)?;
                     }
                 }
+                ("proto", [protocol]) => require_udp(protocol, line)?,
                 ("key-direction", [direction]) => {
                     key_direction = match *direction {
                         "0" => KeyDirection::Normal,
@@ -79,9 +80,20 @@ impl Profile {
                     }
                 }
                 ("verify-x509-name", [name, ..]) => verify_name = Some((*name).to_string()),
-                ("cipher" | "data-ciphers", [name, ..]) => {
+                // `cipher` names one; `data-ciphers` is a colon-separated
+                // list of what the client will accept, and it only has to
+                // contain something we can speak.
+                ("cipher", [name, ..]) => {
                     if !name.eq_ignore_ascii_case(crate::SUPPORTED_CIPHER) {
                         return Err(Error::UnsupportedCipher((*name).to_string()));
+                    }
+                }
+                ("data-ciphers", [list, ..]) => {
+                    if !list
+                        .split(':')
+                        .any(|name| name.eq_ignore_ascii_case(crate::SUPPORTED_CIPHER))
+                    {
+                        return Err(Error::UnsupportedCipher((*list).to_string()));
                     }
                 }
                 // Compression changes the framing of every payload, and this
@@ -117,7 +129,12 @@ impl Profile {
             ca_pem,
             static_key,
             key_direction,
-            wants_credentials: directives(text).any(|line| line == "auth-user-pass"),
+            // With or without a file to read them from: either way the
+            // server is going to ask. Matching only the bare form meant a
+            // profile using `auth-user-pass credentials.txt` sent empty
+            // fields and got `AUTH_FAILED` back.
+            wants_credentials: directives(text)
+                .any(|line| line == "auth-user-pass" || line.starts_with("auth-user-pass ")),
         })
     }
 
@@ -133,6 +150,18 @@ impl Profile {
         config.tls_timeout = Duration::from_secs(2);
         Ok(config)
     }
+}
+
+/// UDP, in any of the spellings OpenVPN accepts for it.
+///
+/// TCP is a different framing and this client speaks one of them, so refusing
+/// beats connecting and then going quiet.
+fn require_udp(protocol: &str, line: &str) -> Result<(), Error> {
+    let protocol = protocol.to_ascii_lowercase();
+    if matches!(protocol.as_str(), "udp" | "udp4" | "udp6") {
+        return Ok(());
+    }
+    Err(Error::UnsupportedProfileOption(line.to_string()))
 }
 
 /// The directives, with comments and inline blocks left out.

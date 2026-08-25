@@ -199,3 +199,19 @@ fn a_pushed_ifconfig_under_either_topology_gives_the_right_prefix() {
         }
     );
 }
+
+#[test]
+fn being_told_not_to_time_out_is_not_the_same_as_being_told_nothing() {
+    // Both leave `ping_restart` empty, and only one of them means the caller's
+    // own deadline should stay out of the way.
+    let told = PushReply::parse("PUSH_REPLY,ping 10,ping-restart 0").expect("a reply");
+    assert!(told.ping_restart.is_none());
+    assert!(told.ping_restart_disabled, "the server said not to");
+
+    let silent = PushReply::parse("PUSH_REPLY,ping 10").expect("a reply");
+    assert!(silent.ping_restart.is_none());
+    assert!(
+        !silent.ping_restart_disabled,
+        "saying nothing asks nothing of us"
+    );
+}

@@ -289,10 +289,18 @@ impl Session {
     /// reasoning that a peer naming no limit had not promised to stay forever,
     /// and what it had actually done was agree to say nothing.
     pub fn peer_timeout(&self) -> Option<Duration> {
-        self.push
-            .as_ref()
-            .and_then(|reply| reply.ping_restart)
-            .or(self.peer_timeout)
+        if let Some(push) = self.push.as_ref() {
+            // The server said not to. That is an instruction rather than an
+            // absence, and overriding it with a local default would end a
+            // tunnel it had just promised to keep.
+            if push.ping_restart_disabled {
+                return None;
+            }
+            if let Some(limit) = push.ping_restart {
+                return Some(limit);
+            }
+        }
+        self.peer_timeout
     }
 
     /// What the server pushed, once it has.

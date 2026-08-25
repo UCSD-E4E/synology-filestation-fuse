@@ -776,3 +776,29 @@ fn a_restart_interval_of_zero_is_off_rather_than_immediate() {
         "and certainly not a deadline already past"
     );
 }
+
+#[test]
+fn a_server_that_says_never_time_out_outranks_a_local_deadline() {
+    // `ping-restart 0` is an instruction, not an absence, and the difference
+    // is the whole point of recording it separately. Folded into "the server
+    // said nothing", a caller's own deadline is reinstated over the top of it
+    // — and an idle tunnel the server had just promised to keep dies with
+    // `PeerGone` on a link where nothing was wrong.
+    let mut server = FakeServer::new(Answer::KeyMaterialThen(
+        "PUSH_REPLY,peer-id 4,ping 10,ping-restart 0".to_string(),
+    ));
+    let mut config = SessionConfig::new(
+        server.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.peer_timeout = Some(Duration::from_secs(30));
+    let mut session = Session::new(config).expect("a client");
+    exchange(&mut session, &mut server, Instant::now()).expect("a whole handshake");
+
+    assert_eq!(
+        session.peer_timeout(),
+        None,
+        "the peer that will do the timing out said not to"
+    );
+}

@@ -138,6 +138,29 @@ impl Drop for Tunnel {
     }
 }
 
+/// Whether a socket error is about this moment rather than about the tunnel.
+///
+/// The socket is `connect`ed, which is what lets the loop use `send`/`recv`
+/// without carrying the peer address around — and which also means the kernel
+/// reports ICMP back to us. A server that has not finished starting, a NAT
+/// that has forgotten the binding, a router that briefly has no route: each
+/// arrives as an error on the *next* operation, and each is exactly what the
+/// retransmission layer exists to ride out. Ending the tunnel on one turns a
+/// blip into a permanent failure.
+///
+/// All of these are delivered once, for one ICMP message, so treating them as
+/// non-fatal cannot spin: the following `recv` waits like any other. Errors
+/// that describe the socket itself — a bad descriptor, a lost binding — are
+/// not on this list and still end the loop.
+fn is_transient(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+
+    matches!(
+        error.kind(),
+        ConnectionRefused | ConnectionReset | HostUnreachable | NetworkUnreachable | TimedOut
+    )
+}
+
 /// The loop.
 async fn run(
     socket: UdpSocket,
@@ -160,6 +183,11 @@ async fn run(
                 break;
             };
             if let Err(error) = socket.send(&datagram).await {
+                // A link that cannot carry this datagram now. The layer above
+                // will send it again.
+                if is_transient(&error) {
+                    continue;
+                }
                 let error = Error::Io(error.to_string());
                 break_with(&mut ready, error.clone());
                 return finish(failure, error);
@@ -233,6 +261,9 @@ async fn run(
                         }
                     }
                 }
+                // Something the socket reports once and recovers from,
+                // rather than a reason to end the tunnel.
+                Err(error) if is_transient(&error) => {}
                 Err(error) => break Error::Io(error.to_string()),
             },
 
@@ -240,7 +271,12 @@ async fn run(
                 Some(payload) => match session.send_payload(Instant::now(), &payload) {
                     Ok(datagram) => {
                         if let Err(error) = socket.send(&datagram).await {
-                            break Error::Io(error.to_string());
+                            if !is_transient(&error) {
+                                break Error::Io(error.to_string());
+                            }
+                            // Dropped, as a link drops what it cannot carry.
+                            // What sits above this tunnel is TCP, and TCP's
+                            // answer to a lost segment is to send it again.
                         }
                     }
                     Err(error) if error.is_fatal() => break error,

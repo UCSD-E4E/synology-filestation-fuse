@@ -228,3 +228,85 @@ fn a_profile_becomes_a_session_configuration() {
         "the NAS asks for no client certificate"
     );
 }
+
+#[test]
+fn a_remote_may_name_its_protocol_as_well_as_its_port() {
+    // `remote host port proto` is the third form OpenVPN writes, and it used
+    // to match no arm at all — so a perfectly ordinary profile failed with
+    // "no remote", which is true and tells the user nothing.
+    let text = published_profile().replace(
+        "remote e4e-nas.ucsd.edu 1194",
+        "remote e4e-nas.ucsd.edu 1194 udp",
+    );
+
+    let profile = Profile::parse(&text).expect("a remote with its protocol spelled out");
+    assert_eq!(profile.remote, "e4e-nas.ucsd.edu");
+    assert_eq!(profile.port, 1194);
+}
+
+#[test]
+fn a_remote_naming_tcp_is_refused_like_any_other_tcp_profile() {
+    let text = published_profile().replace(
+        "remote e4e-nas.ucsd.edu 1194",
+        "remote e4e-nas.ucsd.edu 1194 tcp",
+    );
+
+    assert!(matches!(
+        Profile::parse(&text),
+        Err(Error::UnsupportedProfileOption(_))
+    ));
+}
+
+#[test]
+fn udp_pinned_to_one_address_family_is_still_udp() {
+    // `udp4` and `udp6` say which family to resolve to, not which transport to
+    // speak. Refusing them as an unsupported protocol refuses a file we can
+    // carry out perfectly well.
+    for spelling in ["udp4", "udp6"] {
+        let text = published_profile().replace("proto udp", &format!("proto {spelling}"));
+        assert!(
+            Profile::parse(&text).is_ok(),
+            "{spelling} is a family, not a transport"
+        );
+    }
+}
+
+#[test]
+fn a_cipher_list_only_has_to_contain_one_we_speak() {
+    // `data-ciphers` is a colon-separated list of what the client will accept,
+    // and the standard one leads with the AEAD ciphers. Compared whole against
+    // a single name it matches nothing, so the profile is refused for offering
+    // us more choices than we needed.
+    let text = published_profile().replace(
+        "cipher AES-256-CBC",
+        "data-ciphers AES-256-GCM:AES-128-GCM:AES-256-CBC",
+    );
+
+    assert!(Profile::parse(&text).is_ok(), "AES-256-CBC is on the list");
+}
+
+#[test]
+fn a_cipher_list_with_nothing_we_speak_is_still_refused() {
+    let text = published_profile().replace(
+        "cipher AES-256-CBC",
+        "data-ciphers AES-256-GCM:CHACHA20-POLY1305",
+    );
+
+    assert!(matches!(
+        Profile::parse(&text),
+        Err(Error::UnsupportedCipher(_))
+    ));
+}
+
+#[test]
+fn credentials_kept_in_a_file_are_still_credentials() {
+    // `auth-user-pass <file>` asks for the same thing as the bare form. Read
+    // as "no credentials wanted", the session sends two empty fields and the
+    // server answers `AUTH_FAILED` — a password problem that is not one.
+    let text = published_profile().replace("auth-user-pass", "auth-user-pass credentials.txt");
+
+    assert!(
+        Profile::parse(&text).expect("valid").wants_credentials,
+        "the file is where they are, not whether they are wanted"
+    );
+}

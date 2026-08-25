@@ -50,6 +50,12 @@ pub struct PushReply {
     pub ping: Option<Duration>,
     /// How long the server will wait before concluding we have gone.
     pub ping_restart: Option<Duration>,
+    /// Whether the server said not to time out at all.
+    ///
+    /// Distinct from having said nothing: `ping-restart 0` is an instruction,
+    /// and a local default that overrode it would end a tunnel the server had
+    /// just promised to keep.
+    pub ping_restart_disabled: bool,
     /// A compression directive, if the server pushed one.
     ///
     /// Compression is not a detail of the payload — it prepends a byte to
@@ -117,12 +123,10 @@ impl PushReply {
                 // Zero is off, the same way it is for `ping`. Taken
                 // literally it is a deadline that has already passed, and the
                 // tunnel is torn down the moment the reply is read.
-                ("ping-restart", [seconds]) => {
-                    parsed.ping_restart = match seconds_from(seconds, directive)? {
-                        zero if zero.is_zero() => None,
-                        limit => Some(limit),
-                    }
-                }
+                ("ping-restart", [seconds]) => match seconds_from(seconds, directive)? {
+                    zero if zero.is_zero() => parsed.ping_restart_disabled = true,
+                    limit => parsed.ping_restart = Some(limit),
+                },
                 // Routes, DNS, compression settings and whatever else a server
                 // chooses to say. Kept in `directives` and otherwise ignored:
                 // this tunnel ends inside one process and carries one
