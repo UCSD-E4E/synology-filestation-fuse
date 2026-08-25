@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.4.2...synology-filestation-fuse-v0.4.3) (2026-08-25)
+
+
+### Bug Fixes
+
+* a disconnect that finishes, and frees the mountpoint ([02956dd](https://github.com/UCSD-E4E/synology-filestation/commit/02956ddf367b6108e5866bc2235d87831fb317f7))
+* **fuse:** free the mountpoint without needing sudo ([aca4973](https://github.com/UCSD-E4E/synology-filestation/commit/aca4973642e25cb74bfff27a9a3cedfb96d4637d))
+
 ## [0.4.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.4.1...synology-filestation-fuse-v0.4.2) (2026-08-25)
 
 
