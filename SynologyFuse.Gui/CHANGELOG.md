@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.4.2...synology-filestation-gui-v0.4.3) (2026-08-25)
+
+
+### Bug Fixes
+
+* a disconnect that finishes, and frees the mountpoint ([02956dd](https://github.com/UCSD-E4E/synology-filestation/commit/02956ddf367b6108e5866bc2235d87831fb317f7))
+* **connect:** say when the tunnel was tried and did not reach SMB ([7e6d200](https://github.com/UCSD-E4E/synology-filestation/commit/7e6d2000923f6b5a448263f92d59b628a33c3df1))
+* **connect:** say when the tunnel was tried and did not reach SMB ([da512d0](https://github.com/UCSD-E4E/synology-filestation/commit/da512d0f2530b6051388dddf2b0833f0fe387bd1))
+* **fuse:** free the mountpoint without needing sudo ([aca4973](https://github.com/UCSD-E4E/synology-filestation/commit/aca4973642e25cb74bfff27a9a3cedfb96d4637d))
+* stop a debug-level session drowning the log pane and the window ([25f7cc4](https://github.com/UCSD-E4E/synology-filestation/commit/25f7cc4b4e4e258ed17a2a7644bd41464164e24d))
+* stop a debug-level session drowning the log pane and the window ([a6eb6f5](https://github.com/UCSD-E4E/synology-filestation/commit/a6eb6f56ddd4368fe39afee7de2a45b57f1490b0))
+
 ## [0.4.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.4.1...synology-filestation-gui-v0.4.2) (2026-08-25)
 
 
