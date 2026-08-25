@@ -2633,6 +2633,7 @@ name = "synology-filestation-ffi"
 version = "0.1.19"
 dependencies = [
  "serde_json",
+ "synology-filestation-connect",
  "synology-filestation-core",
  "synology-filestation-fuse",
  "synology-filestation-smb",

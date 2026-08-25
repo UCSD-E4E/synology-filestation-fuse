@@ -19,16 +19,34 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use synology_filestation_connect::{
+    profile::ProfileSource, Chain, Endpoints, NoTunnel, OpenVpnTunnel, SmbRoute, TcpProber,
+    Transport, TransportPolicy, Tunnel, DEFAULT_RECHECK,
+};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::SynoFileInfo;
 use synology_filestation_core::ThrottleConfig;
 use synology_filestation_fuse::{is_otp_required, spawn_mount, MountOptions};
+use synology_filestation_smb::{SmbConfig, SmbTransport};
 use tokio::runtime::Runtime;
+use tracing::{info, warn};
 
 mod logging;
 
 const DOWNLOAD_CHUNK: u64 = 4 * 1024 * 1024;
+
+/// Where the profile lives on the NAS when the caller does not say.
+const DEFAULT_VPN_PROFILE: &str = "/installers/e4e-nas-vpn.ovpn";
+
+/// How long the whole tunnel attempt may take, handshake included.
+const VPN_PATIENCE: Duration = Duration::from_secs(30);
+
+/// How long to wait for SMB to answer before deciding it does not.
+///
+/// Short: this runs while somebody watches a spinner, and being wrong costs
+/// them the HTTP path rather than the connection.
+const SMB_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ─── Status / error reporting ────────────────────────────────────────────────
 
@@ -230,6 +248,181 @@ unsafe fn emit_json(out: *mut *mut c_char, value: &serde_json::Value, err: *mut 
 pub struct SynoClient {
     inner: Arc<SynologyClient>,
     runtime: Arc<Runtime>,
+    /// Which leg this connection ended up on, for [`syno_transport`].
+    transport: SynoTransport,
+}
+
+/// Which leg a connection is using, as the GUI's badge shows it.
+///
+/// Ordered worst to best deliberately, so a consumer can compare them without
+/// knowing what any of them mean.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SynoTransport {
+    /// The HTTP FileStation API: works from anywhere the DSM port is open, and
+    /// cannot resume an interrupted transfer.
+    Https = 0,
+    /// SMB through a tunnel this process raised.
+    SmbOverVpn = 1,
+    /// SMB straight to the appliance.
+    SmbDirect = 2,
+}
+
+impl From<Transport> for SynoTransport {
+    fn from(transport: Transport) -> Self {
+        match transport {
+            Transport::Https => Self::Https,
+            Transport::SmbOverVpn => Self::SmbOverVpn,
+            Transport::SmbDirect => Self::SmbDirect,
+        }
+    }
+}
+
+/// Which leg `client` is using: 0 HTTP, 1 SMB through a tunnel, 2 SMB direct.
+///
+/// `-1` for a null handle. Settled at connect time and does not change for the
+/// life of the handle, so a consumer can read it once and show it.
+///
+/// # Safety
+/// `client` must be a handle from `syno_connect`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn syno_transport(client: *const SynoClient) -> i32 {
+    match client.as_ref() {
+        Some(client) => client.transport as i32,
+        None => -1,
+    }
+}
+
+/// Everything the chain needs that the caller supplied.
+struct Reachable<'a> {
+    host: &'a str,
+    username: &'a str,
+    password: &'a str,
+    smb_domain: Option<&'a str>,
+    /// Where the OpenVPN profile is kept, if an escalation is allowed at all.
+    vpn_profile: Option<&'a str>,
+    /// The NAS's address inside that tunnel, which its public name does not
+    /// resolve to — the tunnel pushes no DNS.
+    vpn_host: Option<&'a str>,
+    /// Where that profile lives on the NAS, for when it has to be fetched.
+    vpn_profile_remote: &'a str,
+}
+
+/// Put SMB in front of the HTTP client if SMB can be reached.
+///
+/// The same three legs the CLI has, in the same order, deciding the same way:
+/// this consumer had its own shortened version that only ever tried SMB at the
+/// public host, so a NAS reachable only through a tunnel was invisible to it.
+async fn reach(client: SynologyClient, settings: Reachable<'_>) -> (SynologyClient, SynoTransport) {
+    // Fetched before anything asks for a tunnel, over the session just
+    // authenticated. That is the point of fetching rather than shipping it:
+    // somebody off campus with no tunnel can still get the file that gives them
+    // one — which the settings field promises and nothing was doing.
+    if let Some(local) = settings.vpn_profile {
+        let source = ProfileSource {
+            remote: settings.vpn_profile_remote.to_string(),
+            local: PathBuf::from(local),
+        };
+        if let Err(e) = source.ensure(&client).await {
+            warn!("VPN profile: {e}; the tunnel leg will not be available");
+        }
+    }
+
+    let endpoints = match settings.vpn_host {
+        Some(inside) => Endpoints::with_tunnel(settings.host, inside),
+        None => {
+            // A profile with nowhere to land is a setting half-filled in.
+            // Raising the tunnel would still leave no address to reach the NAS
+            // at, so the escalation is skipped — and said out loud, because
+            // from the outside it looks exactly like a tunnel that failed.
+            if settings.vpn_profile.is_some() {
+                warn!(
+                    "Transport: a VPN profile is set but no in-tunnel address, so the tunnel \
+                     cannot be used. The NAS answers at a private address inside it, which its \
+                     public name does not resolve to."
+                );
+            }
+            Endpoints::public_only(settings.host)
+        }
+    };
+    let tunnel: Box<dyn Tunnel> = match settings.vpn_profile {
+        Some(profile) => Box::new(OpenVpnTunnel::new(
+            profile,
+            settings.username,
+            settings.password,
+            VPN_PATIENCE,
+        )),
+        None => Box::new(NoTunnel),
+    };
+    let chain = Chain::new(
+        TransportPolicy::default(),
+        endpoints,
+        Box::new(TcpProber::new(SMB_PROBE_TIMEOUT)),
+        tunnel,
+        DEFAULT_RECHECK,
+    );
+
+    match chain.reach_smb().await {
+        Ok(SmbRoute::Direct { host }) => {
+            // Reachable is not the same as usable: the port answers, and the
+            // session on top of it can still be refused — which is exactly what
+            // an AD account with no domain does. Reporting `SmbDirect` on the
+            // strength of the probe would put "SMB" on the badge while every
+            // transfer went over HTTP, which is the bug this whole change
+            // exists to stop happening quietly.
+            match synology_filestation_smb::auto_connect_as(
+                &host,
+                settings.username,
+                settings.password,
+                settings.smb_domain,
+            )
+            .await
+            {
+                Some(smb) => {
+                    info!("Transport: SMB, direct to {host}");
+                    (
+                        synology_filestation_smb::attach(client, smb),
+                        SynoTransport::SmbDirect,
+                    )
+                }
+                None => {
+                    warn!(
+                        "Transport: {host} answers on 445 but the SMB session was refused; \
+                         using the HTTP API. An AD account needs its domain set."
+                    );
+                    (client, SynoTransport::Https)
+                }
+            }
+        }
+        Ok(SmbRoute::Tunnelled { host, connection }) => {
+            info!("Transport: SMB, through a tunnel to {host}");
+            let mut cfg = SmbConfig::new(&host, settings.username, settings.password);
+            cfg.domain = settings.smb_domain.unwrap_or_default().to_string();
+            match SmbTransport::over(connection, &cfg).await {
+                Ok(smb) => (
+                    synology_filestation_smb::attach(client, Arc::new(smb)),
+                    SynoTransport::SmbOverVpn,
+                ),
+                // The tunnel carried a connection and SMB behind it would not
+                // talk. Not a reason to fail the connection: HTTP is there, and
+                // which of the two failed is what a user needs to know.
+                Err(e) => {
+                    warn!("SMB through the tunnel: {e}; using the HTTP API");
+                    (client, SynoTransport::Https)
+                }
+            }
+        }
+        Ok(SmbRoute::Unavailable) => {
+            info!("Transport: the HTTP API");
+            (client, SynoTransport::Https)
+        }
+        // Every leg forbidden is a configuration this consumer cannot produce,
+        // since it never disables any of them.
+        Err(e) => {
+            warn!("Transport: no leg is available ({e}); using the HTTP API");
+            (client, SynoTransport::Https)
+        }
+    }
 }
 
 /// Opaque live-mount handle.
@@ -262,6 +455,19 @@ pub unsafe extern "C" fn syno_connect(
     // so the GUI exposes this as a per-connection checkbox — but it makes the
     // connection encrypted without being authenticated, so it is opt-in.
     verify_ssl: bool,
+    // The NetBIOS domain SMB authenticates in — `KRG` for an AD account, null
+    // for a local DSM user. Without it an AD account is checked against the
+    // appliance's own accounts, fails, and SMB is silently skipped: the reason
+    // this consumer has been on the HTTP path even on campus.
+    smb_domain: *const c_char,
+    // Where the OpenVPN profile is kept, and where the NAS answers inside the
+    // tunnel it describes. Both null means no escalation is possible, and a
+    // NAS that does not answer directly is reached over HTTP as before.
+    vpn_profile: *const c_char,
+    vpn_host: *const c_char,
+    // Where that profile lives on the NAS, when it is not on disk yet. Null for
+    // the published location.
+    vpn_profile_remote: *const c_char,
     out: *mut *mut SynoClient,
     err: *mut SynoError,
 ) -> i32 {
@@ -279,6 +485,10 @@ pub unsafe extern "C" fn syno_connect(
             Err(c) => return c,
         };
         let otp = opt_str(otp);
+        let smb_domain = opt_str(smb_domain);
+        let vpn_profile = opt_str(vpn_profile);
+        let vpn_host = opt_str(vpn_host);
+        let vpn_profile_remote = opt_str(vpn_profile_remote).unwrap_or(DEFAULT_VPN_PROFILE);
         if out.is_null() {
             return set_err(err, SynoStatus::NullArg, 0, "out pointer must not be null");
         }
@@ -346,15 +556,28 @@ pub unsafe extern "C" fn syno_connect(
                         )
                     }
                 };
-                // Transparently prefer SMB for transfers when reachable (the GUI
-                // browser's downloads, and a GUI-initiated mount, then bypass
-                // synoscgi); silently HTTP-only otherwise.
-                let client = runtime.block_on(synology_filestation_smb::auto_attach(
-                    client, host, username, password,
+                // Which leg reaches the NAS, decided the same way the CLI
+                // decides it: SMB directly, SMB through a tunnel this process
+                // raises, or the HTTP API. The GUI's downloads and a
+                // GUI-initiated mount both ride whatever this attaches, so the
+                // choice is worth logging — the log pane is where a user finds
+                // out they are on the slow path.
+                let (client, transport) = runtime.block_on(reach(
+                    client,
+                    Reachable {
+                        host,
+                        username,
+                        password,
+                        smb_domain,
+                        vpn_profile,
+                        vpn_host,
+                        vpn_profile_remote,
+                    },
                 ));
                 let handle = Box::new(SynoClient {
                     inner: Arc::new(client),
                     runtime,
+                    transport,
                 });
                 *out = Box::into_raw(handle);
                 SynoStatus::Ok as i32
@@ -965,6 +1188,12 @@ mod tests {
                 ptr::null(),
                 false,
                 true,
+                // No SMB domain and no tunnel: these exercise the login path,
+                // and SMB is not reachable from a wiremock server anyway.
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
                 &mut client,
                 &mut err,
             );
@@ -1012,6 +1241,12 @@ mod tests {
                 ptr::null(),
                 false,
                 true,
+                // No SMB domain and no tunnel: these exercise the login path,
+                // and SMB is not reachable from a wiremock server anyway.
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
                 &mut client,
                 &mut err,
             );
@@ -1048,6 +1283,12 @@ mod tests {
                 ptr::null(),
                 false,
                 true,
+                // No SMB domain and no tunnel: these exercise the login path,
+                // and SMB is not reachable from a wiremock server anyway.
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
                 &mut client,
                 &mut err,
             );
@@ -1090,6 +1331,12 @@ mod tests {
                 ptr::null(),
                 false,
                 true,
+                // No SMB domain and no tunnel: these exercise the login path,
+                // and SMB is not reachable from a wiremock server anyway.
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
                 &mut client,
                 &mut err,
             );
@@ -1115,5 +1362,53 @@ mod tests {
             assert_eq!(rc, SynoStatus::NullArg as i32);
             syno_string_free(err.message);
         }
+    }
+
+    /// An address in TEST-NET-1 (RFC 5737), which is guaranteed to answer
+    /// nothing — so the probe below fails for the reason the test is about
+    /// rather than because of whatever the machine running it happens to have
+    /// listening on 445.
+    const NOWHERE: &str = "192.0.2.1";
+
+    #[tokio::test]
+    async fn a_nas_that_answers_nothing_falls_to_http_and_says_so() {
+        // The consumer never disables a leg, so this is the only way it reaches
+        // the HTTP path: SMB unreachable, and no profile with which to escalate.
+        let client = SynologyClient::new(NOWHERE, 5001, true);
+
+        let (_client, transport) = reach(
+            client,
+            Reachable {
+                host: NOWHERE,
+                // Empty, because nothing here authenticates: the probe fails
+                // before any credential is used. A literal pair in a test is
+                // also exactly what a secret scanner is built to notice, and it
+                // is right to — so the fix is not to write one.
+                username: "",
+                password: "",
+                smb_domain: Some("KRG"),
+                vpn_profile: None,
+                vpn_host: None,
+                vpn_profile_remote: DEFAULT_VPN_PROFILE,
+            },
+        )
+        .await;
+
+        assert_eq!(transport, SynoTransport::Https);
+    }
+
+    #[test]
+    fn a_handle_that_is_not_there_reports_no_transport() {
+        // The GUI asks this of whatever it holds; a null is the answer to "you
+        // have not connected", not a reason to read through it.
+        assert_eq!(unsafe { syno_transport(std::ptr::null()) }, -1);
+    }
+
+    #[test]
+    fn the_legs_are_ordered_worst_to_best() {
+        // The C ABI promises this so a badge can compare them without knowing
+        // what any of them mean.
+        assert!(SynoTransport::Https < SynoTransport::SmbOverVpn);
+        assert!(SynoTransport::SmbOverVpn < SynoTransport::SmbDirect);
     }
 }

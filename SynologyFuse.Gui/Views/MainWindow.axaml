@@ -16,14 +16,34 @@
     <Border DockPanel.Dock="Bottom"
             Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}"
             Padding="12,6">
-      <Grid ColumnDefinitions="*,Auto">
+      <Grid ColumnDefinitions="*,Auto,Auto">
         <TextBlock Grid.Column="0"
                    Text="{Binding StatusText}"
                    FontSize="12"
+                   VerticalAlignment="Center"
                    Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" />
-        <TextBlock Grid.Column="1"
+
+        <!-- How the NAS is being reached. The difference between these is the
+             difference between a transfer that resumes where it stopped and one
+             that starts again, and nothing else in the UI says which you got.
+             Hidden until something has connected, so it never shows a guess. -->
+        <Border Grid.Column="1"
+                IsVisible="{Binding HasTransport}"
+                Background="{DynamicResource SystemControlBackgroundBaseLowBrush}"
+                CornerRadius="3"
+                Padding="7,2"
+                Margin="0,0,10,0"
+                ToolTip.Tip="{Binding TransportDetail}">
+          <TextBlock Text="{Binding TransportBadge}"
+                     FontSize="11"
+                     FontWeight="SemiBold"
+                     Foreground="{DynamicResource SystemControlForegroundBaseHighBrush}" />
+        </Border>
+
+        <TextBlock Grid.Column="2"
                    Text="{Binding Version}"
                    FontSize="12"
+                   VerticalAlignment="Center"
                    Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}" />
       </Grid>
     </Border>
@@ -188,6 +208,57 @@
           <TextBox   Grid.Column="1" Text="{Binding Mountpoint}"
                      PlaceholderText="/mnt/nas  •  /Volumes/nas  •  Z:\"
                      IsEnabled="{Binding IsDisconnected}" />
+        </Grid>
+
+        <!-- How the NAS is reached. Both of these decide whether transfers go
+             over SMB or fall back to the slower FileStation API, and neither is
+             discoverable from anywhere else. -->
+        <TextBlock Text="Access"
+                   FontWeight="SemiBold"
+                   FontSize="14"
+                   Margin="0,12,0,4" />
+
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+          <TextBlock Grid.Column="0" Text="SMB domain" VerticalAlignment="Center" />
+          <StackPanel Grid.Column="1">
+            <TextBox Text="{Binding SmbDomain}"
+                     PlaceholderText="KRG  •  leave empty for a local DSM user"
+                     IsEnabled="{Binding IsDisconnected}" />
+            <TextBlock Text="An Active Directory account needs its domain here. Without it SMB cannot authenticate and transfers quietly use the slower FileStation API instead."
+                       TextWrapping="Wrap"
+                       FontSize="11"
+                       Opacity="0.7"
+                       Margin="0,2,0,0" />
+          </StackPanel>
+        </Grid>
+
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6">
+          <TextBlock Grid.Column="0" Text="VPN profile" VerticalAlignment="Center" />
+          <StackPanel Grid.Column="1">
+            <TextBox Text="{Binding VpnProfile}"
+                     PlaceholderText="path to an .ovpn file  •  optional"
+                     IsEnabled="{Binding IsDisconnected}" />
+            <TextBlock Text="For reaching the NAS from outside its network. The tunnel is raised inside this application — nothing is installed, and nothing else on the machine is affected. Downloaded from the NAS if the file is not there yet."
+                       TextWrapping="Wrap"
+                       FontSize="11"
+                       Opacity="0.7"
+                       Margin="0,2,0,0" />
+          </StackPanel>
+        </Grid>
+
+        <Grid ColumnDefinitions="130,*" Margin="0,0,0,6"
+              IsVisible="{Binding VpnProfile, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+          <TextBlock Grid.Column="0" Text="NAS address in VPN" VerticalAlignment="Center" />
+          <StackPanel Grid.Column="1">
+            <TextBox Text="{Binding VpnHost}"
+                     PlaceholderText="10.90.24.1"
+                     IsEnabled="{Binding IsDisconnected}" />
+            <TextBlock Text="The address the NAS answers on inside the tunnel. It differs from the name above because the tunnel carries no DNS."
+                       TextWrapping="Wrap"
+                       FontSize="11"
+                       Opacity="0.7"
+                       Margin="0,2,0,0" />
+          </StackPanel>
         </Grid>
 
         <!-- Advanced section -->

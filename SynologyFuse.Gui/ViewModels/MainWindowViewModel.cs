@@ -35,6 +35,9 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _cacheTtl = s.CacheTtl;
         _readCacheMb = s.ReadCacheMb;
         _logLevel = s.LogLevel;
+        _smbDomain = s.SmbDomain;
+        _vpnProfile = s.VpnProfile;
+        _vpnHost = s.VpnHost;
 
         _mountService.OutputReceived += OnOutput;
 
@@ -100,6 +103,23 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private string _logLevel = "info"; // overwritten by constructor; default satisfies nullable analysis
 
+    /// <summary>NetBIOS domain for SMB — `KRG` for an AD account, empty for a
+    /// local DSM user. Empty against an AD account is why a connection ends up
+    /// on the slower HTTP path without saying so.</summary>
+    [ObservableProperty]
+    private string _smbDomain = "";
+
+    /// <summary>Where the OpenVPN profile is kept. With one, a NAS that does
+    /// not answer directly is reached through a tunnel raised inside this
+    /// process. Fetched from the NAS if the file is not there.</summary>
+    [ObservableProperty]
+    private string _vpnProfile = "";
+
+    /// <summary>The NAS's address inside that tunnel, which its public name
+    /// does not resolve to.</summary>
+    [ObservableProperty]
+    private string _vpnHost = "";
+
     public IReadOnlyList<string> LogLevels { get; } =
         ["error", "warn", "info", "debug", "trace"];
 
@@ -127,6 +147,23 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 
     [ObservableProperty]
     private string _statusText = "Disconnected";
+
+    /// <summary>Which leg the connection reached the NAS by.
+    ///
+    /// Shown as a badge, because the difference between these is the difference
+    /// between a transfer that resumes where it stopped and one that starts
+    /// again — and until now nothing told anyone which they had.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(TransportBadge))]
+    [NotifyPropertyChangedFor(nameof(TransportDetail))]
+    [NotifyPropertyChangedFor(nameof(HasTransport))]
+    private SynoTransport _transport = SynoTransport.Unknown;
+
+    public bool HasTransport => Transport != SynoTransport.Unknown;
+
+    public string TransportBadge => TransportPresenter.Badge(Transport);
+
+    public string TransportDetail => TransportPresenter.Detail(Transport);
 
     [ObservableProperty]
     private string _logOutput = "";
@@ -216,16 +253,18 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
             if (action == PendingAction.Test)
             {
                 await _mountService.TestConnectionAsync(config, otp);
+                Transport = _mountService.Transport;
                 StatusText = "Connection OK";
-                AppendLog("Connection succeeded.");
+                AppendLog($"Connection succeeded, using {TransportBadge}.");
                 _pending = PendingAction.None;
             }
             else
             {
                 await _mountService.ConnectAndMountAsync(config, otp);
+                Transport = _mountService.Transport;
                 IsConnected = true;
                 StatusText = $"Volume ready at {config.Mountpoint}";
-                AppendLog("Volume ready.");
+                AppendLog($"Volume ready, using {TransportBadge}.");
                 _pending = PendingAction.None;
             }
         }
@@ -269,6 +308,10 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
             // joining the background worker — keep it off the UI thread.
             await Task.Run(() => _mountService.Stop());
             IsConnected = false;
+            // Nothing is being reached any more, so the badge goes with it: a
+            // "SMB" next to "Disconnected" is a guess about a connection that
+            // no longer exists, and the next one may not get the same leg.
+            Transport = SynoTransport.Unknown;
             StatusText = "Disconnected";
             AppendLog("Volume closed.");
         }
@@ -320,6 +363,9 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         CacheTtl = (ulong)CacheTtl,
         ReadCacheMb = (ulong)ReadCacheMb,
         LogLevel = LogLevel,
+        SmbDomain = SmbDomain,
+        VpnProfile = VpnProfile,
+        VpnHost = VpnHost,
     };
 
     private void PersistSettings() => SettingsService.Save(new PersistedSettings
@@ -333,6 +379,9 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         CacheTtl = CacheTtl,
         ReadCacheMb = ReadCacheMb,
         LogLevel = LogLevel,
+        SmbDomain = SmbDomain,
+        VpnProfile = VpnProfile,
+        VpnHost = VpnHost,
     });
 
     // ── Event handlers ────────────────────────────────────────────────────────

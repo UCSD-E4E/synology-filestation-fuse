@@ -41,17 +41,32 @@ public sealed class SynoClient : IDisposable
     /// for a self-signed DSM certificate — the connection is then encrypted but
     /// not authenticated. Throws <see cref="TlsVerificationException"/> when
     /// verification is on and the certificate is rejected.</param>
+    /// <param name="smbDomain">NetBIOS domain SMB authenticates in — `KRG` for
+    /// an AD account, null for a local DSM user. Without it an AD account is
+    /// checked against the appliance's own accounts, fails, and SMB is silently
+    /// skipped in favour of the slower HTTP path.</param>
+    /// <param name="vpnProfile">Where the OpenVPN profile is kept. Given it, a
+    /// NAS that does not answer directly is reached through a tunnel raised
+    /// inside this process — no tun device and no privileged helper. Fetched
+    /// from the NAS if the file is not there.</param>
+    /// <param name="vpnHost">The NAS's address inside that tunnel, which its
+    /// public name does not resolve to.</param>
     public static SynoClient Connect(
         string host, ushort port, bool https, string username, string password,
-        string? otp = null, bool autoRelogin = true, bool verifySsl = true)
+        string? otp = null, bool autoRelogin = true, bool verifySsl = true,
+        string? smbDomain = null, string? vpnProfile = null, string? vpnHost = null,
+        string? vpnProfileRemote = null)
     {
         NativeMethods.EnsureResolver();
         var err = default(NativeError);
         int rc = syno_connect(host, port, https, username, password, otp, autoRelogin,
-            verifySsl, out var handle, ref err);
+            verifySsl, smbDomain, vpnProfile, vpnHost, vpnProfileRemote, out var handle, ref err);
         Check(rc, ref err);
         return new SynoClient(handle);
     }
+
+    /// <summary>Which leg this connection is using. Settled when it was made.</summary>
+    public SynoTransport Transport => (SynoTransport)syno_transport(_client);
 
     // ── Browse ─────────────────────────────────────────────────────────────────
 

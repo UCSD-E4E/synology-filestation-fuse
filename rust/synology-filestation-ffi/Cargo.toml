@@ -13,6 +13,9 @@ crate-type = ["cdylib"]
 [dependencies]
 synology-filestation-core = { path = "../synology-filestation-core" }
 synology-filestation-smb = { path = "../synology-filestation-smb" }
+# The same three legs the CLI has: this consumer used to try SMB at the public
+# host and nothing else, so a NAS reachable only through a tunnel was invisible.
+synology-filestation-connect = { path = "../synology-filestation-connect" }
 synology-filestation-fuse = { path = "../synology-filestation-fuse" }
 
 tokio       = { version = "1", features = ["rt", "rt-multi-thread"] }

@@ -31,6 +31,19 @@ public sealed class MountService : IDisposable
 
     public bool IsMounted => _client is { IsMounted: true };
 
+    /// <summary>Which leg the last connection reached the NAS by.
+    ///
+    /// <see cref="SynoTransport.Unknown"/> until something has connected. Worth
+    /// showing: the difference between SMB and the HTTP API is the difference
+    /// between a transfer that resumes where it stopped and one that starts
+    /// again, and nothing else tells a user which they got.</summary>
+    public SynoTransport Transport { get; private set; } = SynoTransport.Unknown;
+
+    /// <summary>An empty setting means "not set", which the native side spells
+    /// null. A blank string would be a domain of "" and a profile path of "".</summary>
+    internal static string? Blank(string value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value;
+
     /// <summary>
     /// Connect and mount in one step. Throws <see cref="OtpRequiredException"/>
     /// when the account needs a 2FA code (prompt and retry with
@@ -48,7 +61,10 @@ public sealed class MountService : IDisposable
         {
             var c = SynoClient.Connect(
                 config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
-                autoRelogin: true, verifySsl: config.VerifySsl);
+                autoRelogin: true, verifySsl: config.VerifySsl,
+                smbDomain: Blank(config.SmbDomain),
+                vpnProfile: Blank(ExpandPath(config.VpnProfile)),
+                vpnHost: Blank(config.VpnHost));
             try
             {
                 c.Mount(mountpoint, config.CacheTtl, config.ReadCacheMb);
@@ -78,6 +94,7 @@ public sealed class MountService : IDisposable
             return;
         }
         _client = client;
+        Transport = client.Transport;
     }
 
     /// <summary>
@@ -91,7 +108,11 @@ public sealed class MountService : IDisposable
         {
             using var client = SynoClient.Connect(
                 config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
-                autoRelogin: true, verifySsl: config.VerifySsl);
+                autoRelogin: true, verifySsl: config.VerifySsl,
+                smbDomain: Blank(config.SmbDomain),
+                vpnProfile: Blank(ExpandPath(config.VpnProfile)),
+                vpnHost: Blank(config.VpnHost));
+            Transport = client.Transport;
             // Dispose logs out immediately; reaching here means success.
         });
     }

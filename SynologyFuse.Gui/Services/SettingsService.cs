@@ -25,6 +25,17 @@ public sealed class PersistedSettings
     public decimal CacheTtl { get; set; } = 30;
     public decimal ReadCacheMb { get; set; } = 256;
     public string LogLevel { get; set; } = "info";
+
+    /// <summary>NetBIOS domain for SMB (`KRG` for an AD account). Empty for a
+    /// local DSM user.</summary>
+    public string SmbDomain { get; set; } = "";
+
+    /// <summary>Where the OpenVPN profile is kept, if the NAS should be reached
+    /// through a tunnel when it does not answer directly.</summary>
+    public string VpnProfile { get; set; } = "";
+
+    /// <summary>The NAS's address inside that tunnel.</summary>
+    public string VpnHost { get; set; } = "";
 }
 
 public static class SettingsService
