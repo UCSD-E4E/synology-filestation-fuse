@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.4.1...synology-filestation-fuse-v0.4.2) (2026-08-25)
+
+
+### Bug Fixes
+
+* **vpn:** send the tunnel a domain-qualified login name ([31dc296](https://github.com/UCSD-E4E/synology-filestation/commit/31dc2962420cd042d3e900858a0310984b9bdc0d))
+* **vpn:** send the tunnel a domain-qualified login name ([16f232c](https://github.com/UCSD-E4E/synology-filestation/commit/16f232c3eb50ae375f047c17bbd687f481be0a5e))
+
 ## [0.4.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.4.0...synology-filestation-fuse-v0.4.1) (2026-08-25)
 
 
