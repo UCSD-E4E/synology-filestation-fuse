@@ -180,8 +180,15 @@ impl Endpoints {
 pub struct Route {
     /// Which leg of the chain this is.
     pub transport: Transport,
-    /// The host SMB should connect to. `None` on the HTTP leg, which carries
-    /// no SMB at all.
+    /// The host SMB is reached at on this leg.
+    ///
+    /// **Not always dialable.** On [`Transport::SmbOverVpn`] this is an
+    /// address inside a tunnel that terminates in this process, which no
+    /// socket on this machine has a route to — dialling it reaches the
+    /// operating system's idea of the network, which has never heard of it.
+    /// Use [`Chain::reach_smb`], which hands back the connection it already
+    /// had to open to know the leg works. `None` on the HTTP leg, which
+    /// carries no SMB at all.
     pub smb_host: Option<String>,
 }
 
@@ -217,6 +224,12 @@ pub trait Tunnel: Send + Sync {
     /// find out whether the NAS answers is to talk to it — and having done
     /// that, throwing the connection away to open another one would be a
     /// second handshake to learn what the first already proved.
+    ///
+    /// Implementations must bound their own wait, as [`Prober`] must: this
+    /// runs while a user watches a spinner, and the HTTP leg is one branch
+    /// below. A tunnel that hangs holds up the answer for everybody, and the
+    /// chain cannot bound it from outside without inventing a deadline that
+    /// belongs to whoever knows what the tunnel is doing.
     ///
     /// Must not prompt: this can run at a cache expiry, and a dialog in the
     /// middle of someone's copy is worse than staying on the slower leg. A
@@ -398,9 +411,21 @@ impl Chain {
                             // What was remembered no longer holds. Falling
                             // through re-decides rather than reporting a
                             // failure the chain has other answers to.
+                            // Falling through re-decides rather than
+                            // reporting a failure the chain has other answers
+                            // to — but without asking the tunnel again,
+                            // because it has just been asked, and a second
+                            // attempt in one call is a second wait for an
+                            // answer already given.
                             Err(e) => {
                                 debug!("transport: the remembered tunnel no longer opens ({e})");
-                                self.forget();
+                                self.forget(&cached);
+                                let (chosen, _) = self.decide_without_the_tunnel().await?;
+                                self.remember(chosen.clone(), Instant::now());
+                                return Ok(match (chosen.transport, chosen.smb_host) {
+                                    (Transport::SmbDirect, Some(host)) => SmbRoute::Direct { host },
+                                    _ => SmbRoute::Unavailable,
+                                });
                             }
                         }
                     }
@@ -419,8 +444,25 @@ impl Chain {
         })
     }
 
-    fn forget(&self) {
+    /// Tell the chain that the route it handed out has stopped working.
+    ///
+    /// The best leg is remembered without an expiry, because there is nothing
+    /// better to look for — which also means nothing ever asks again. A laptop
+    /// carried off the campus network keeps being told SMB answers directly
+    /// until something says otherwise, and the only thing that knows is
+    /// whoever tried to use it.
+    pub fn reconsider(&self) {
         *self.decision.lock().unwrap() = None;
+    }
+
+    /// Drop a remembered decision, but only if it is still the one we acted
+    /// on. A concurrent caller may have written a fresher answer between our
+    /// reading it and finding it wanting, and that one is not ours to discard.
+    fn forget(&self, acted_on: &Route) {
+        let mut guard = self.decision.lock().unwrap();
+        if guard.as_ref().is_some_and(|held| &held.route == acted_on) {
+            *guard = None;
+        }
     }
 
     /// The current choice without deciding one, for a status line that must
@@ -456,6 +498,19 @@ impl Chain {
     /// The best leg available, and — on the tunnel leg — the connection that
     /// proved it.
     async fn decide(&self) -> Result<(Route, Option<Connection>), NoTransport> {
+        self.decide_with_tunnel(true).await
+    }
+
+    /// The same ladder with the tunnel rung missing, for a caller that has
+    /// just tried it.
+    async fn decide_without_the_tunnel(&self) -> Result<(Route, Option<Connection>), NoTransport> {
+        self.decide_with_tunnel(false).await
+    }
+
+    async fn decide_with_tunnel(
+        &self,
+        may_open: bool,
+    ) -> Result<(Route, Option<Connection>), NoTransport> {
         if self.policy.allows_smb() {
             let public = &self.endpoints.public_host;
             if self.prober.smb_reachable(public).await {
@@ -475,19 +530,24 @@ impl Chain {
                 // SMB and one that never comes up are now the same answer
                 // here — the error says which, and it is the tunnel's to
                 // explain rather than this layer's to guess.
-                (true, Some(inside)) => match self.tunnel.open(inside, SMB_PORT).await {
-                    Ok(connection) => {
-                        info!("transport: SMB reachable through the tunnel at {inside}");
-                        return Ok((
-                            Route {
-                                transport: Transport::SmbOverVpn,
-                                smb_host: Some(inside.clone()),
-                            },
-                            Some(connection),
-                        ));
+                (true, Some(inside)) if may_open => {
+                    match self.tunnel.open(inside, SMB_PORT).await {
+                        Ok(connection) => {
+                            info!("transport: SMB reachable through the tunnel at {inside}");
+                            return Ok((
+                                Route {
+                                    transport: Transport::SmbOverVpn,
+                                    smb_host: Some(inside.clone()),
+                                },
+                                Some(connection),
+                            ));
+                        }
+                        Err(e) => debug!("transport: no SMB through a tunnel ({e})"),
                     }
-                    Err(e) => debug!("transport: no SMB through a tunnel ({e})"),
-                },
+                }
+                // Just tried, and it did not open. Asking again in the same
+                // call buys a second wait for an answer already given.
+                (true, Some(_)) => {}
                 // Nowhere for an escalation to land. Raising the tunnel would
                 // still leave us with no address to mount, so don't.
                 (true, None) => {
@@ -585,12 +645,6 @@ mod tests {
         /// A tunnel that opens a connection to the NAS.
         fn reaching() -> Arc<Self> {
             Self::new(true)
-        }
-        /// A tunnel that comes up but reaches nothing useful — which, now that
-        /// opening is the probe, is indistinguishable from one that does not
-        /// come up, and is meant to be.
-        fn to_nowhere() -> Arc<Self> {
-            Self::new(false)
         }
         fn opens(&self) -> usize {
             self.opens.load(Ordering::SeqCst)
@@ -695,7 +749,7 @@ mod tests {
         // Raising a tunnel we have no address to mount through would cost the
         // user a connection and change nothing.
         let prober = FakeProber::nothing_answers();
-        let tunnel = FakeTunnel::to_nowhere();
+        let tunnel = FakeTunnel::absent();
         let chain = Chain::new(
             TransportPolicy::default(),
             Endpoints::public_only(PUBLIC),
@@ -709,17 +763,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tunnel_that_comes_up_without_reaching_smb_is_not_the_answer() {
-        // Connected to *a* network is not connected to *this* NAS. Reporting
-        // SmbOverVpn here would blame SMB for a routing problem.
+    async fn a_tunnel_that_cannot_reach_smb_is_not_the_answer() {
+        // Connected to *a* network is not connected to *this* NAS, and now
+        // that opening the connection is the probe, those two failures are one
+        // — a tunnel that does not come up and one that comes up somewhere
+        // useless both fail to hand back a connection. Reporting SmbOverVpn
+        // for either would blame SMB for a routing problem.
         let prober = FakeProber::nothing_answers();
-        let tunnel = FakeTunnel::to_nowhere();
+        let tunnel = FakeTunnel::absent();
         let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
 
         let route = chain.route().await.unwrap();
         assert_eq!(route.transport, Transport::Https);
         assert_eq!(route.smb_host, None, "the HTTP leg carries no SMB");
         assert_eq!(tunnel.opens(), 1, "tried, and honestly reported");
+    }
+
+    #[tokio::test]
+    async fn a_stale_tunnel_route_is_not_asked_twice_in_one_breath() {
+        // Re-deciding after a remembered tunnel stops opening is right; asking
+        // the tunnel again inside the same call is not. Every attempt is a
+        // wait, and this one has just been made.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert!(matches!(
+            chain.reach_smb().await.unwrap(),
+            SmbRoute::Tunnelled { .. }
+        ));
+        tunnel.stops_working();
+
+        assert!(matches!(
+            chain.reach_smb().await.unwrap(),
+            SmbRoute::Unavailable
+        ));
+        assert_eq!(
+            tunnel.opens(),
+            2,
+            "the first call opened one, the second attempted one — not two"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_can_say_the_route_stopped_working() {
+        // The best leg is remembered without an expiry, so nothing ever asks
+        // again on its own. A laptop carried off the campus network would keep
+        // being told SMB answers directly, and the only thing that knows
+        // otherwise is whoever tried to use it.
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::absent();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert_eq!(chain.route().await.unwrap().transport, Transport::SmbDirect);
+        let probes = prober.probes();
+        assert_eq!(
+            chain.route().await.unwrap().transport,
+            Transport::SmbDirect,
+            "remembered, and not asked again"
+        );
+        assert_eq!(prober.probes(), probes);
+
+        chain.reconsider();
+        assert_eq!(chain.route().await.unwrap().transport, Transport::SmbDirect);
+        assert!(prober.probes() > probes, "told otherwise, it looks again");
     }
 
     #[tokio::test]
