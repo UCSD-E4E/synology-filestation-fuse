@@ -11,15 +11,16 @@
 //! wakes when it says to. All the timing lives here and nowhere else, so the
 //! state machine stays a state machine.
 
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::ip::Ifconfig;
 use crate::session::{Session, SessionConfig};
+use crate::stack::{LinkFailure, TunnelStream};
 use crate::Error;
 
 /// How long to wait for the tunnel to come up before giving up on it.
@@ -45,7 +46,9 @@ pub struct Tunnel {
     outgoing: mpsc::Sender<Vec<u8>>,
     incoming: mpsc::Receiver<Vec<u8>>,
     /// Why the tunnel stopped, once it has.
-    failure: Arc<Mutex<Option<Error>>>,
+    failure: LinkFailure,
+    /// Where the server put us, from its push reply.
+    ifconfig: Option<Ifconfig>,
     task: JoinHandle<()>,
 }
 
@@ -70,7 +73,7 @@ impl Tunnel {
         let session = Session::new(config)?;
         let (to_tunnel, from_caller) = mpsc::channel(64);
         let (to_caller, from_tunnel) = mpsc::channel(64);
-        let failure = Arc::new(Mutex::new(None));
+        let failure = LinkFailure::new();
         let (ready, is_ready) = tokio::sync::oneshot::channel();
 
         let task = tokio::spawn(run(
@@ -83,11 +86,12 @@ impl Tunnel {
         ));
 
         let outcome = match tokio::time::timeout(CONNECT_TIMEOUT, is_ready).await {
-            Ok(Ok(Ok(()))) => {
+            Ok(Ok(Ok(ifconfig))) => {
                 return Ok(Self {
                     outgoing: to_tunnel,
                     incoming: from_tunnel,
                     failure,
+                    ifconfig,
                     task,
                 })
             }
@@ -121,9 +125,93 @@ impl Tunnel {
         self.incoming.recv().await
     }
 
+    /// Where the server put us inside the tunnel.
+    ///
+    /// `None` when it pushed no `ifconfig`, which means it intends to carry
+    /// something other than IP — nothing this driver has any use for, but not
+    /// this layer's business to refuse.
+    pub fn ifconfig(&self) -> Option<Ifconfig> {
+        self.ifconfig
+    }
+
+    /// Open a TCP connection through the tunnel.
+    ///
+    /// This is the join the rest of the crate was for: the tunnel carries IP
+    /// packets, [`TunnelStream`] is a TCP stack that speaks them, and neither
+    /// knows about the other until here. What comes back reads and writes like
+    /// any other stream, and nothing on this machine has — or needs — a route
+    /// to the address at the far end.
+    ///
+    /// The tunnel is consumed. One connection is what this exists to carry,
+    /// the packets have to go somewhere exclusively, and it means the tunnel
+    /// failing arrives where a caller is already looking: as an error on the
+    /// stream rather than as silence.
+    pub async fn open_stream(
+        self,
+        remote: (Ipv4Addr, u16),
+        patience: Duration,
+    ) -> Result<TunnelStream, Error> {
+        let ifconfig = self
+            .ifconfig
+            .ok_or_else(|| Error::Io("the server pushed no address for us".into()))?;
+
+        // A tunnel that has already stopped knows why, and that reason is the
+        // one worth giving. Left to the stack, this becomes a connection
+        // attempt that nobody answers — reported against the address inside
+        // the tunnel, which blames the NAS's SMB port for a tunnel that was
+        // not there.
+        if let Some(stopped) = self.failure() {
+            return Err(stopped);
+        }
+        let failure = self.failure.clone();
+
+        // Two channels and a pump, because the stack wants somewhere to put
+        // packets and somewhere to take them from, while the tunnel wants to
+        // be sent and received on.
+        let (to_tunnel, mut from_stack) = mpsc::channel::<Vec<u8>>(64);
+        let (to_stack, from_tunnel) = mpsc::channel::<Vec<u8>>(64);
+
+        let mut tunnel = self;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    outbound = from_stack.recv() => match outbound {
+                        Some(packet) => {
+                            if tunnel.send(packet).await.is_err() {
+                                return;
+                            }
+                        }
+                        // The stack has gone, so nothing more will be sent and
+                        // nothing more is worth receiving.
+                        None => return,
+                    },
+                    inbound = tunnel.recv() => match inbound {
+                        // Dropped rather than waited on: this is a link, and a
+                        // link that blocks stops carrying in both directions.
+                        // TCP above asks again.
+                        Some(packet) => {
+                            let _ = to_stack.try_send(packet);
+                        }
+                        None => return,
+                    },
+                }
+            }
+        });
+
+        match TunnelStream::connect(to_tunnel, from_tunnel, ifconfig, remote, patience).await {
+            // And the same question again on the way out: the tunnel may have
+            // stopped while the connection was being made, in which case what
+            // happened is not that nobody answered.
+            Err(unanswered) => Err(failure.reason().unwrap_or(unanswered)),
+            // From here on the stream is what the caller holds, so it is where
+            // the reason has to arrive.
+            Ok(stream) => Ok(stream.explaining(failure)),
+        }
+    }
+
     /// Why the tunnel stopped, if it has.
     pub fn failure(&self) -> Option<Error> {
-        self.failure.lock().ok().and_then(|failure| failure.clone())
+        self.failure.reason()
     }
 
     fn why_it_stopped(&self) -> Error {
@@ -167,8 +255,8 @@ async fn run(
     mut session: Session,
     mut from_caller: mpsc::Receiver<Vec<u8>>,
     to_caller: mpsc::Sender<Vec<u8>>,
-    failure: Arc<Mutex<Option<Error>>>,
-    ready: tokio::sync::oneshot::Sender<Result<(), Error>>,
+    failure: LinkFailure,
+    ready: tokio::sync::oneshot::Sender<Result<Option<Ifconfig>, Error>>,
 ) {
     let mut ready = Some(ready);
     let mut buffer = vec![0u8; 4096];
@@ -201,7 +289,15 @@ async fn run(
         // told.
         if session.is_ready() {
             if let Some(ready) = ready.take() {
-                let _ = ready.send(Ok(()));
+                // Read here rather than kept on the session: the push reply is
+                // the only place the server says where we are, and the session
+                // is about to be shut away inside this loop.
+                let ifconfig = session.push_reply().and_then(|reply| {
+                    reply
+                        .ifconfig
+                        .map(|(address, second)| Ifconfig::from_push(address, second))
+                });
+                let _ = ready.send(Ok(ifconfig));
             }
         }
 
@@ -295,16 +391,17 @@ async fn run(
 }
 
 /// Tell a caller still waiting on `connect` why it will not happen.
-fn break_with(ready: &mut Option<tokio::sync::oneshot::Sender<Result<(), Error>>>, error: Error) {
+fn break_with(
+    ready: &mut Option<tokio::sync::oneshot::Sender<Result<Option<Ifconfig>, Error>>>,
+    error: Error,
+) {
     if let Some(ready) = ready.take() {
         let _ = ready.send(Err(error));
     }
 }
 
-fn finish(failure: Arc<Mutex<Option<Error>>>, error: Error) {
-    if let Ok(mut failure) = failure.lock() {
-        *failure = Some(error);
-    }
+fn finish(failure: LinkFailure, error: Error) {
+    failure.set(error);
 }
 
 fn net_time() -> u32 {
