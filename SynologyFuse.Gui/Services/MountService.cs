@@ -41,7 +41,7 @@ public sealed class MountService : IDisposable
 
     /// <summary>An empty setting means "not set", which the native side spells
     /// null. A blank string would be a domain of "" and a profile path of "".</summary>
-    private static string? Blank(string value) =>
+    internal static string? Blank(string value) =>
         string.IsNullOrWhiteSpace(value) ? null : value;
 
     /// <summary>
@@ -62,7 +62,8 @@ public sealed class MountService : IDisposable
             var c = SynoClient.Connect(
                 config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
                 autoRelogin: true, verifySsl: config.VerifySsl,
-                smbDomain: Blank(config.SmbDomain), vpnProfile: Blank(config.VpnProfile),
+                smbDomain: Blank(config.SmbDomain),
+                vpnProfile: Blank(ExpandPath(config.VpnProfile)),
                 vpnHost: Blank(config.VpnHost));
             try
             {
@@ -108,7 +109,8 @@ public sealed class MountService : IDisposable
             using var client = SynoClient.Connect(
                 config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
                 autoRelogin: true, verifySsl: config.VerifySsl,
-                smbDomain: Blank(config.SmbDomain), vpnProfile: Blank(config.VpnProfile),
+                smbDomain: Blank(config.SmbDomain),
+                vpnProfile: Blank(ExpandPath(config.VpnProfile)),
                 vpnHost: Blank(config.VpnHost));
             Transport = client.Transport;
             // Dispose logs out immediately; reaching here means success.

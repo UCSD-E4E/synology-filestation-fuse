@@ -102,9 +102,15 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         Status = "Connecting…";
         try
         {
+            // The same access settings the mount uses: this is its own session,
+            // so without them the browser's downloads stay on the
+            // non-resumable HTTP path even when the mount would not.
             var client = await Task.Run(() => SynoClient.Connect(
                 _config.Host, _config.Port, _config.UseHttps, _config.Username, _config.Password, otp,
-                autoRelogin: true, verifySsl: _config.VerifySsl));
+                autoRelogin: true, verifySsl: _config.VerifySsl,
+                smbDomain: MountService.Blank(_config.SmbDomain),
+                vpnProfile: MountService.Blank(MountService.ExpandPath(_config.VpnProfile)),
+                vpnHost: MountService.Blank(_config.VpnHost)));
             // If the window was closed (Dispose ran) while the login was in
             // flight, the handle would otherwise leak — dispose it and bail.
             // The await resumed on the UI thread, so this can't race Dispose().

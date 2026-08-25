@@ -161,32 +161,9 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 
     public bool HasTransport => Transport != SynoTransport.Unknown;
 
-    /// <summary>Two or three words, because a badge is read at a glance.</summary>
-    public string TransportBadge => Transport switch
-    {
-        SynoTransport.SmbDirect => "SMB",
-        SynoTransport.SmbOverVpn => "SMB via VPN",
-        SynoTransport.Https => "HTTP API",
-        _ => "",
-    };
+    public string TransportBadge => TransportPresenter.Badge(Transport);
 
-    /// <summary>What the badge means, for the tooltip — including what to do
-    /// about it, since the HTTP leg is usually a setting away from not being
-    /// the answer.</summary>
-    public string TransportDetail => Transport switch
-    {
-        SynoTransport.SmbDirect =>
-            "Transfers go straight to the NAS over SMB, and resume where they stopped.",
-        SynoTransport.SmbOverVpn =>
-            "The NAS did not answer directly, so this connection is tunnelled — "
-            + "raised inside this application, with nothing else on the machine affected.",
-        SynoTransport.Https =>
-            "SMB could not be reached, so transfers use the FileStation API: slower, "
-            + "and an interrupted one starts again rather than resuming. "
-            + "An AD account needs its domain set for SMB to authenticate; "
-            + "off campus it also needs a VPN profile.",
-        _ => "",
-    };
+    public string TransportDetail => TransportPresenter.Detail(Transport);
 
     [ObservableProperty]
     private string _logOutput = "";
@@ -331,6 +308,10 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
             // joining the background worker — keep it off the UI thread.
             await Task.Run(() => _mountService.Stop());
             IsConnected = false;
+            // Nothing is being reached any more, so the badge goes with it: a
+            // "SMB" next to "Disconnected" is a guess about a connection that
+            // no longer exists, and the next one may not get the same leg.
+            Transport = SynoTransport.Unknown;
             StatusText = "Disconnected";
             AppendLog("Volume closed.");
         }

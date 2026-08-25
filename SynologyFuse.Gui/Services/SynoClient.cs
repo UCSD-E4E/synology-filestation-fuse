@@ -54,12 +54,13 @@ public sealed class SynoClient : IDisposable
     public static SynoClient Connect(
         string host, ushort port, bool https, string username, string password,
         string? otp = null, bool autoRelogin = true, bool verifySsl = true,
-        string? smbDomain = null, string? vpnProfile = null, string? vpnHost = null)
+        string? smbDomain = null, string? vpnProfile = null, string? vpnHost = null,
+        string? vpnProfileRemote = null)
     {
         NativeMethods.EnsureResolver();
         var err = default(NativeError);
         int rc = syno_connect(host, port, https, username, password, otp, autoRelogin,
-            verifySsl, smbDomain, vpnProfile, vpnHost, out var handle, ref err);
+            verifySsl, smbDomain, vpnProfile, vpnHost, vpnProfileRemote, out var handle, ref err);
         Check(rc, ref err);
         return new SynoClient(handle);
     }
