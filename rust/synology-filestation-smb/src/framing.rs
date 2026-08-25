@@ -36,6 +36,11 @@ const MAX_FRAME_SIZE: usize = 0xFF_FFFF;
 
 /// An `smb2` transport over one byte stream.
 ///
+/// `Send` is asked of the stream and `Sync` deliberately is not: the tunnel's
+/// stream holds boxed futures, so it is one and not the other, and the mutexes
+/// below make this type `Sync` regardless. A `Sync` bound here would exclude
+/// the only stream this was written for.
+///
 /// The halves are locked separately on purpose. `smb2` drives both from a
 /// single `select!` loop — a request going out while a response is being
 /// waited for is the ordinary case, not a rare one — so a lock shared between
@@ -56,7 +61,7 @@ impl<S: AsyncRead + AsyncWrite> StreamTransport<S> {
 }
 
 #[async_trait]
-impl<S: AsyncRead + AsyncWrite + Send + Sync> TransportSend for StreamTransport<S> {
+impl<S: AsyncRead + AsyncWrite + Send> TransportSend for StreamTransport<S> {
     async fn send(&self, data: &[u8]) -> Result<()> {
         let len = data.len();
         if len > MAX_FRAME_SIZE {
@@ -76,7 +81,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync> TransportSend for StreamTransport<
 }
 
 #[async_trait]
-impl<S: AsyncRead + AsyncWrite + Send + Sync> TransportReceive for StreamTransport<S> {
+impl<S: AsyncRead + AsyncWrite + Send> TransportReceive for StreamTransport<S> {
     async fn receive(&self) -> Result<Vec<u8>> {
         let mut reader = self.reader.lock().await;
 
