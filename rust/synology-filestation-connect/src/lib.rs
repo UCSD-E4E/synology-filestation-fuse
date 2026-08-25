@@ -607,7 +607,14 @@ impl Chain {
                             warn!("transport: the tunnel refused, and will not be asked again until something changes ({why})");
                             *self.refused.lock().unwrap() = Some(why);
                         }
-                        Err(e) => debug!("transport: no SMB through a tunnel ({e})"),
+                        // Not routine, and not `debug`: reaching here means a
+                        // tunnel was configured, SMB did not answer directly,
+                        // and the escalation that exists for exactly that case
+                        // did not work. Left at `debug` this was invisible at
+                        // the level people run, so a mount that tried and
+                        // failed looked identical to one with no tunnel at all
+                        // — the fallback line, and nothing above it.
+                        Err(e) => warn!("transport: no SMB through the tunnel ({e})"),
                     }
                 }
                 // Just tried, and it did not open. Asking again in the same
@@ -1125,5 +1132,113 @@ mod tests {
             _ => panic!("SMB answers directly"),
         }
         assert_eq!(tunnel.opens(), 0);
+    }
+
+    // ── What reaches the user ─────────────────────────────────────────────────
+
+    /// Somewhere to put log events so a test can read them back.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Captures what this thread logs for as long as it is held.
+    ///
+    /// Which leg the chain chose, and why the better ones were not available,
+    /// reaches a user as log output and nothing else — so the level an event
+    /// is emitted at is behaviour, not decoration, and belongs under test like
+    /// any other. The default is thread-local and `#[tokio::test]` polls on
+    /// the thread that set it, so this holds across await points without
+    /// disturbing the tests running beside it.
+    struct LogCapture {
+        sink: Sink,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl LogCapture {
+        /// Capture at `info` — what somebody gets without changing a setting,
+        /// which is the whole point of asserting on it.
+        fn at_the_default_level() -> Self {
+            let sink = Sink::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .finish();
+            Self {
+                _guard: tracing::subscriber::set_default(subscriber),
+                sink,
+            }
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.sink.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Regression: every way the tunnel leg could fail *except* a refusal was
+    /// logged at `debug`. At the level people actually run, a mount that
+    /// raised a tunnel, failed to reach SMB through it, and quietly used the
+    /// slower HTTP API produced exactly the same output as one with no tunnel
+    /// configured at all — the fallback line, and nothing above it.
+    ///
+    /// `docs/vpn-live-pass.md` even tabulates the messages this hid, which is
+    /// how the gap was found: documented, and unreachable.
+    #[tokio::test]
+    async fn a_tunnel_that_did_not_reach_smb_says_so_at_the_default_level() {
+        let logs = LogCapture::at_the_default_level();
+        let chain = chain(
+            TransportPolicy::default(),
+            FakeProber::nothing_answers(),
+            FakeTunnel::absent(),
+        );
+
+        let route = chain.reach_smb().await.expect("HTTP is still there");
+
+        assert!(matches!(route, SmbRoute::Unavailable));
+        let said = logs.text();
+        assert!(
+            said.contains("no route"),
+            "the tunnel's own reason is the only thing that says which leg \
+             broke, and it has to survive to the user. Got:\n{said}"
+        );
+        assert!(
+            said.contains("WARN"),
+            "a leg that was configured and did not work is not routine. \
+             Got:\n{said}"
+        );
+    }
+
+    /// The other half of the trade: this only fires when SMB was asked for,
+    /// did not answer directly, and a tunnel was configured — so a mount that
+    /// simply works has nothing to warn about, and the level stays meaningful.
+    #[tokio::test]
+    async fn a_leg_that_works_warns_about_nothing() {
+        let logs = LogCapture::at_the_default_level();
+        let chain = chain(
+            TransportPolicy::default(),
+            FakeProber::answering(&[PUBLIC]),
+            FakeTunnel::reaching(),
+        );
+
+        chain.reach_smb().await.expect("SMB answers directly");
+
+        let said = logs.text();
+        assert!(!said.contains("WARN"), "nothing went wrong. Got:\n{said}");
     }
 }

@@ -34,3 +34,7 @@ tempfile = "3"
 # writes needs a certificate that actually parses. Generating one here beats
 # committing a real key to a repository.
 rcgen = "0.14"
+# Log level is behaviour for this crate: which leg was chosen, and why the
+# better ones were not, reaches a user only as log output. Asserting on it
+# needs the events captured. Same version the CLI and the FFI already use.
+tracing-subscriber = "0.3"
