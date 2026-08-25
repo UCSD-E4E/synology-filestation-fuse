@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace SynologyFuse.Gui.Services;
 
@@ -26,9 +27,20 @@ public sealed class PersistedSettings
     public decimal ReadCacheMb { get; set; } = 256;
     public string LogLevel { get; set; } = "info";
 
-    /// <summary>NetBIOS domain for SMB (`KRG` for an AD account). Empty for a
-    /// local DSM user.</summary>
-    public string SmbDomain { get; set; } = "";
+    /// <summary>NetBIOS domain the account lives in (`KRG` for an AD account).
+    /// Empty for a local DSM user. Used by both SMB and the VPN.</summary>
+    public string Domain { get; set; } = "";
+
+    /// <summary>The name <see cref="Domain"/> had while SMB was the only leg
+    /// that authenticated against the directory. Read so a settings.json
+    /// written before the rename keeps its value, and never written back — the
+    /// migration in <see cref="SettingsService.Load"/> clears it.
+    ///
+    /// Worth the twelve lines: an empty domain sends an unqualified name, DSM
+    /// refuses it before checking the password, and DSM's auto-block is three
+    /// strikes in 24 hours that never expire.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? SmbDomain { get; set; }
 
     /// <summary>Where the OpenVPN profile is kept, if the NAS should be reached
     /// through a tunnel when it does not answer directly.</summary>
@@ -93,12 +105,30 @@ public static class SettingsService
             if (File.Exists(filePath))
             {
                 var json = File.ReadAllText(filePath);
-                return JsonSerializer.Deserialize<PersistedSettings>(json) ?? new();
+                return Migrated(JsonSerializer.Deserialize<PersistedSettings>(json) ?? new());
             }
         }
         catch { /* corrupt file — fall back to defaults */ }
 
         return new();
+    }
+
+    /// <summary>Carry a pre-rename file forward, once.
+    ///
+    /// The current key wins where both are present: a file written since the
+    /// rename is the authority on its own value, and the stale key beside it
+    /// is not a second opinion. Clearing it afterwards is what stops the old
+    /// name living on in every settings file that has ever been saved.</summary>
+    private static PersistedSettings Migrated(PersistedSettings settings)
+    {
+        if (string.IsNullOrWhiteSpace(settings.Domain)
+            && !string.IsNullOrWhiteSpace(settings.SmbDomain))
+        {
+            settings.Domain = settings.SmbDomain;
+        }
+
+        settings.SmbDomain = null;
+        return settings;
     }
 
     public static void Save(PersistedSettings settings, string? path = null)

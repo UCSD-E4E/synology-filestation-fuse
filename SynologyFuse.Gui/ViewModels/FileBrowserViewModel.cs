@@ -108,7 +108,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
             var client = await Task.Run(() => SynoClient.Connect(
                 _config.Host, _config.Port, _config.UseHttps, _config.Username, _config.Password, otp,
                 autoRelogin: true, verifySsl: _config.VerifySsl,
-                smbDomain: MountService.Blank(_config.SmbDomain),
+                domain: MountService.Blank(_config.Domain),
                 vpnProfile: MountService.VpnProfileFor(_config),
                 vpnHost: MountService.Blank(_config.VpnHost),
                 vpnProfileRemote: MountService.Blank(_config.VpnProfileNas)));

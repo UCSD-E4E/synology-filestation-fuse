@@ -187,4 +187,48 @@ public class SettingsServiceTests : IDisposable
         Assert.Equal(original.ReadCacheMb, loaded.ReadCacheMb);
         Assert.Equal(original.LogLevel, loaded.LogLevel);
     }
+
+    // ── The SmbDomain → Domain rename ─────────────────────────────────────────
+
+    /// <summary>
+    /// The field was called "SmbDomain" while SMB was the only leg that
+    /// authenticated against the directory. The VPN needs it too — DSM refuses
+    /// an unqualified name before it looks at the password — so it was renamed.
+    ///
+    /// Dropping the existing value on that rename is not a cosmetic loss: an
+    /// empty domain sends the unqualified name, DSM rejects it, and its
+    /// auto-block is three strikes in 24h and never expires. The migration is
+    /// cheaper than the permanent unblock chore it avoids.
+    /// </summary>
+    [Fact]
+    public void Load_JsonWithTheOldSmbDomainKey_KeepsTheDomain()
+    {
+        File.WriteAllText(_path, """{"Host":"nas","SmbDomain":"KRG"}""");
+
+        Assert.Equal("KRG", SettingsService.Load(_path).Domain);
+    }
+
+    /// <summary>A file written since the rename is the authority on its own
+    /// value; the stale key beside it is not a second opinion.</summary>
+    [Fact]
+    public void Load_JsonWithBothKeys_PrefersTheCurrentOne()
+    {
+        File.WriteAllText(_path, """{"Domain":"KRG","SmbDomain":"STALE"}""");
+
+        Assert.Equal("KRG", SettingsService.Load(_path).Domain);
+    }
+
+    /// <summary>Migrated once, not carried forever: writing the old key back
+    /// would keep a second source of truth alive in every settings file.</summary>
+    [Fact]
+    public void SaveThenLoad_DoesNotWriteBackTheOldKey()
+    {
+        File.WriteAllText(_path, """{"SmbDomain":"KRG"}""");
+
+        SettingsService.Save(SettingsService.Load(_path), _path);
+
+        var written = File.ReadAllText(_path);
+        Assert.Contains("\"Domain\": \"KRG\"", written);
+        Assert.DoesNotContain("SmbDomain", written);
+    }
 }

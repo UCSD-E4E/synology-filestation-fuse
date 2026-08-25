@@ -127,10 +127,13 @@ struct Args {
     #[arg(long)]
     vpn_host: Option<String>,
 
-    /// NetBIOS domain for SMB, for an appliance joined to a directory. Falls
-    /// back to `SYNOLOGY_FS_SMB_DOMAIN`, then to none for a local DSM user
+    /// NetBIOS domain the account lives in — `KRG` for an AD user, omitted for
+    /// a local DSM one. Used by both legs that authenticate against the
+    /// directory: SMB, and the VPN, whose DSM front end refuses a name that
+    /// does not carry it. Falls back to `SYNOLOGY_FS_SMB_DOMAIN` — the old
+    /// name, kept because mounts in the field are configured with it
     #[arg(long, env = "SYNOLOGY_FS_SMB_DOMAIN")]
-    smb_domain: Option<String>,
+    domain: Option<String>,
 
     /// The OpenVPN profile on *this computer*.
     ///
@@ -175,6 +178,7 @@ fn tunnel_from(args: &Args, username: &str, password: &str) -> Box<dyn Tunnel> {
             profile,
             username,
             password,
+            args.domain.as_deref(),
             VPN_PATIENCE,
         )),
         None => Box::new(NoTunnel),
@@ -365,13 +369,13 @@ fn main() -> anyhow::Result<()> {
                 &host,
                 &args.username,
                 &password,
-                args.smb_domain.as_deref(),
+                args.domain.as_deref(),
             ))
         }
         SmbRoute::Tunnelled { host, connection } => {
             info!("Transport: SMB, through a tunnel to {host}");
             let mut cfg = SmbConfig::new(&host, &args.username, &password);
-            cfg.domain = args.smb_domain.clone().unwrap_or_default();
+            cfg.domain = args.domain.clone().unwrap_or_default();
             match rt.block_on(SmbTransport::over(connection, &cfg)) {
                 Ok(smb) => synology_filestation_smb::attach(client, Arc::new(smb)),
                 // The tunnel carried a connection and SMB behind it would not

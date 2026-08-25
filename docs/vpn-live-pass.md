@@ -57,6 +57,14 @@ Two checkpoints, in order:
   winbind → the DC, entirely inside the NAS, so a DC outage looks like a
   password failure here.
 
+  **The username must carry its domain: `KRG\<ad-user>`, not `<ad-user>`.**
+  DSM's `vpnauthd` runs a Synology pre-check — `SYNOWinsEnumAllDomains` and
+  the privilege file — ahead of the FreeRADIUS site config. An unqualified
+  name matches no local account there, so it is refused as "Incorrect user
+  name" before the password is looked at, and never reaches the `Realm` regex
+  that would have accepted either form. The driver builds this itself from
+  `--domain`; only a hand-run `openvpn` needs it typed.
+
 Do not test with `ping`: ICMP is dropped by the `vpn` firewall adapter by
 design. A silent `10.90.24.1` is expected and proves nothing either way.
 
@@ -94,7 +102,7 @@ synology-filestation-fuse \
   --vpn-host 10.90.24.1 \
   --vpn-profile ~/e4e-nas-vpn.ovpn \
   --vpn-profile-nas /installers/e4e-nas-vpn.ovpn \
-  --smb-domain KRG \
+  --domain KRG \
   --username <ad-user> \
   ~/mnt
 ```
@@ -147,7 +155,7 @@ running them in order is that the first one to fail is the one to fix.
 | What you see | What it means |
 |---|---|
 | Step 2 never reaches `TLS: Initial packet` | 1194 is not open from where you are, or `ta.key` does not match. Nothing downstream is worth trying. |
-| Step 2 reaches `AUTH_FAILED` | The credentials, or the DC behind them. The tunnel itself is fine. |
+| Step 2 reaches `AUTH_FAILED` | The username was not domain-qualified (`KRG\<ad-user>`), or the credentials, or the DC behind them. The tunnel itself is fine. ⚠️ DSM auto-block is 3 strikes / 24h / never expires, so fix it before the next attempt rather than guessing. |
 | Step 3's `smbclient` fails | DSM's SMB, not ours: the dialect, the signing, or the AD account. Step 4 was never going to work. |
 | `VPN profile: cannot read … ; the tunnel leg will not be available` | The profile is not where `--vpn-profile` says and could not be fetched. Check `--vpn-profile-nas`, and that the local path is one you can write to. The mount is on HTTP. |
 | `the vpn tunnel to … did not come up` | Our client could not do what step 2 did. That is a client bug, and step 2 passing is what makes it one. |
