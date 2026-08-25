@@ -135,6 +135,44 @@ public sealed class MountService : IDisposable
         _client = null;
     }
 
+    /// <summary>How long a disconnect is worth waiting for before saying so.
+    ///
+    /// Teardown unmounts the volume and then waits for the filesystem's own
+    /// workers to finish — a read being retried against a NAS that has stopped
+    /// answering can hold that open for as long as the retries last. That is
+    /// not a reason to leave somebody looking at a progress bar with no idea
+    /// whether anything is happening.</summary>
+    public static readonly TimeSpan StopPatience = TimeSpan.FromSeconds(20);
+
+    /// <summary>Stop, and say whether it finished.
+    ///
+    /// False means teardown is still running: the volume is unmounted either
+    /// way — that is the first thing it does — but the session is still being
+    /// closed. It is deliberately not abandoned, because the native call owns
+    /// the handle and cannot be interrupted from here; it is only stopped
+    /// being waited on.</summary>
+    public Task<bool> StopAsync() => AwaitWithin(Task.Run(Stop), StopPatience);
+
+    /// <summary>Wait for <paramref name="work"/>, but not forever.
+    ///
+    /// Returns false if it is still running. The work is not cancelled — it
+    /// owns a native handle and cannot be interrupted from here — it is only
+    /// stopped being waited on, which is the difference between a window that
+    /// says what happened and one that shows a progress bar indefinitely.
+    ///
+    /// Separated from <see cref="StopAsync"/> so the rule can be tested: this
+    /// service's constructor talks to the native library, which a unit test
+    /// has no business needing.</summary>
+    internal static async Task<bool> AwaitWithin(Task work, TimeSpan patience)
+    {
+        var finished = await Task.WhenAny(work, Task.Delay(patience)) == work;
+        // Only when it finished: awaiting the other branch would wait forever
+        // for the thing we just decided not to wait for. A failure that
+        // arrives later is unobserved, which is why `Stop` swallows nothing.
+        if (finished) await work;
+        return finished;
+    }
+
     public void Dispose()
     {
         _disposed = true;
