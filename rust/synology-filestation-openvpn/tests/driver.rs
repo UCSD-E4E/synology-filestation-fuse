@@ -8,11 +8,11 @@
 
 mod common;
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use common::{Answer, FakeServer, TA_KEY_HEX};
-use synology_filestation_openvpn::{SessionConfig, StaticKey, Tunnel};
+use synology_filestation_openvpn::{Session, SessionConfig, StaticKey, Tunnel};
 
 const PUSH: &str = "PUSH_REPLY,ifconfig 10.90.24.6 255.255.255.0,peer-id 4,cipher AES-256-CBC";
 
@@ -92,4 +92,85 @@ async fn a_refusal_before_the_peer_is_listening_does_not_end_the_tunnel() {
         .expect("the refusals are not the end of it");
 
     assert!(tunnel.failure().is_none());
+}
+
+#[tokio::test]
+async fn a_connection_through_the_tunnel_reaches_the_far_side_encrypted() {
+    // The join everything else was for: a tunnel carrying IP, a TCP stack on
+    // top of it, and a connection out of that stack whose first packet arrives
+    // at the peer as an ordinary encrypted data packet. Nothing on this
+    // machine has a route to 10.90.24.1 and nothing needs one.
+    let server = FakeServer::new(Answer::KeyMaterialThen(PUSH.to_string()));
+    let config = config_for(&server);
+    let port = a_free_port();
+
+    // The peer, answering control packets and reporting what it decrypts.
+    let (arrived, mut arriving) = tokio::sync::mpsc::channel(16);
+    let mut server = server;
+    tokio::spawn(async move {
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", port))
+            .await
+            .expect("the port is free");
+        let mut buffer = vec![0u8; 4096];
+        loop {
+            let Ok((len, from)) = socket.recv_from(&mut buffer).await else {
+                return;
+            };
+            let datagram = &buffer[..len];
+            if Session::is_data(datagram) {
+                if let Ok(payload) = server.decrypt_payload(datagram) {
+                    if arrived.send(payload).await.is_err() {
+                        return;
+                    }
+                }
+                continue;
+            }
+            for answer in server.handle(datagram) {
+                let _ = socket.send_to(&answer, from).await;
+            }
+        }
+    });
+
+    let remote: SocketAddr = ([127, 0, 0, 1], port).into();
+    let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
+
+    assert_eq!(
+        tunnel
+            .ifconfig()
+            .expect("the server said where we are")
+            .address,
+        Ipv4Addr::new(10, 90, 24, 6),
+        "the address from the push reply, not one we chose"
+    );
+
+    // Nothing is listening inside, so this cannot complete — what matters is
+    // what leaves.
+    let _ = tokio::time::timeout(
+        Duration::from_millis(600),
+        tunnel.open_stream(
+            (Ipv4Addr::new(10, 90, 24, 1), 445),
+            Duration::from_millis(500),
+        ),
+    )
+    .await;
+
+    // Keepalives are not it; the first thing carrying IP is.
+    let packet = loop {
+        let payload = tokio::time::timeout(Duration::from_secs(10), arriving.recv())
+            .await
+            .expect("something was sent through it")
+            .expect("a payload");
+        if payload.first().map(|first| first >> 4) == Some(4) {
+            break payload;
+        }
+    };
+
+    assert_eq!(packet[9], 6, "carrying TCP");
+    assert_eq!(&packet[12..16], &[10, 90, 24, 6], "from where we were put");
+    assert_eq!(&packet[16..20], &[10, 90, 24, 1], "to the NAS");
+
+    let header_len = ((packet[0] & 0x0f) as usize) * 4;
+    let tcp = &packet[header_len..];
+    assert_eq!(u16::from_be_bytes([tcp[2], tcp[3]]), 445, "to the SMB port");
+    assert_eq!(tcp[13] & 0x3f, 0x02, "a bare SYN");
 }
