@@ -26,10 +26,12 @@
 //! ```
 
 pub mod error;
+pub mod framing;
 pub mod path;
 pub mod transport;
 
 pub use error::to_syno_error;
+pub use framing::StreamTransport;
 pub use path::SmbPath;
 pub use transport::{
     auto_attach, auto_attach_as, auto_connect, auto_connect_as, FileMeta, SmbConfig, SmbTransport,
