@@ -12,15 +12,22 @@ members = [
 
 # Our fork of `smb2`, pinned by revision.
 #
-# It carries two SET_INFO operations upstream does not have yet: a rename that
-# tells the server to replace the destination (so a published file is never
-# briefly absent, instead of the delete-then-rename dance that leaves a gap),
-# and `set_end_of_file`, which truncates in one round trip rather than making
-# the caller download a file, cut the tail off and write it all back.
+# It carries three things upstream does not have yet. Two SET_INFO operations:
+# a rename that tells the server to replace the destination (so a published
+# file is never briefly absent, instead of the delete-then-rename dance that
+# leaves a gap), and `set_end_of_file`, which truncates in one round trip
+# rather than making the caller download a file, cut the tail off and write it
+# all back.
+#
+# And `SmbClient::from_connection` — `connect` without the dial — which is what
+# lets an SMB client run on a transport the crate has never heard of. Without
+# it the userspace TCP stack in `synology-filestation-openvpn` could reach a
+# `Connection` and no further, so SMB through the tunnel stopped one layer
+# short of anything that could use it.
 #
 # A `patch` rather than a `git` dependency so the crates named in each manifest
 # stay honest: when the changes land upstream, this block goes away and nothing
 # else moves. Pinned to a revision, never a branch — a build that can change
 # under you is not a build.
 [patch.crates-io]
-smb2 = { git = "https://github.com/UCSD-E4E/smb2", rev = "b33283c9963cbef74c2b4a17faae4664980a0f9d" }
+smb2 = { git = "https://github.com/UCSD-E4E/smb2", rev = "392f57377b93211816a4546d2aa2ae2de1551c58" }

@@ -348,6 +348,68 @@ impl SmbTransport {
         })
     }
 
+    /// Connect + authenticate over a stream the caller opened.
+    ///
+    /// [`connect`](Self::connect) dials TCP, which is the right thing when the
+    /// NAS is reachable. When it is not — off campus, where port 445 never
+    /// leaves the building — the way to it is a tunnel, and what comes out of
+    /// one is a stream rather than an address. Everything above this line is
+    /// then ordinary SMB; the only difference is where the bytes go.
+    ///
+    /// `cfg.host` still names the server. Nothing here dials it, but it is
+    /// what tree connects are attributed to and what a DFS referral's path
+    /// would be built from.
+    ///
+    /// # This one cannot bring itself back
+    ///
+    /// A transport built here will not reopen its own stream: only the caller
+    /// knows how the stream was made. So a dead session is reported rather
+    /// than recovered — `SmbClient` refuses to dial `host` behind the caller's
+    /// back, which for a tunnelled connection would put the session on the
+    /// open internet or on nothing at all. Recovery belongs to whoever owns
+    /// the tunnel: bring a new stream and build a new transport.
+    pub async fn over<S>(stream: S, cfg: &SmbConfig) -> Result<Self, SynoFsError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'static,
+    {
+        let framed = Arc::new(crate::framing::StreamTransport::new(stream));
+        // The host without its port: `Connection` names the server, and the
+        // port is not part of a server's name.
+        let server = cfg.host.split(':').next().unwrap_or(&cfg.host).to_string();
+
+        let conn = smb2::client::connection::Connection::from_transport(
+            Box::new(Arc::clone(&framed)),
+            Box::new(framed),
+            server,
+        );
+
+        let client = SmbClient::from_connection(
+            ClientConfig {
+                addr: cfg.addr(),
+                timeout: cfg.timeout,
+                username: cfg.username.clone(),
+                password: cfg.password.clone(),
+                domain: cfg.domain.clone(),
+                // Not ours to arm: see the note above.
+                auto_reconnect: false,
+                compression: true,
+                dfs_enabled: true,
+                dfs_target_overrides: HashMap::new(),
+            },
+            conn,
+        )
+        .await
+        .map_err(|e| to_syno_error(&e))?;
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(Inner {
+                client,
+                trees: HashMap::new(),
+            })),
+            reconnect: Arc::new(ReconnectState::default()),
+        })
+    }
+
     /// Map an `smb2::Error`, flagging the connection for reconnect when the
     /// error means the link is dead — so the next operation re-establishes it.
     fn mark_and_map(&self, e: &smb2::Error) -> SynoFsError {
