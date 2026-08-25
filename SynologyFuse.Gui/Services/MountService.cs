@@ -135,6 +135,42 @@ public sealed class MountService : IDisposable
         _client = null;
     }
 
+    /// <summary>How long a disconnect runs before it is worth saying it is
+    /// taking a while.
+    ///
+    /// Teardown unmounts the volume and then waits for the filesystem's own
+    /// workers to finish — a read being retried against a NAS that has stopped
+    /// answering can hold that open. Worth <em>reporting</em>; not a reason to
+    /// stop waiting. See <see cref="StopAsync"/>.</summary>
+    public static readonly TimeSpan SlowStopThreshold = TimeSpan.FromSeconds(20);
+
+    /// <summary>Stop, reporting once it is taking a while.
+    ///
+    /// It keeps waiting, because giving up on the wait gives up on nothing:
+    /// the work owns a native handle and cannot be interrupted from here, so
+    /// it carries on regardless — while <see cref="Stop"/> has not yet reached
+    /// the line that releases this service's own reference. Reporting
+    /// "Disconnected" at that point would re-enable Connect over a service
+    /// that still holds a client, and the next attempt would fail with
+    /// "Already mounted." for as long as the process lived.
+    ///
+    /// So a slow teardown changes what is <em>said</em>, not what is true.</summary>
+    public async Task StopAsync(Action? onSlow = null) =>
+        await NotifyIfSlow(Task.Run(Stop), SlowStopThreshold, onSlow);
+
+    /// <summary>Await <paramref name="work"/>, calling <paramref name="onSlow"/>
+    /// if it has not finished within <paramref name="patience"/>.
+    ///
+    /// Always awaits it in the end, so nothing acts on a half-finished
+    /// teardown. Separate from <see cref="StopAsync"/> so the rule can be
+    /// tested: this service's constructor talks to the native library, which a
+    /// unit test has no business needing.</summary>
+    internal static async Task NotifyIfSlow(Task work, TimeSpan patience, Action? onSlow)
+    {
+        if (await Task.WhenAny(work, Task.Delay(patience)) != work) onSlow?.Invoke();
+        await work;
+    }
+
     public void Dispose()
     {
         _disposed = true;

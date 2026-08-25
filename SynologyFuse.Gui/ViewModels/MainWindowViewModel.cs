@@ -316,7 +316,18 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         {
             // Stop() disposes the native client and blocks while unmounting and
             // joining the background worker — keep it off the UI thread.
-            await Task.Run(() => _mountService.Stop());
+            await _mountService.StopAsync(onSlow: () => Dispatcher.UIThread.Post(() =>
+            {
+                // Said, not done. The volume is already unmounted — that is the
+                // first thing teardown does — and the session is still closing.
+                // The spinner stays because it is still true, and Connect stays
+                // disabled because this is not finished.
+                StatusText = "Still closing the session — the volume is unmounted";
+                AppendLog(
+                    "Closing the session is taking more than "
+                    + $"{MountService.SlowStopThreshold.TotalSeconds:0} seconds. The volume is "
+                    + "already unmounted; the last 'teardown:' line above is the step it is on.");
+            }));
             IsConnected = false;
             // Nothing is being reached any more, so the badge goes with it: a
             // "SMB" next to "Disconnected" is a guess about a connection that

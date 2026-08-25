@@ -610,7 +610,9 @@ pub unsafe extern "C" fn syno_connect(
 pub unsafe extern "C" fn syno_logout(client: *mut SynoClient) {
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if let Some(c) = client.as_ref() {
+            info!("teardown: logging out");
             let _ = c.runtime.block_on(c.inner.logout());
+            info!("teardown: logged out");
         }
     }));
 }
@@ -622,7 +624,13 @@ pub unsafe extern "C" fn syno_logout(client: *mut SynoClient) {
 #[no_mangle]
 pub unsafe extern "C" fn syno_client_free(client: *mut SynoClient) {
     if !client.is_null() {
+        // Dropping the last `Arc<Runtime>` blocks this thread until the
+        // runtime has shut down — which waits on anything still running in it.
+        // The GUI blocks on this call, so if it never returns the window sits
+        // on "Working…"; saying where we are is what makes that legible.
+        info!("teardown: releasing the client");
         drop(Box::from_raw(client));
+        info!("teardown: client released");
     }
 }
 
@@ -1076,8 +1084,23 @@ pub unsafe extern "C" fn syno_unmount(mount: *mut SynoMount) {
         }
         let mut mount = Box::from_raw(mount);
         if let Some(handle) = mount.handle.take() {
+            // Bracketed, because this is where a disconnect can stop and
+            // nothing said so. `handle.stop()` unmounts and then *joins* the
+            // filesystem's worker threads; a worker still inside a callback —
+            // waiting on a read that is being retried, say — keeps the join
+            // waiting, and the caller of this is a thread the GUI is blocked
+            // on. Without these two lines the log ends at the kernel's
+            // "Unmounting" and there is no way to tell this apart from the
+            // teardown after it.
+            info!("teardown: unmounting and waiting for the filesystem to finish");
             handle.stop();
+            info!("teardown: filesystem finished");
         }
+        // Dropping the mount's runtime handle. The last one to go blocks until
+        // the runtime has shut down, so which of the two callers drops it last
+        // is worth knowing.
+        drop(mount);
+        info!("teardown: mount released");
     }));
 }
 
@@ -1158,6 +1181,64 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true, "data": {"sid": "sid-123"}
         }))
+    }
+
+    #[test]
+    fn a_client_is_freed_promptly_rather_than_parking_a_thread() {
+        // What a disconnect does, and what it must not do: `syno_client_free`
+        // drops the last `Arc<Runtime>`, and dropping a Tokio runtime blocks
+        // the calling thread until the runtime has shut down. The GUI calls
+        // this from a thread pool worker and waits for it, so anything that
+        // stops the runtime shutting down stops the disconnect — and the whole
+        // window sits on "Working…" with nothing to say.
+        let (_rt, server) = server_with(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/webapi/auth.cgi"))
+                .respond_with(login_ok())
+                .mount(&server)
+                .await;
+            server
+        });
+
+        let (host, port) = host_port(&server);
+        let freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watching = std::sync::Arc::clone(&freed);
+
+        // On its own thread, so a hang is a failed assertion rather than a
+        // test run that never ends.
+        std::thread::spawn(move || unsafe {
+            let mut client: *mut SynoClient = ptr::null_mut();
+            let mut err = empty_err();
+            let rc = syno_connect(
+                host.as_ptr(),
+                port,
+                false,
+                cstr("alice").as_ptr(),
+                cstr("secret").as_ptr(),
+                ptr::null(),
+                false,
+                true,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &mut client,
+                &mut err,
+            );
+            assert_eq!(rc, SynoStatus::Ok as i32);
+            syno_logout(client);
+            syno_client_free(client);
+            watching.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        for _ in 0..100 {
+            if freed.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("syno_client_free did not return: the runtime never shut down");
     }
 
     #[test]
