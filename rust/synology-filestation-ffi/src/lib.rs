@@ -36,6 +36,13 @@ mod logging;
 
 const DOWNLOAD_CHUNK: u64 = 4 * 1024 * 1024;
 
+/// How long to wait for a filesystem to finish after unmounting it.
+///
+/// Past this it is left to finish on its own. The volume is gone either way —
+/// that happens first — and what remains is a worker waiting on a request the
+/// NAS is not answering, which nothing here can hurry.
+const UNMOUNT_PATIENCE: Duration = Duration::from_secs(10);
+
 /// How long the whole tunnel attempt may take, handshake included.
 const VPN_PATIENCE: Duration = Duration::from_secs(30);
 
@@ -432,7 +439,9 @@ async fn reach(client: SynologyClient, settings: Reachable<'_>) -> (SynologyClie
 
 /// Opaque live-mount handle.
 pub struct SynoMount {
-    handle: Option<synology_filestation_fuse::MountHandle>,
+    // Never read: dropping it is what unmounts, and teardown drops the whole
+    // mount rather than reaching in for this.
+    _handle: synology_filestation_fuse::MountHandle,
     // Keeps the runtime alive for the duration of the mount (the FUSE/WinFsp
     // callbacks block on it). Dropped after the mount is torn down.
     _runtime: Arc<Runtime>,
@@ -619,6 +628,25 @@ pub unsafe extern "C" fn syno_logout(client: *mut SynoClient) {
             info!("teardown: logged out");
         }
     }));
+}
+
+/// Run `work` on a thread of its own, and wait `patience` for it to finish.
+///
+/// Returns whether it did. On a timeout the work is **left running**, not
+/// abandoned: it owns the Tokio runtime that the filesystem's leftover workers
+/// call back into, and releasing that while they are still running turns a hang
+/// into a panic. What the deadline buys is the caller's thread, not the work's.
+fn finish_within<F>(patience: Duration, work: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (finished, waiting) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        work();
+        // Nobody may be listening any more, which is the point of this.
+        let _ = finished.send(());
+    });
+    waiting.recv_timeout(patience).is_ok()
 }
 
 /// Free a client handle. After this the pointer is invalid.
@@ -1064,7 +1092,7 @@ pub unsafe extern "C" fn syno_mount(
         ) {
             Ok(handle) => {
                 let mount = Box::new(SynoMount {
-                    handle: Some(handle),
+                    _handle: handle,
                     _runtime: c.runtime.clone(),
                 });
                 *out = Box::into_raw(mount);
@@ -1086,25 +1114,32 @@ pub unsafe extern "C" fn syno_unmount(mount: *mut SynoMount) {
         if mount.is_null() {
             return;
         }
-        let mut mount = Box::from_raw(mount);
-        if let Some(handle) = mount.handle.take() {
-            // Bracketed, because this is where a disconnect can stop and
-            // nothing said so. `handle.stop()` unmounts and then *joins* the
-            // filesystem's worker threads; a worker still inside a callback —
-            // waiting on a read that is being retried, say — keeps the join
-            // waiting, and the caller of this is a thread the GUI is blocked
-            // on. Without these two lines the log ends at the kernel's
-            // "Unmounting" and there is no way to tell this apart from the
-            // teardown after it.
-            info!("teardown: unmounting and waiting for the filesystem to finish");
-            handle.stop();
+        let mount = Box::from_raw(mount);
+
+        // Unmount, then wait for the filesystem to finish — but not forever.
+        //
+        // `stop()` unmounts and then *joins* the worker threads. The unmount
+        // is the part that matters to whoever asked: the volume is gone from
+        // the filesystem the moment it returns. The join is bookkeeping, and a
+        // worker still inside a callback — waiting on a NAS that has stopped
+        // answering — will not reach the point where it notices the unmount
+        // until that request gives up, which can be minutes.
+        //
+        // Waiting for that is what hung the GUI: it blocks on this call, so
+        // the window sat on a progress bar with the volume already gone.
+        //
+        // The whole mount moves onto the thread, its handle on the runtime
+        // included. That is not tidiness: the leftover workers call back into
+        // the runtime, and releasing it while they are still running turns
+        // this hang into a panic.
+        info!("teardown: unmounting and waiting for the filesystem to finish");
+        if finish_within(UNMOUNT_PATIENCE, move || drop(mount)) {
             info!("teardown: filesystem finished");
+        } else {
+            warn!(
+                "teardown: the volume is unmounted, but the filesystem has not finished after {UNMOUNT_PATIENCE:?} — a request to the NAS is still outstanding. Closing it in the background rather than waiting."
+            );
         }
-        // Dropping the mount's runtime handle. The last one to go blocks until
-        // the runtime has shut down, so which of the two callers drops it last
-        // is worth knowing.
-        drop(mount);
-        info!("teardown: mount released");
     }));
 }
 
@@ -1185,6 +1220,36 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true, "data": {"sid": "sid-123"}
         }))
+    }
+
+    #[test]
+    fn work_that_finishes_in_time_is_waited_for() {
+        assert!(finish_within(Duration::from_secs(5), || {}));
+    }
+
+    #[test]
+    fn work_that_does_not_finish_gives_the_caller_its_thread_back() {
+        // The disconnect that hung. Unmounting a volume whose NAS has stopped
+        // answering joins worker threads that are inside a callback, and the
+        // GUI blocks on that call — with the volume already gone, because the
+        // unmount is what happens first. So waiting buys nothing.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+
+        let started = std::time::Instant::now();
+        let finished = finish_within(Duration::from_millis(200), move || {
+            let _ = held.recv();
+        });
+
+        assert!(!finished);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it stopped waiting rather than waiting anyway"
+        );
+        // And left the work running rather than abandoning it, because it owns
+        // what the stragglers are still using.
+        release
+            .send(())
+            .expect("the work is still there to be released");
     }
 
     #[test]

@@ -50,5 +50,6 @@ winfsp = "0.13"
 
 [dev-dependencies]
 wiremock = "0.6"
+tempfile = "3"
 # Test-only: the fake write sink implements a core trait that is async.
 async-trait = "0.1"

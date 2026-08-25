@@ -2666,6 +2666,7 @@ dependencies = [
  "synology-filestation-connect",
  "synology-filestation-core",
  "synology-filestation-smb",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

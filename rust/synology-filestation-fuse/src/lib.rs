@@ -128,17 +128,104 @@ impl MountHandle {
 #[cfg(target_os = "linux")]
 struct PlatformMount {
     session: Option<fuser::BackgroundSession>,
+    /// Kept so a wedged mount can be detached by name. See [`detach`].
+    mountpoint: PathBuf,
 }
+
+/// How long an ordinary unmount is given before the mount is treated as wedged.
+///
+/// Generous: this is only reached when `fusermount -u` has already failed,
+/// which it does not do on a mount nobody is using.
+#[cfg(target_os = "linux")]
+const UNMOUNT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(target_os = "linux")]
 impl Drop for PlatformMount {
+    /// Unmount, and do not come back wedged.
+    ///
+    /// `umount_and_join` unmounts and then *joins* the session's threads. Both
+    /// halves can stick, and they stick together: a worker inside a callback
+    /// the NAS is not answering keeps the kernel counting the mount as busy, so
+    /// `fusermount -u` fails — and the session then never sees the end of
+    /// `/dev/fuse`, so the join waits for a thread that is waiting for the
+    /// unmount that just failed.
+    ///
+    /// The volume stayed mounted and the caller never returned, which is what
+    /// made a disconnect hang until somebody ran `umount` by hand: doing that
+    /// is what finally gave the session its EOF.
+    ///
+    /// So past a deadline the mount is detached lazily, which succeeds whether
+    /// or not anyone is using it. **Then this waits for the join anyway.**
+    /// Detaching frees the directory; it does not reach into the worker that is
+    /// still inside an HTTP call, and that worker goes on using the Tokio
+    /// runtime. Returning here is what lets the caller drop it — and a worker
+    /// that outlives its runtime does not fail quietly, it panics. So the wait
+    /// is what keeps the two in the right order; it is the *mountpoint* that
+    /// needed to stop waiting, not this.
+    ///
+    /// Callers who cannot block are expected to do this off their own thread —
+    /// which is what the FFI does, so the window is unblocked long before this
+    /// returns.
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            if let Err(e) = session.umount_and_join() {
-                tracing::warn!("error during unmount: {e}");
-            }
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let mountpoint = self.mountpoint.clone();
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let joining = std::thread::spawn(move || {
+            let _ = done.send(session.umount_and_join());
+        });
+
+        if finished.recv_timeout(UNMOUNT_PATIENCE).is_err() {
+            tracing::warn!(
+                "unmounting {} is taking longer than {UNMOUNT_PATIENCE:?} — a request to the \
+                 NAS is still outstanding, so the mount is busy. Detaching it; the filesystem \
+                 will finish when that request does.",
+                mountpoint.display()
+            );
+            detach(&mountpoint);
+        }
+
+        // However long that takes. Nothing is waiting on this that a person can
+        // see, and letting go early is what turns a stuck request into a panic.
+        if joining.join().is_err() {
+            tracing::warn!("the filesystem's teardown panicked");
         }
     }
+}
+
+/// Detach a mount that will not come down the ordinary way.
+///
+/// `-z` is the whole point: a lazy unmount takes the filesystem out of the
+/// directory tree immediately, whether or not something is still using it, and
+/// the rest is cleaned up when the last user lets go. Without it a wedged mount
+/// needs somebody with `sudo`, which is not a thing to ask of a person who
+/// clicked Disconnect.
+#[cfg(target_os = "linux")]
+fn detach(mountpoint: &std::path::Path) {
+    // fuse3 first: `fusermount` may not exist on a fuse3-only system, and vice
+    // versa on an older one.
+    for tool in ["fusermount3", "fusermount"] {
+        match std::process::Command::new(tool)
+            .arg("-u")
+            .arg("-z")
+            .arg(mountpoint)
+            .status()
+        {
+            Ok(status) if status.success() => {
+                tracing::info!("detached {}", mountpoint.display());
+                return;
+            }
+            Ok(status) => tracing::debug!("{tool} exited {status} for {}", mountpoint.display()),
+            Err(e) => tracing::debug!("{tool} is not usable here: {e}"),
+        }
+    }
+    tracing::warn!(
+        "could not detach {} — it may need `fusermount3 -uz {}` by hand",
+        mountpoint.display(),
+        mountpoint.display()
+    );
 }
 
 /// Returns `true` when `/etc/fuse.conf` contains an uncommented
@@ -263,6 +350,7 @@ pub fn spawn_mount(
         client,
         inner: PlatformMount {
             session: Some(session),
+            mountpoint,
         },
     })
 }
