@@ -45,7 +45,14 @@ impl StaticKey {
         }
 
         let mut out = [0u8; STATIC_KEY_LEN];
-        for (byte, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
+        // `as_chunks` rather than `chunks_exact`: the pair arrives as an array
+        // of known length, so the two reads below are settled at compile time
+        // rather than bounds-checked one at a time. The remainder is empty by
+        // the check above, and taken rather than ignored so that stops being
+        // true loudly if it ever changes.
+        let (pairs, rest) = digits.as_chunks::<2>();
+        debug_assert!(rest.is_empty(), "an even length was checked above");
+        for (byte, pair) in out.iter_mut().zip(pairs) {
             let hi = hex_digit(pair[0])?;
             let lo = hex_digit(pair[1])?;
             *byte = (hi << 4) | lo;
