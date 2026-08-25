@@ -316,29 +316,25 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         {
             // Stop() disposes the native client and blocks while unmounting and
             // joining the background worker — keep it off the UI thread.
-            var finished = await _mountService.StopAsync();
+            await _mountService.StopAsync(onSlow: () => Dispatcher.UIThread.Post(() =>
+            {
+                // Said, not done. The volume is already unmounted — that is the
+                // first thing teardown does — and the session is still closing.
+                // The spinner stays because it is still true, and Connect stays
+                // disabled because this is not finished.
+                StatusText = "Still closing the session — the volume is unmounted";
+                AppendLog(
+                    "Closing the session is taking more than "
+                    + $"{MountService.SlowStopThreshold.TotalSeconds:0} seconds. The volume is "
+                    + "already unmounted; the last 'teardown:' line above is the step it is on.");
+            }));
             IsConnected = false;
             // Nothing is being reached any more, so the badge goes with it: a
             // "SMB" next to "Disconnected" is a guess about a connection that
             // no longer exists, and the next one may not get the same leg.
             Transport = SynoTransport.Unknown;
-            if (finished)
-            {
-                StatusText = "Disconnected";
-                AppendLog("Volume closed.");
-            }
-            else
-            {
-                // The volume is gone — unmounting is the first thing teardown
-                // does — and closing the session is still going. Saying so
-                // beats a progress bar that never stops, which is what this
-                // looked like before: no error, no end, and nothing to act on.
-                StatusText = "Disconnected — still closing the session";
-                AppendLog(
-                    $"Volume closed. The session is taking longer than "
-                    + $"{MountService.StopPatience.TotalSeconds:0} seconds to close; "
-                    + "the log above shows which step it is on.");
-            }
+            StatusText = "Disconnected";
+            AppendLog("Volume closed.");
         }
         catch (Exception ex)
         {

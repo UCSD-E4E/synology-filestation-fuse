@@ -135,42 +135,40 @@ public sealed class MountService : IDisposable
         _client = null;
     }
 
-    /// <summary>How long a disconnect is worth waiting for before saying so.
+    /// <summary>How long a disconnect runs before it is worth saying it is
+    /// taking a while.
     ///
     /// Teardown unmounts the volume and then waits for the filesystem's own
     /// workers to finish — a read being retried against a NAS that has stopped
-    /// answering can hold that open for as long as the retries last. That is
-    /// not a reason to leave somebody looking at a progress bar with no idea
-    /// whether anything is happening.</summary>
-    public static readonly TimeSpan StopPatience = TimeSpan.FromSeconds(20);
+    /// answering can hold that open. Worth <em>reporting</em>; not a reason to
+    /// stop waiting. See <see cref="StopAsync"/>.</summary>
+    public static readonly TimeSpan SlowStopThreshold = TimeSpan.FromSeconds(20);
 
-    /// <summary>Stop, and say whether it finished.
+    /// <summary>Stop, reporting once it is taking a while.
     ///
-    /// False means teardown is still running: the volume is unmounted either
-    /// way — that is the first thing it does — but the session is still being
-    /// closed. It is deliberately not abandoned, because the native call owns
-    /// the handle and cannot be interrupted from here; it is only stopped
-    /// being waited on.</summary>
-    public Task<bool> StopAsync() => AwaitWithin(Task.Run(Stop), StopPatience);
+    /// It keeps waiting, because giving up on the wait gives up on nothing:
+    /// the work owns a native handle and cannot be interrupted from here, so
+    /// it carries on regardless — while <see cref="Stop"/> has not yet reached
+    /// the line that releases this service's own reference. Reporting
+    /// "Disconnected" at that point would re-enable Connect over a service
+    /// that still holds a client, and the next attempt would fail with
+    /// "Already mounted." for as long as the process lived.
+    ///
+    /// So a slow teardown changes what is <em>said</em>, not what is true.</summary>
+    public async Task StopAsync(Action? onSlow = null) =>
+        await NotifyIfSlow(Task.Run(Stop), SlowStopThreshold, onSlow);
 
-    /// <summary>Wait for <paramref name="work"/>, but not forever.
+    /// <summary>Await <paramref name="work"/>, calling <paramref name="onSlow"/>
+    /// if it has not finished within <paramref name="patience"/>.
     ///
-    /// Returns false if it is still running. The work is not cancelled — it
-    /// owns a native handle and cannot be interrupted from here — it is only
-    /// stopped being waited on, which is the difference between a window that
-    /// says what happened and one that shows a progress bar indefinitely.
-    ///
-    /// Separated from <see cref="StopAsync"/> so the rule can be tested: this
-    /// service's constructor talks to the native library, which a unit test
-    /// has no business needing.</summary>
-    internal static async Task<bool> AwaitWithin(Task work, TimeSpan patience)
+    /// Always awaits it in the end, so nothing acts on a half-finished
+    /// teardown. Separate from <see cref="StopAsync"/> so the rule can be
+    /// tested: this service's constructor talks to the native library, which a
+    /// unit test has no business needing.</summary>
+    internal static async Task NotifyIfSlow(Task work, TimeSpan patience, Action? onSlow)
     {
-        var finished = await Task.WhenAny(work, Task.Delay(patience)) == work;
-        // Only when it finished: awaiting the other branch would wait forever
-        // for the thing we just decided not to wait for. A failure that
-        // arrives later is unobserved, which is why `Stop` swallows nothing.
-        if (finished) await work;
-        return finished;
+        if (await Task.WhenAny(work, Task.Delay(patience)) != work) onSlow?.Invoke();
+        await work;
     }
 
     public void Dispose()
