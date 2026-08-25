@@ -555,3 +555,46 @@ async fn a_stream_says_what_stopped_underneath_it() {
         "the reason from below reaches the caller: {failed}"
     );
 }
+
+#[tokio::test]
+async fn giving_up_on_a_connection_takes_the_stack_with_it() {
+    // `connect` aborts its task on every path it returns from. It cannot abort
+    // anything on a path it never returns from: a caller that gives up — a
+    // `timeout`, a `select!` losing the race — drops the future, and whatever
+    // it had already spawned is left running with nobody holding it.
+    //
+    // What is left is not idle. It holds the sender into the tunnel below,
+    // which keeps that tunnel's pump alive, which keeps an authenticated
+    // OpenVPN session and its socket alive. Once per retry, forever.
+    let (to_peer, mut peer_inbound) = mpsc::channel(64);
+    let (_to_us, our_inbound) = mpsc::channel(64);
+
+    let attempt = tokio::spawn(TunnelStream::connect(
+        to_peer,
+        our_inbound,
+        OURS,
+        NAS,
+        // Long enough that the caller below is certainly the one giving up.
+        Duration::from_secs(600),
+    ));
+
+    // It got as far as putting a SYN on the link, so the stack is running.
+    tokio::time::timeout(PATIENCE, peer_inbound.recv())
+        .await
+        .expect("something went out")
+        .expect("a packet");
+
+    attempt.abort();
+
+    // The stack holds the only sender on this channel. Its closing is the
+    // stack having gone.
+    let ended = tokio::time::timeout(Duration::from_secs(30), async {
+        while peer_inbound.recv().await.is_some() {}
+    })
+    .await;
+
+    assert!(
+        ended.is_ok(),
+        "the stack outlived the caller that asked for it"
+    );
+}

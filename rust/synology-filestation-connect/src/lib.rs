@@ -25,7 +25,10 @@
 //! `synology-filestation-core`, which is what makes a dead link cheap instead
 //! of a ten-second timeout per call.
 
+pub mod openvpn;
 pub mod profile;
+
+pub use openvpn::OpenVpnTunnel;
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -33,7 +36,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// How long a degraded choice is trusted before the chain looks for a better
 /// one. Steady state on the best leg never re-probes, so this is not a poll
@@ -238,12 +241,35 @@ pub trait Tunnel: Send + Sync {
 }
 
 /// A tunnel that could not be established, with a reason worth logging.
+///
+/// Two kinds, because the chain re-decides on a timer and the two want
+/// opposite things from it.
 #[derive(Debug, Clone)]
-pub struct TunnelUnavailable(pub String);
+pub enum TunnelUnavailable {
+    /// Could be different next time: no route, a server not answering, a
+    /// profile that has not been fetched yet.
+    Transient(String),
+    /// Will not be different next time, and asking again costs more than it
+    /// can gain.
+    ///
+    /// A rejected password is the one that matters. Every attempt is a real
+    /// authentication against the domain controller, so a chain that re-probes
+    /// every minute with a password the user mistyped locks their account
+    /// inside an hour — for a mount they have already given up on.
+    Refused(String),
+}
+
+impl TunnelUnavailable {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Transient(why) | Self::Refused(why) => why,
+        }
+    }
+}
 
 impl std::fmt::Display for TunnelUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.reason())
     }
 }
 
@@ -256,7 +282,9 @@ pub struct NoTunnel;
 #[async_trait]
 impl Tunnel for NoTunnel {
     async fn open(&self, _host: &str, _port: u16) -> Result<Connection, TunnelUnavailable> {
-        Err(TunnelUnavailable("no tunnel is configured".into()))
+        Err(TunnelUnavailable::Transient(
+            "no tunnel is configured".into(),
+        ))
     }
 }
 
@@ -351,6 +379,14 @@ pub struct Chain {
     tunnel: Box<dyn Tunnel>,
     recheck: Duration,
     decision: Mutex<Option<Decision>>,
+    /// Why the tunnel refused, once it has.
+    ///
+    /// Kept apart from the decision because it outlives one: a decision
+    /// expires so the chain can look for something better, and this exists
+    /// precisely so it stops looking. Cleared only by
+    /// [`reconsider`](Chain::reconsider), which is what a caller says when the
+    /// thing that was refused has changed.
+    refused: Mutex<Option<String>>,
 }
 
 impl Chain {
@@ -370,6 +406,7 @@ impl Chain {
             tunnel,
             recheck,
             decision: Mutex::new(None),
+            refused: Mutex::new(None),
         }
     }
 
@@ -453,11 +490,25 @@ impl Chain {
     /// whoever tried to use it.
     pub fn reconsider(&self) {
         *self.decision.lock().unwrap() = None;
+        *self.refused.lock().unwrap() = None;
     }
 
     /// Drop a remembered decision, but only if it is still the one we acted
     /// on. A concurrent caller may have written a fresher answer between our
     /// reading it and finding it wanting, and that one is not ours to discard.
+    /// Expire the remembered decision, leaving a refusal standing.
+    ///
+    /// What the recheck interval does when it lapses, without a test having to
+    /// wait for it.
+    #[cfg(test)]
+    fn reconsider_the_decision_only(&self) {
+        *self.decision.lock().unwrap() = None;
+    }
+
+    fn was_refused(&self) -> Option<String> {
+        self.refused.lock().unwrap().clone()
+    }
+
     fn forget(&self, acted_on: &Route) {
         let mut guard = self.decision.lock().unwrap();
         if guard.as_ref().is_some_and(|held| &held.route == acted_on) {
@@ -530,6 +581,16 @@ impl Chain {
                 // SMB and one that never comes up are now the same answer
                 // here — the error says which, and it is the tunnel's to
                 // explain rather than this layer's to guess.
+                // A tunnel that refused is not asked again. The chain
+                // re-decides on a timer, and a timer is exactly the wrong
+                // thing to point at a credential: every attempt is a real
+                // authentication, and enough of them lock the account.
+                (true, Some(_)) if self.was_refused().is_some() => {
+                    debug!(
+                        "transport: not asking the tunnel again ({})",
+                        self.was_refused().unwrap_or_default()
+                    );
+                }
                 (true, Some(inside)) if may_open => {
                     match self.tunnel.open(inside, SMB_PORT).await {
                         Ok(connection) => {
@@ -541,6 +602,10 @@ impl Chain {
                                 },
                                 Some(connection),
                             ));
+                        }
+                        Err(TunnelUnavailable::Refused(why)) => {
+                            warn!("transport: the tunnel refused, and will not be asked again until something changes ({why})");
+                            *self.refused.lock().unwrap() = Some(why);
                         }
                         Err(e) => debug!("transport: no SMB through a tunnel ({e})"),
                     }
@@ -621,6 +686,8 @@ mod tests {
     struct FakeTunnel {
         /// Whether a connection through it can be opened at all.
         works: AtomicBool,
+        /// Whether its refusal is one that asking again could change.
+        refuses: AtomicBool,
         opens: AtomicUsize,
         /// Every host it was asked to open a connection to, in order.
         asked: StdMutex<Vec<String>>,
@@ -633,6 +700,7 @@ mod tests {
         fn new(works: bool) -> Arc<Self> {
             Arc::new(Self {
                 works: AtomicBool::new(works),
+                refuses: AtomicBool::new(false),
                 opens: AtomicUsize::new(0),
                 asked: StdMutex::new(Vec::new()),
                 far_end: StdMutex::new(None),
@@ -652,6 +720,13 @@ mod tests {
         fn stops_working(&self) {
             self.works.store(false, Ordering::SeqCst);
         }
+        /// A tunnel that turns the credentials down, which is not a thing
+        /// asking again can fix.
+        fn refuses() -> Arc<Self> {
+            let tunnel = Self::new(false);
+            tunnel.refuses.store(true, Ordering::SeqCst);
+            tunnel
+        }
         fn asked(&self) -> Vec<String> {
             self.asked.lock().unwrap().clone()
         }
@@ -666,7 +741,11 @@ mod tests {
             self.opens.fetch_add(1, Ordering::SeqCst);
             self.asked.lock().unwrap().push(format!("{host}:{port}"));
             if !self.works.load(Ordering::SeqCst) {
-                return Err(TunnelUnavailable("no route".into()));
+                return Err(if self.refuses.load(Ordering::SeqCst) {
+                    TunnelUnavailable::Refused("that password is not the one".into())
+                } else {
+                    TunnelUnavailable::Transient("no route".into())
+                });
             }
             let (ours, theirs) = tokio::io::duplex(4096);
             *self.far_end.lock().unwrap() = Some(theirs);
@@ -777,6 +856,41 @@ mod tests {
         assert_eq!(route.transport, Transport::Https);
         assert_eq!(route.smb_host, None, "the HTTP leg carries no SMB");
         assert_eq!(tunnel.opens(), 1, "tried, and honestly reported");
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_refuses_is_not_asked_again() {
+        // The chain re-decides on a timer, and a timer is exactly the wrong
+        // thing to point at a credential. Every attempt is a real
+        // authentication against the domain controller, so a mount left
+        // running with a mistyped password would work its way to a locked
+        // account — for something the user has already given up on.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::refuses();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        for _ in 0..5 {
+            assert_eq!(chain.route().await.unwrap().transport, Transport::Https);
+            chain.reconsider_the_decision_only();
+        }
+
+        assert_eq!(tunnel.opens(), 1, "asked once, and believed");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_reconsidered_when_something_has_changed() {
+        // Not asking again is right until the thing that was refused changes.
+        // Only the caller knows that it has — they are the one who asked for a
+        // password again.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::refuses();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert_eq!(chain.route().await.unwrap().transport, Transport::Https);
+        chain.reconsider();
+        assert_eq!(chain.route().await.unwrap().transport, Transport::Https);
+
+        assert_eq!(tunnel.opens(), 2, "asked again, having been told to");
     }
 
     #[tokio::test]
