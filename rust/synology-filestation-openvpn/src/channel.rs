@@ -69,6 +69,12 @@ pub struct ControlChannel {
     tls_timeout: Duration,
     /// The keys carrying traffic.
     primary: KeyState,
+    /// Generations the peer began and then moved on from.
+    ///
+    /// A soft reset for one of these is a straggler rather than a fresh start;
+    /// see [`ControlChannel::handle`]. Cleared on promotion, so the key ids
+    /// recycling around the eight-value space are not refused forever.
+    superseded: Vec<KeyId>,
     /// A generation being negotiated, if the peer has started one.
     pending: Option<KeyState>,
 }
@@ -87,6 +93,7 @@ impl ControlChannel {
             replay: ReplayWindow::new(),
             tls_timeout,
             primary: KeyState::new(KeyId::FIRST, tls_timeout),
+            superseded: Vec::new(),
             pending: None,
         }
     }
@@ -152,6 +159,10 @@ impl ControlChannel {
     pub fn promote(&mut self) {
         if let Some(pending) = self.pending.take() {
             self.primary = pending;
+            // This renegotiation is over, and the abandoned attempts that led
+            // to it are far enough back that nothing of theirs is still in
+            // flight.
+            self.superseded.clear();
         }
     }
 
@@ -300,8 +311,21 @@ impl ControlChannel {
                 .pending
                 .as_ref()
                 .is_some_and(|state| state.key_id == packet.key_id);
-            if !already {
-                self.pending = Some(KeyState::new(packet.key_id, self.tls_timeout));
+            // But only a generation we have not already watched the peer
+            // abandon. The reset that started an abandoned attempt is still in
+            // flight when the next one begins, and it carries its own replay
+            // id, so nothing below this filters it out. Acted on, it replaces
+            // the handshake actually in progress — and every packet of the
+            // live generation is then refused as `OtherKeyId`, a renegotiation
+            // defeated by its own predecessor's retransmission.
+            let abandoned = self.superseded.contains(&packet.key_id);
+            if !already && !abandoned {
+                let previous = self
+                    .pending
+                    .replace(KeyState::new(packet.key_id, self.tls_timeout));
+                if let Some(previous) = previous {
+                    self.superseded.push(previous.key_id);
+                }
             }
         }
 

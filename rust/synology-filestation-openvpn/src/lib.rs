@@ -24,6 +24,7 @@ mod ip;
 mod key_method;
 mod packet;
 mod prf;
+mod profile;
 mod push;
 mod reliable;
 mod replay;
@@ -39,6 +40,7 @@ pub use ip::Ifconfig;
 pub use key_method::{ClientKeyMethod2, ServerKeyMethod2, ServerMessage};
 pub use packet::{Acks, ControlPacket, KeyId, Opcode, SessionId};
 pub use prf::{key_expansion, tls1_prf, KeySource2};
+pub use profile::{credentials, Profile};
 pub use push::{PushReply, PUSH_REQUEST, SUPPORTED_CIPHER};
 pub use reliable::{Delivery, Outgoing, RecvWindow, SendWindow};
 pub use replay::ReplayWindow;
@@ -135,6 +137,12 @@ pub enum Error {
     #[error("socket: {0}")]
     Io(String),
 
+    #[error("the profile is not usable: {0}")]
+    BadProfile(String),
+
+    #[error("the profile asks for something this client does not do: {0}")]
+    UnsupportedProfileOption(String),
+
     #[error("{context} is longer than the protocol can describe")]
     FieldTooLong {
         /// Which field, so the caller knows what to shorten.
@@ -203,6 +211,8 @@ impl Error {
             | Error::UnsupportedCipher(_)
             | Error::UnsupportedCompression(_)
             | Error::NoPushReply
+            | Error::BadProfile(_)
+            | Error::UnsupportedProfileOption(_)
             | Error::HandshakeTimeout
             | Error::PeerGone(_)
             | Error::Io(_) => true,

@@ -698,3 +698,47 @@ fn a_second_attempt_replaces_an_abandoned_one() {
         "the newer attempt is the one being negotiated"
     );
 }
+
+#[test]
+fn a_late_reset_for_an_abandoned_generation_does_not_disturb_the_live_one() {
+    // The other half of the rule above. A peer that stalls on one key id and
+    // moves to the next leaves a reset for the abandoned one still in flight,
+    // and it carries its own replay id, so nothing below this filters it out.
+    //
+    // Treated as "the peer is starting a generation", it tears down the
+    // handshake actually in progress and every packet of the live generation
+    // is then refused as `OtherKeyId` — a renegotiation defeated by its own
+    // predecessor's retransmission.
+    let now = Instant::now();
+    let (mut client, _) = handshaken(now);
+    let signer = TlsAuth::new(&key(), KeyDirection::Normal);
+
+    let soft_reset = |key_id: KeyId| ControlPacket {
+        opcode: Opcode::ControlSoftResetV1,
+        key_id,
+        session_id: SERVER_SESSION,
+        acks: None,
+        packet_id: Some(0),
+        payload: Vec::new(),
+    };
+
+    let first = KeyId::new(1).expect("one fits");
+    let second = KeyId::new(2).expect("two fits");
+
+    client
+        .handle(&signer.wrap(&soft_reset(first), 2, 0), now)
+        .expect("a start");
+    client
+        .handle(&signer.wrap(&soft_reset(second), 3, 0), now)
+        .expect("and the peer moving on");
+    assert_eq!(client.pending_key_id(), Some(second));
+
+    // Now the straggler, with its own replay id, so nothing below refuses it.
+    let _ = client.handle(&signer.wrap(&soft_reset(first), 4, 0), now);
+
+    assert_eq!(
+        client.pending_key_id(),
+        Some(second),
+        "the abandoned generation does not come back to replace the live one"
+    );
+}
