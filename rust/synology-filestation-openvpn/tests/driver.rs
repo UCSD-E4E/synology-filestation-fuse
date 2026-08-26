@@ -268,3 +268,41 @@ async fn a_connection_through_the_tunnel_reaches_the_far_side_encrypted() {
     assert_eq!(u16::from_be_bytes([tcp[2], tcp[3]]), 445, "to the SMB port");
     assert_eq!(tcp[13] & 0x3f, 0x02, "a bare SYN");
 }
+
+#[tokio::test]
+async fn a_datagram_that_will_not_send_does_not_end_the_tunnel() {
+    // What killed a copy. A megabyte of SMB write is a burst of packets, and a
+    // burst is what fills an interface queue — at which point the kernel
+    // refuses a datagram with `ENOBUFS`, which has no `ErrorKind` of its own
+    // and arrives as `Uncategorized`. Anything not on a list of five
+    // recognised kinds used to end the session, so the tunnel died a few
+    // milliseconds into the write and every layer above reported something
+    // true and useless.
+    //
+    // Provoked here by sending a datagram larger than the socket will take:
+    // `EMSGSIZE`, also uncategorised, also not the tunnel's fault.
+    let server = FakeServer::new(Answer::KeyMaterialThen(PUSH.to_string()));
+    let config = config_for(&server);
+    let port = a_free_port();
+    serve_from(server, port, Duration::ZERO);
+
+    let remote: SocketAddr = ([127, 0, 0, 1], port).into();
+    let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
+
+    // Far larger than any datagram a socket will carry.
+    let enormous = vec![0u8; 200 * 1024];
+    let _ = tunnel.send(enormous).await;
+
+    // The refusal is about that datagram, not about the tunnel: an ordinary
+    // payload still goes, and nothing has stopped.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        tunnel.failure().is_none(),
+        "one datagram the kernel would not take is not the end of a session: {:?}",
+        tunnel.failure()
+    );
+    tunnel
+        .send(b"and this still goes".to_vec())
+        .await
+        .expect("still carrying");
+}
