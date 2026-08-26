@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.2...synology-filestation-fuse-v0.5.3) (2026-08-26)
+
+
+### Miscellaneous Chores
+
+* **synology-filestation-fuse:** Synchronize synology-filestation versions
+
 ## [0.5.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.1...synology-filestation-fuse-v0.5.2) (2026-08-26)
 
 

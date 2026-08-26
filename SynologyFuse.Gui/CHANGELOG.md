@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.5.2...synology-filestation-gui-v0.5.3) (2026-08-26)
+
+
+### Performance Improvements
+
+* **openvpn:** raise the window, and say how a transfer is going ([1b7d8ac](https://github.com/UCSD-E4E/synology-filestation/commit/1b7d8ac6bfae1e37e1cd702672d3d32eca2f83b9))
+* **openvpn:** stop the tunnel's window being the speed limit ([7d9de90](https://github.com/UCSD-E4E/synology-filestation/commit/7d9de9099717f17adcdd9b0e80c15f2fb0edf8ed))
+* **openvpn:** stop the window being the speed limit ([4d0995c](https://github.com/UCSD-E4E/synology-filestation/commit/4d0995c491193ea973d6d4235092a1952cdc62fa))
+
 ## [0.5.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.5.1...synology-filestation-gui-v0.5.2) (2026-08-26)
 
 
