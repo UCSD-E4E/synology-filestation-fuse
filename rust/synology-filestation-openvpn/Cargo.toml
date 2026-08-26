@@ -41,6 +41,9 @@ md-5 = "0.10"
 sha1 = "0.10"
 # Session ids have to be unpredictable, not merely distinct.
 rand = "0.9"
+# A transfer in progress reports its rate, which is how a slow tunnel is
+# told from a stuck one. The consumer bridges this to its own log.
+tracing = "0.1"
 thiserror = "2"
 # The driver owns the socket and the timers. Everything below it stays
 # sans-io, which is what let the rest of this crate be tested without a

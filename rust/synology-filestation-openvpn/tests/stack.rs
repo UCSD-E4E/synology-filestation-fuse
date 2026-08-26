@@ -598,3 +598,60 @@ async fn giving_up_on_a_connection_takes_the_stack_with_it() {
         "the stack outlived the caller that asked for it"
     );
 }
+
+#[tokio::test]
+async fn a_bulk_write_gets_through_at_a_usable_rate() {
+    // The one the earlier tests could not see. They moved 200 KB and only asked
+    // whether it arrived — and it did, eventually, because TCP recovers from
+    // losing packets. What it does not do is recover *quickly*: the device used
+    // to drop whatever the tunnel's queue had no room for, `smoltcp` believed
+    // it had sent those packets, and the retransmissions read as congestion.
+    //
+    // What that looked like from above was an SMB write queue that would not
+    // drain — frames sitting half a minute, never on the wire — because the
+    // writer was blocked in `send` on a stack that was mostly retransmitting.
+    let (mut stream, _ask, mut heard) = connected().await;
+
+    // Enough to fill the window many times over, which is what a file copy is.
+    const BULK: usize = 4 * 1024 * 1024;
+
+    // The far end has to keep reading, or this measures the test harness.
+    let counting = tokio::spawn(async move {
+        let mut total = 0usize;
+        while total < BULK {
+            match heard.recv().await {
+                Some(chunk) => total += chunk.len(),
+                None => break,
+            }
+        }
+        total
+    });
+
+    let sent: Vec<u8> = (0..BULK).map(|i| (i % 251) as u8).collect();
+    let started = std::time::Instant::now();
+    stream.write_all(&sent).await.expect("written");
+    stream.flush().await.expect("acknowledged");
+    let took = started.elapsed();
+
+    let arrived = tokio::time::timeout(Duration::from_secs(30), counting)
+        .await
+        .expect("the far end kept up")
+        .expect("the task finished");
+    assert_eq!(arrived, BULK, "all of it, not most of it");
+
+    // Loopback through an in-process peer: not a network measurement, but the
+    // difference between a stack that sends and one that spends its time
+    // sending things twice.
+    eprintln!(
+        "4 MiB in {took:?} ({:.1} MB/s)",
+        BULK as f64 / took.as_secs_f64() / 1e6
+    );
+    // No threshold asserted. An in-process peer with no latency measures the
+    // harness, not the tunnel: the window that limits a real transfer is
+    // irrelevant when the round trip is microseconds. What this pins is that
+    // four megabytes go through intact and promptly enough to notice a stall.
+    assert!(
+        took < Duration::from_secs(20),
+        "4 MiB took {took:?} even in-process"
+    );
+}
