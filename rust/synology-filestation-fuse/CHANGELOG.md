@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.1...synology-filestation-fuse-v0.5.2) (2026-08-26)
+
+
+### Bug Fixes
+
+* **fuse:** let the kernel cache a directory, and stop mtimes moving ([828d05d](https://github.com/UCSD-E4E/synology-filestation/commit/828d05d43dce362b38d66bb8a16b3a4c20f54841))
+* **fuse:** let the kernel cache a directory, and stop mtimes moving ([e9ffe2b](https://github.com/UCSD-E4E/synology-filestation/commit/e9ffe2b1692351bd379f75edea8a34609327fcbb))
+
 ## [0.5.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.0...synology-filestation-fuse-v0.5.1) (2026-08-26)
 
 
