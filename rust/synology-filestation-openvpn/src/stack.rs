@@ -404,6 +404,9 @@ impl TunnelStream {
         let (to_stack, from_caller) = mpsc::channel(QUEUE_DEPTH);
         let (to_caller, from_stack) = mpsc::channel(QUEUE_DEPTH);
         let (up, is_up) = tokio::sync::oneshot::channel();
+        // One slot, shared with the driver: a stream that breaks mid-write can
+        // then say what happened rather than only that something did.
+        let cause = LinkFailure::new();
         let (progress, watching) = watch::channel(Progress {
             acknowledged: 0,
             closed: false,
@@ -423,6 +426,7 @@ impl TunnelStream {
                 to_caller: Some(to_caller),
                 by: started + patience,
                 progress,
+                cause: cause.clone(),
                 started,
             },
             up,
@@ -436,7 +440,7 @@ impl TunnelStream {
                 taken: 0,
                 written: 0,
                 progress: watching,
-                cause: LinkFailure::new(),
+                cause,
                 flushing: None,
                 shutting_down: None,
                 task,
@@ -615,6 +619,44 @@ impl TunnelStream {
     }
 }
 
+/// Why the loop stopped.
+///
+/// It has five exits and used to take all of them in silence, so a caller
+/// mid-write got "the tunnel stack has stopped" and nothing more: no cause on
+/// the error, nothing in the log, and no way to tell a peer that closed from a
+/// link that went from a socket the stack itself gave up on.
+#[derive(Debug, Clone, Copy)]
+enum Stopped {
+    /// Nobody was waiting for the connection any more.
+    CallerGaveUp,
+    /// It never came up inside the time it was given.
+    NeverConnected,
+    /// The socket refused what the caller wrote — it is not open for sending.
+    CannotSend,
+    /// The tunnel underneath stopped, and what it had delivered is handed over.
+    TunnelGone,
+    /// Both ends are finished and there is nothing left to read.
+    Finished,
+}
+
+impl Stopped {
+    fn why(self) -> &'static str {
+        match self {
+            Self::CallerGaveUp => "nobody was waiting for it any more",
+            Self::NeverConnected => "it never came up",
+            Self::CannotSend => "the connection would not accept what was written to it",
+            Self::TunnelGone => "the tunnel underneath it stopped",
+            Self::Finished => "the connection was closed at both ends",
+        }
+    }
+
+    /// Whether this is the connection ending as it should, or something the
+    /// caller is entitled to hear about.
+    fn is_ordinary(self) -> bool {
+        matches!(self, Self::Finished | Self::CallerGaveUp)
+    }
+}
+
 /// Everything the loop owns.
 struct Driver {
     device: TunnelDevice,
@@ -633,6 +675,9 @@ struct Driver {
     from_caller: mpsc::Receiver<Vec<u8>>,
     /// How much of what the caller wrote is still ours to deliver.
     progress: watch::Sender<Progress>,
+    /// Where a reason for stopping goes, so the stream reports why rather than
+    /// only that it did.
+    cause: LinkFailure,
     /// When to give up if the connection has still not come up.
     ///
     /// The loop's own deadline, not the caller's. `connect` aborts this task
@@ -681,6 +726,10 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
     let mut last = *driver.progress.borrow();
     // Whether the tunnel underneath is still there.
     let mut link_gone = false;
+    // Set on the way out of every exit, so a caller is never told only that
+    // this stopped. No initial value worth having: every `break` names one,
+    // which is the point.
+    let stopped;
     // Whether the caller has finished writing, so the connection should be
     // closed once what it wrote has gone.
     let mut closing = false;
@@ -697,6 +746,7 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
         // That is the only signal there is, and without it this loop runs on
         // holding a tunnel nobody wants.
         if up.as_ref().is_some_and(|caller| caller.is_closed()) {
+            stopped = Stopped::CallerGaveUp;
             break;
         }
 
@@ -705,6 +755,7 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
         // long time should not mean a stack that waits that long to notice a
         // peer that was never there.
         if !established && StdInstant::now() >= driver.by {
+            stopped = Stopped::NeverConnected;
             break;
         }
 
@@ -720,7 +771,11 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
         if !queued.is_empty() && driver.socket().can_send() {
             match driver.socket().send_slice(&queued) {
                 Ok(sent) => drop(queued.drain(..sent)),
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!("tunnel: the connection would not take a write: {e}");
+                    stopped = Stopped::CannotSend;
+                    break;
+                }
             }
         }
         if closing && queued.is_empty() && driver.socket().may_send() {
@@ -816,6 +871,11 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
         // it.
         let unread = driver.socket().can_recv() && driver.to_caller.is_some();
         if (!driver.socket().is_active() || link_gone) && !unread {
+            stopped = if link_gone {
+                Stopped::TunnelGone
+            } else {
+                Stopped::Finished
+            };
             break;
         }
 
@@ -879,6 +939,19 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
     // Said as it is rather than as anyone would like it: a `flush` waiting on
     // bytes this stack still had is a `flush` that failed, and a reader whose
     // peer never said goodbye was cut off rather than finished.
+    // Which is worth saying when it is not the ordinary ending: a caller
+    // mid-transfer sees a broken pipe, and this is the reason for it. Recorded
+    // before the channels close, because that is what wakes the caller.
+    if stopped.is_ordinary() {
+        tracing::debug!("tunnel: the connection ended because {}", stopped.why());
+    } else {
+        tracing::warn!("tunnel: the connection ended because {}", stopped.why());
+        driver.cause.set(Error::Io(format!(
+            "the connection ended because {}",
+            stopped.why()
+        )));
+    }
+
     driver.progress.send_replace(Progress {
         stopped: true,
         ..last
