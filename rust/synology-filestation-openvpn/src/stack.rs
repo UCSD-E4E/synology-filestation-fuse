@@ -88,6 +88,11 @@ const IDLE_POLL: Duration = Duration::from_millis(50);
 pub struct TunnelDevice {
     outbound: mpsc::Sender<Vec<u8>>,
     inbox: std::collections::VecDeque<Vec<u8>>,
+    /// How many packets have gone each way, so a connection that never came up
+    /// can say whether anything was ever sent and whether anything ever came
+    /// back. `Cell` because a transmit token borrows the device immutably.
+    sent: std::cell::Cell<usize>,
+    received: usize,
 }
 
 impl TunnelDevice {
@@ -95,12 +100,20 @@ impl TunnelDevice {
         Self {
             outbound,
             inbox: std::collections::VecDeque::new(),
+            sent: std::cell::Cell::new(0),
+            received: 0,
         }
     }
 
     /// Hand the device a packet that arrived from the tunnel.
     pub fn push(&mut self, packet: Vec<u8>) {
+        self.received += 1;
         self.inbox.push_back(packet);
+    }
+
+    /// Packets handed to the tunnel, and packets taken from it.
+    pub fn traffic(&self) -> (usize, usize) {
+        (self.sent.get(), self.received)
     }
 }
 
@@ -128,6 +141,7 @@ impl Device for TunnelDevice {
             TunnelRx { packet },
             TunnelTx {
                 outbound: &self.outbound,
+                sent: &self.sent,
             },
         ))
     }
@@ -135,6 +149,7 @@ impl Device for TunnelDevice {
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(TunnelTx {
             outbound: &self.outbound,
+            sent: &self.sent,
         })
     }
 }
@@ -151,6 +166,7 @@ impl RxToken for TunnelRx {
 
 pub struct TunnelTx<'a> {
     outbound: &'a mpsc::Sender<Vec<u8>>,
+    sent: &'a std::cell::Cell<usize>,
 }
 
 impl TxToken for TunnelTx<'_> {
@@ -161,6 +177,7 @@ impl TxToken for TunnelTx<'_> {
         // link does with a packet it cannot carry. TCP above will send it
         // again.
         let _ = self.outbound.try_send(buffer);
+        self.sent.set(self.sent.get() + 1);
         result
     }
 }
@@ -794,6 +811,59 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
     // Whoever is waiting on `connect` hears why, rather than waiting out the
     // whole timeout for an answer that is never coming.
     if let Some(up) = up.take() {
-        let _ = up.send(Err(Error::Io("the connection was refused or reset".into())));
+        let (sent, received) = driver.device.traffic();
+        let _ = up.send(Err(Error::Io(why_it_never_came_up(sent, received))));
+    }
+}
+
+/// Why a connection that never came up did not.
+///
+/// "Refused or reset" was said whatever happened, and for the case that
+/// actually occurs in the field it was simply untrue: a tunnel came up, the
+/// SYN went out, the NAS said nothing at all, and thirty seconds later the
+/// driver reported a refusal that never happened. That sent an afternoon after
+/// the routing in this crate, which turned out to be fine.
+///
+/// The counts are the whole point. Nothing received means the packets left and
+/// the far end was silent — which is somebody else's half of the problem, and
+/// saying so is what stops it being investigated here again.
+fn why_it_never_came_up(sent: usize, received: usize) -> String {
+    if received == 0 {
+        format!(
+            "nothing answered inside the tunnel: {sent} packets went out and none came back, \
+             so the address is silent rather than refusing"
+        )
+    } else {
+        format!("the connection was refused or reset after {sent} sent and {received} received")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The message that sent an afternoon after a routing bug that did not
+    /// exist. Silence and refusal are different problems belonging to
+    /// different people, and only one of them is worth reading this crate for.
+    #[test]
+    fn a_silent_far_end_is_not_reported_as_a_refusal() {
+        let said = why_it_never_came_up(6, 0);
+
+        assert!(said.contains("silent"), "got {said}");
+        assert!(!said.contains("refused or reset"), "got {said}");
+        assert!(
+            said.contains('6'),
+            "how much we sent is the evidence: {said}"
+        );
+    }
+
+    /// A real refusal still reads as one — the counts are context, not a new
+    /// diagnosis.
+    #[test]
+    fn something_that_answered_and_refused_still_says_so() {
+        let said = why_it_never_came_up(3, 1);
+
+        assert!(said.contains("refused or reset"), "got {said}");
+        assert!(said.contains('1'), "got {said}");
     }
 }
