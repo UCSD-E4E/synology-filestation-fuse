@@ -189,6 +189,11 @@ impl DirCache {
         }
     }
 
+    /// Whether listings are cached at all, which `--cache-ttl 0` turns off.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn get(&self, path: &str) -> Option<Arc<Vec<SynoFileInfo>>> {
         if !self.enabled {
             return None;

@@ -20,6 +20,26 @@ use synology_filestation_core::transport::{WriteHandle, WriteOpen};
 use synology_filestation_core::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
 
 const TTL: Duration = Duration::from_secs(1);
+
+/// What `opendir` tells the kernel it may keep.
+///
+/// Without `FOPEN_CACHE_DIR` the kernel caches nothing about a directory, so
+/// every `opendir` + `getdents` pair from every caller arrives here — a native
+/// filesystem would answer most of them from the page cache and never be
+/// asked. A client that lists a directory in a loop therefore lands on this
+/// filesystem in full, hundreds of times a second.
+///
+/// Granting it is not a new promise. `--cache-ttl` already says how stale a
+/// listing may be, and this hands the kernel the same contract; a mount that
+/// set it to zero asked for no caching, and gets none here either rather than
+/// having the flag honoured in one layer and ignored in the next.
+fn dir_open_flags(may_cache: bool) -> FopenFlags {
+    if may_cache {
+        FopenFlags::FOPEN_CACHE_DIR
+    } else {
+        FopenFlags::empty()
+    }
+}
 const ROOT_INO: u64 = 1;
 
 /// Convert a raw errno (`SynoFsError::to_errno`, `libc::ENOENT`, etc.) into the
@@ -139,10 +159,12 @@ fn file_attr(owner: Ownership, ino: u64, info: &SynoFileInfo) -> FileAttr {
                 ts_to_system(t.crtime),
             )
         })
-        .unwrap_or_else(|| {
-            let now = SystemTime::now();
-            (now, now, now, now)
-        });
+        // The epoch, not `now()`. An entry DSM sent no `time` for has an
+        // unknown timestamp, and `now()` answers that question differently
+        // every time it is asked — so nothing, kernel included, can ever cache
+        // an attribute for it, and the mount revalidates forever. A poor
+        // timestamp that stays put beats a plausible one that does not.
+        .unwrap_or((UNIX_EPOCH, UNIX_EPOCH, UNIX_EPOCH, UNIX_EPOCH));
 
     FileAttr {
         ino: INodeNo(ino),
@@ -862,6 +884,17 @@ impl Filesystem for SynologyFS {
                 reply.error(errno(e.to_errno()));
             }
         }
+    }
+
+    /// Nothing to open — a directory here is a listing, not a handle — but the
+    /// reply is the only place to tell the kernel it may cache one, and
+    /// fuser's default says nothing. See [`dir_open_flags`].
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if self.get_path_for_ino(ino.0).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        reply.opened(FileHandle(0), dir_open_flags(self.dir_cache.is_enabled()));
     }
 
     fn readdir(
@@ -2715,5 +2748,65 @@ mod tests {
         forget_parent_listing(&cache, "notes.txt");
 
         assert!(cache.get(VIRTUAL_ROOT_PATH).is_none());
+    }
+
+    // ── Caches the kernel is allowed to keep ──────────────────────────────────
+
+    fn info_without_timestamps(path: &str) -> SynoFileInfo {
+        SynoFileInfo {
+            name: path.rsplit('/').next().unwrap_or("").to_string(),
+            path: path.to_string(),
+            isdir: false,
+            additional: None,
+            code: None,
+        }
+    }
+
+    /// Regression: an entry DSM sent no `time` for was given
+    /// `SystemTime::now()` — a *different* mtime on every single stat. Nothing
+    /// downstream can cache an attribute that changes each time it is asked
+    /// for, so the kernel has to revalidate everything about that inode
+    /// forever, and a mount that is doing nothing still looks busy.
+    ///
+    /// The epoch is a poor timestamp and an honest one: it says "not known",
+    /// which is the truth, and it says the same thing twice.
+    #[test]
+    fn an_entry_with_no_timestamps_gets_a_stable_one() {
+        let owner = Ownership {
+            uid: 1000,
+            gid: 1000,
+            umask: 0o022,
+        };
+
+        let first = file_attr(owner, 42, &info_without_timestamps("/homes/a.txt"));
+        let second = file_attr(owner, 42, &info_without_timestamps("/homes/a.txt"));
+
+        assert_eq!(first.mtime, second.mtime, "asking twice must answer twice");
+        assert_eq!(
+            first.mtime, UNIX_EPOCH,
+            "and the answer is 'not known', not 'now'"
+        );
+        assert_eq!(first.ctime, second.ctime);
+        assert_eq!(first.atime, second.atime);
+        assert_eq!(first.crtime, second.crtime);
+    }
+
+    /// Regression: `opendir` was never implemented, so fuser's default replied
+    /// with no flags and the kernel cached nothing about a directory. Every
+    /// `opendir` + `getdents` pair from every caller came all the way through
+    /// to us — a native filesystem would have served most of them from the
+    /// page cache and we would never have seen them. That is why a client
+    /// looping on `~/mnt` showed up as hundreds of `readdir` a second.
+    #[test]
+    fn a_directory_the_kernel_may_cache_says_so() {
+        assert!(dir_open_flags(true).contains(FopenFlags::FOPEN_CACHE_DIR));
+    }
+
+    /// `--cache-ttl 0` is somebody asking for no caching. Handing the kernel a
+    /// directory cache anyway would honour the flag in this process and ignore
+    /// it one layer up, which is worse than not having the flag.
+    #[test]
+    fn a_mount_that_asked_for_no_caching_does_not_get_one_from_the_kernel() {
+        assert!(!dir_open_flags(false).contains(FopenFlags::FOPEN_CACHE_DIR));
     }
 }
