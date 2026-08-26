@@ -14,17 +14,6 @@ dependencies = [
 
 [[package]]
 name = "aes"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
-dependencies = [
- "cfg-if",
- "cipher 0.4.4",
- "cpufeatures 0.2.17",
-]
-
-[[package]]
-name = "aes"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8eb277bec05f56a0e0591f155a484cbd0f4f07ff2905051a48c72f004f7ed58"
@@ -41,7 +30,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdf011db2e21ce0d575593d749db5554b47fed37aff429e4dc50bc91ac93a028"
 dependencies = [
  "aead",
- "aes 0.9.2",
+ "aes",
  "cipher 0.5.2",
  "ctr",
  "ghash",
@@ -2494,7 +2483,7 @@ name = "smb2"
 version = "0.18.1"
 source = "git+https://github.com/UCSD-E4E/smb2?rev=66262fdf48ef8a4bc9c0b24299fd60dad6c7bfb8#66262fdf48ef8a4bc9c0b24299fd60dad6c7bfb8"
 dependencies = [
- "aes 0.9.2",
+ "aes",
  "aes-gcm",
  "async-trait",
  "ccm",
@@ -2612,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "synology-filestation-core"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2646,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "synology-filestation-fuse"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2679,7 +2668,7 @@ dependencies = [
 name = "synology-filestation-openvpn"
 version = "0.1.0"
 dependencies = [
- "aes 0.8.4",
+ "aes",
  "cbc",
  "hex",
  "hmac 0.12.1",
@@ -2713,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "synology_filestation"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "pyo3",
  "pyo3-async-runtimes",

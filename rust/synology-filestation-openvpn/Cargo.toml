@@ -40,7 +40,7 @@ rustls-pemfile = "2"
 # do not get to choose, and are used only through HMAC.
 # The data channel's cipher, as e4e-nas is configured. Not AEAD: DSM offers
 # CBC, so the packet carries a separate HMAC.
-aes = "0.8"
+aes = "0.9"
 cbc = { version = "0.1", features = ["alloc"] }
 md-5 = "0.10"
 sha1 = "0.10"
