@@ -278,7 +278,10 @@ async fn a_reader_that_takes_its_time_loses_nothing() {
     // is the whole reason there is a window.
     let (mut stream, ask, _heard) = connected().await;
 
-    let sent: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    // Bigger than the window, which is what makes this about the window: it
+    // is now sized not to be the thing limiting a transfer, so a couple of
+    // hundred kilobytes would simply sit in the buffer and prove nothing.
+    let sent: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let sending = {
         let sent = sent.clone();
         tokio::spawn(async move {

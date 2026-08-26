@@ -52,11 +52,21 @@ const MTU: usize = 1400;
 
 /// How much each direction may buffer inside the stack.
 ///
-/// A window, in effect: what may be in flight before the sender has to wait for
-/// an acknowledgement. It is therefore the ceiling on throughput — a window
-/// divided by the round trip — and SMB writes a lot: at 64 KiB and 30 ms this
-/// tops out around 2 MB/s no matter how fast the link is.
-const BUFFER: usize = 256 * 1024;
+/// This is the window, and the window is the speed limit: a sender may have
+/// this much unacknowledged, so throughput cannot exceed it divided by the
+/// round trip, however fast the link underneath is. At 64 KiB — where this
+/// started — that is about 2 MB/s over a 30 ms path, and no amount of
+/// bandwidth changes it.
+///
+/// So it is sized not to be the constraint rather than to be comfortable. Four
+/// mebibytes carries roughly a gigabit at 30 ms, and about 300 Mbit even on a
+/// 100 ms path — past anything a NAS at the end of a VPN is going to do. The
+/// cost is eight mebibytes of buffer for the one connection this stack exists
+/// to carry, which is not a trade worth thinking about twice.
+///
+/// It is not capped at 65535 by the protocol: `smoltcp` derives its window
+/// scale (RFC 7323) from this capacity, so the advertised window grows with it.
+const BUFFER: usize = 4 * 1024 * 1024;
 
 /// The largest piece of a write handed to the stack at once.
 ///
