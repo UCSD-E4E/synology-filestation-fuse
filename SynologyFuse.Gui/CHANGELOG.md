@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.5.0...synology-filestation-gui-v0.5.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **openvpn:** stop reporting silence as a refusal, and cover net30 ([6d91597](https://github.com/UCSD-E4E/synology-filestation/commit/6d9159724a86944fd2bcc2f60f232fcdb077d5d5))
+* **openvpn:** stop reporting silence as a refusal, and cover net30 ([f29e9c2](https://github.com/UCSD-E4E/synology-filestation/commit/f29e9c29dc9618d24f0d9e1ebea95b5c248e64cd))
+
 ## [0.5.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.4.3...synology-filestation-gui-v0.5.0) (2026-08-26)
 
 
