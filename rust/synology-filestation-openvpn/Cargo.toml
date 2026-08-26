@@ -12,6 +12,10 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+# What the tunnel negotiated reaches a person only as log output. Without it,
+# a tunnel that comes up and then carries nothing is indistinguishable from one
+# that landed on the wrong subnet.
+tracing = "0.1"
 # SHA-512 is what the server is configured with (`auth SHA512` in the published
 # .ovpn). See `tls_auth.rs` for why that is a constant here and not a knob.
 hmac = "0.12"
@@ -51,6 +55,9 @@ tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-
 tokio-util = "0.7"
 
 [dev-dependencies]
+# The negotiated summary is the crate's only diagnostic surface, so what it
+# says is worth asserting on.
+tracing-subscriber = "0.3"
 hex = "0.4"
 # The tests build a few packets the library's own types refuse to represent,
 # so they sign them themselves.

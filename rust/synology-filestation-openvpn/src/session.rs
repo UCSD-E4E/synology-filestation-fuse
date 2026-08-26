@@ -841,6 +841,27 @@ impl Session {
                 reply.cipher.clone().unwrap_or_default(),
             ));
         }
+        // The one place the negotiated tunnel is described. Everything here was
+        // already parsed and stored and never mentioned, which left "the tunnel
+        // is up but nothing answered at the NAS" indistinguishable from "we
+        // landed on a different subnet from the address we dialled". The
+        // address is the fact that separates them, and it is not a secret —
+        // the credentials never appear.
+        tracing::info!(
+            "tunnel: ready as {} (cipher {}, peer-id {})",
+            match reply.ifconfig {
+                Some((address, mask)) => format!("{address} mask {mask}"),
+                // A point-to-point server assigns nothing, which is worth
+                // saying out loud rather than printing an empty space.
+                None => "no address assigned".to_string(),
+            },
+            reply.cipher.as_deref().unwrap_or("unspecified"),
+            match reply.peer_id {
+                Some(id) => format!("{id:?}"),
+                None => "none".to_string(),
+            }
+        );
+
         self.push = Some(reply);
         self.phase = Phase::Ready;
         self.open_tunnel()
