@@ -850,7 +850,16 @@ impl Session {
         tracing::info!(
             "tunnel: ready as {} (cipher {}, peer-id {})",
             match reply.ifconfig {
-                Some((address, mask)) => format!("{address} mask {mask}"),
+                // As a prefix, not as the two values the server sent. Under
+                // `topology net30` — OpenVPN 2.5's default, and what DSM runs
+                // — the second value is the *peer*, not a mask, and printing
+                // it as one is actively misleading: it reads as a /32-ish
+                // netmask and sends the reader after a routing fault that is
+                // not there.
+                Some((address, second)) => {
+                    let ifconfig = crate::ip::Ifconfig::from_push(address, second);
+                    format!("{}/{}", ifconfig.address, ifconfig.prefix)
+                }
                 // A point-to-point server assigns nothing, which is worth
                 // saying out loud rather than printing an empty space.
                 None => "no address assigned".to_string(),

@@ -282,3 +282,57 @@ async fn keepalives_and_payload_share_the_channel() {
     );
     assert_eq!(noticed.undecryptable.load(Relaxed), 0);
 }
+
+/// What e4e-nas *actually* pushes, as opposed to what this file assumed.
+///
+/// The second value is the peer, not a mask: OpenVPN 2.5 defaults to
+/// `topology net30`, and DSM runs 2.5. Every test here used a mask, which put
+/// the client on a `/24` containing the NAS and so could never exercise the
+/// case the live tunnel hits.
+const PUSH_NET30: &str = "PUSH_REPLY,ifconfig 10.90.24.6 10.90.24.5,peer-id 4,\
+                          cipher AES-256-CBC,ping 1,ping-restart 60";
+
+/// Regression: under `net30` the client is given a four-address block —
+/// 10.90.24.4 to .7 — and the NAS at 10.90.24.1 is **not in it**. The stack
+/// installed the address and no route at all, so an off-link destination had
+/// nowhere to go: the SYN was never emitted, nothing answered, and thirty
+/// seconds later the tunnel reported "the connection was refused or reset".
+/// It was never refused. Nothing was ever sent.
+///
+/// This is the whole live failure, and the suite could not see it because
+/// every push in it was a `topology subnet` one.
+#[tokio::test]
+async fn a_net30_tunnel_can_still_reach_the_nas() {
+    let server = FakeServer::with_peer_id(Answer::KeyMaterialThen(PUSH_NET30.to_string()), PEER_ID);
+    let mut config = SessionConfig::new(
+        server.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.tls_timeout = Duration::from_millis(100);
+
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("a local socket");
+    let remote: SocketAddr = socket.local_addr().expect("bound");
+    let noticed = spawn_nas(server, socket);
+
+    let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
+    let mut stream = tunnel
+        .open_stream(NAS, Duration::from_secs(10))
+        .await
+        .expect("the NAS is off-link under net30, and reached through the peer");
+
+    let said = b"smb2 would go here".to_vec();
+    let expected: Vec<u8> = said.iter().map(|b| b.to_ascii_uppercase()).collect();
+
+    stream.write_all(&said).await.expect("written");
+    let mut heard = vec![0u8; said.len()];
+    tokio::time::timeout(Duration::from_secs(20), stream.read_exact(&mut heard))
+        .await
+        .expect("in reasonable time")
+        .expect("read");
+
+    assert_eq!(heard, expected, "the bytes came back, so they arrived");
+    assert_eq!(noticed.undecryptable.load(Relaxed), 0);
+}
