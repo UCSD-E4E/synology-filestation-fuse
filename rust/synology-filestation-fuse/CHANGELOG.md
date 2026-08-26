@@ -1,5 +1,74 @@
 # Changelog
 
+## [0.5.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.1...synology-filestation-fuse-v0.5.2) (2026-08-26)
+
+
+### Bug Fixes
+
+* **fuse:** let the kernel cache a directory, and stop mtimes moving ([828d05d](https://github.com/UCSD-E4E/synology-filestation/commit/828d05d43dce362b38d66bb8a16b3a4c20f54841))
+* **fuse:** let the kernel cache a directory, and stop mtimes moving ([e9ffe2b](https://github.com/UCSD-E4E/synology-filestation/commit/e9ffe2b1692351bd379f75edea8a34609327fcbb))
+
+## [0.5.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.0...synology-filestation-fuse-v0.5.1) (2026-08-26)
+
+
+### Miscellaneous Chores
+
+* **synology-filestation-fuse:** Synchronize synology-filestation versions
+
+## [0.5.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.4.3...synology-filestation-fuse-v0.5.0) (2026-08-26)
+
+
+### Bug Fixes
+
+* **fuse:** cache directory listings instead of re-asking the NAS ([a3805ee](https://github.com/UCSD-E4E/synology-filestation/commit/a3805ee5f0a657f612731fce53232ce90ae38666))
+* **fuse:** cache directory listings instead of re-asking the NAS ([28cf37f](https://github.com/UCSD-E4E/synology-filestation/commit/28cf37f52b9928962cdfc6eede972aa221123609))
+
+## [0.4.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.4.2...synology-filestation-fuse-v0.4.3) (2026-08-25)
+
+
+### Bug Fixes
+
+* a disconnect that finishes, and frees the mountpoint ([02956dd](https://github.com/UCSD-E4E/synology-filestation/commit/02956ddf367b6108e5866bc2235d87831fb317f7))
+* **fuse:** free the mountpoint without needing sudo ([aca4973](https://github.com/UCSD-E4E/synology-filestation/commit/aca4973642e25cb74bfff27a9a3cedfb96d4637d))
+
+## [0.4.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.4.1...synology-filestation-fuse-v0.4.2) (2026-08-25)
+
+
+### Bug Fixes
+
+* **vpn:** send the tunnel a domain-qualified login name ([31dc296](https://github.com/UCSD-E4E/synology-filestation/commit/31dc2962420cd042d3e900858a0310984b9bdc0d))
+* **vpn:** send the tunnel a domain-qualified login name ([16f232c](https://github.com/UCSD-E4E/synology-filestation/commit/16f232c3eb50ae375f047c17bbd687f481be0a5e))
+
+## [0.4.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.4.0...synology-filestation-fuse-v0.4.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* stop assuming where a NAS keeps things, and which path was meant ([20899bf](https://github.com/UCSD-E4E/synology-filestation/commit/20899bfa013643f9584dbb5bd01a1c8214b46380))
+* stop assuming where a NAS keeps things, and which path was meant ([0ac1397](https://github.com/UCSD-E4E/synology-filestation/commit/0ac1397aff84a1d6ae74fd04749db85bdde58885))
+
+## [0.4.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.3.1...synology-filestation-fuse-v0.4.0) (2026-08-25)
+
+
+### Features
+
+* **cli:** choose the transport through the chain, and expose the flags ([670f50a](https://github.com/UCSD-E4E/synology-filestation/commit/670f50ae1b5ec6850193eae444eeec434f585e46))
+* **cli:** choose the transport through the chain, and expose the flags ([ed55c48](https://github.com/UCSD-E4E/synology-filestation/commit/ed55c48ac6ca62eecebd04e8183219a0a29b8319))
+* **connect:** the tunnel leg answers with a connection, not an address ([c70adcc](https://github.com/UCSD-E4E/synology-filestation/commit/c70adcc0e47d0b3518f59905a3f915eaf51171ae))
+* **fuse:** mount through a tunnel the mount raises itself ([a12ab11](https://github.com/UCSD-E4E/synology-filestation/commit/a12ab11d7fb6d454c541d71a0a0a6fecb203c662))
+* **fuse:** mount through a tunnel the mount raises itself ([ccbf727](https://github.com/UCSD-E4E/synology-filestation/commit/ccbf727715f480e8305867a0e4fd3717e7d1b12c))
+* **fuse:** stream writes to the server as they are made ([a438b21](https://github.com/UCSD-E4E/synology-filestation/commit/a438b21ead8ed3a9e98ff37799645ab59a93a57f))
+* **fuse:** stream writes to the server as they are made ([aee913a](https://github.com/UCSD-E4E/synology-filestation/commit/aee913a7942c4467cabafef993f490a78c667460))
+* **smb:** use the two SET_INFO operations the fork added ([11844c1](https://github.com/UCSD-E4E/synology-filestation/commit/11844c1fbec44ecbe8f86559d451a1cd9af0cdb7))
+* **smb:** use the two SET_INFO operations the fork added ([746ed14](https://github.com/UCSD-E4E/synology-filestation/commit/746ed14e0b73f7ee4add655d2cd1c17b4a72f035))
+
+
+### Bug Fixes
+
+* **cli:** let the old env knobs reach the chain, and an empty domain mean none ([993e2a0](https://github.com/UCSD-E4E/synology-filestation/commit/993e2a0cd3c86d5895ad50719b3e482d0992a4e1))
+* **connect:** an address that cannot be dialled must not look like one ([1b8d894](https://github.com/UCSD-E4E/synology-filestation/commit/1b8d894d9f15fcd74ab9a512ce7b702e2f814425))
+* **core:** a declined backend must not strand its own breaker ([c3dacd1](https://github.com/UCSD-E4E/synology-filestation/commit/c3dacd17fec2fddfedf2ed048ee00a09f7e0643c))
+
 ## [0.3.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.3.0...synology-filestation-fuse-v0.3.1) (2026-08-12)
 
 

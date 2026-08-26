@@ -41,10 +41,11 @@ public sealed class SynoClient : IDisposable
     /// for a self-signed DSM certificate — the connection is then encrypted but
     /// not authenticated. Throws <see cref="TlsVerificationException"/> when
     /// verification is on and the certificate is rejected.</param>
-    /// <param name="smbDomain">NetBIOS domain SMB authenticates in — `KRG` for
-    /// an AD account, null for a local DSM user. Without it an AD account is
+    /// <param name="domain">NetBIOS domain the account lives in — `KRG` for an
+    /// AD account, null for a local DSM user. Without it an AD account is
     /// checked against the appliance's own accounts, fails, and SMB is silently
-    /// skipped in favour of the slower HTTP path.</param>
+    /// skipped in favour of the slower HTTP path; the VPN, meanwhile, refuses
+    /// an unqualified name before it looks at the password.</param>
     /// <param name="vpnProfile">Where the OpenVPN profile is kept. Given it, a
     /// NAS that does not answer directly is reached through a tunnel raised
     /// inside this process — no tun device and no privileged helper. Fetched
@@ -54,13 +55,13 @@ public sealed class SynoClient : IDisposable
     public static SynoClient Connect(
         string host, ushort port, bool https, string username, string password,
         string? otp = null, bool autoRelogin = true, bool verifySsl = true,
-        string? smbDomain = null, string? vpnProfile = null, string? vpnHost = null,
+        string? domain = null, string? vpnProfile = null, string? vpnHost = null,
         string? vpnProfileRemote = null)
     {
         NativeMethods.EnsureResolver();
         var err = default(NativeError);
         int rc = syno_connect(host, port, https, username, password, otp, autoRelogin,
-            verifySsl, smbDomain, vpnProfile, vpnHost, vpnProfileRemote, out var handle, ref err);
+            verifySsl, domain, vpnProfile, vpnHost, vpnProfileRemote, out var handle, ref err);
         Check(rc, ref err);
         return new SynoClient(handle);
     }

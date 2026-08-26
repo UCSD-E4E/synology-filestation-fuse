@@ -12,7 +12,7 @@ use fuser::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::cache::{InodeCache, ReadCache};
+use crate::cache::{DirCache, InodeCache, ReadCache};
 use crate::spill::{payload_for, upload_payload, SpillBuffer};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
@@ -20,6 +20,26 @@ use synology_filestation_core::transport::{WriteHandle, WriteOpen};
 use synology_filestation_core::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
 
 const TTL: Duration = Duration::from_secs(1);
+
+/// What `opendir` tells the kernel it may keep.
+///
+/// Without `FOPEN_CACHE_DIR` the kernel caches nothing about a directory, so
+/// every `opendir` + `getdents` pair from every caller arrives here — a native
+/// filesystem would answer most of them from the page cache and never be
+/// asked. A client that lists a directory in a loop therefore lands on this
+/// filesystem in full, hundreds of times a second.
+///
+/// Granting it is not a new promise. `--cache-ttl` already says how stale a
+/// listing may be, and this hands the kernel the same contract; a mount that
+/// set it to zero asked for no caching, and gets none here either rather than
+/// having the flag honoured in one layer and ignored in the next.
+fn dir_open_flags(may_cache: bool) -> FopenFlags {
+    if may_cache {
+        FopenFlags::FOPEN_CACHE_DIR
+    } else {
+        FopenFlags::empty()
+    }
+}
 const ROOT_INO: u64 = 1;
 
 /// Convert a raw errno (`SynoFsError::to_errno`, `libc::ENOENT`, etc.) into the
@@ -139,10 +159,12 @@ fn file_attr(owner: Ownership, ino: u64, info: &SynoFileInfo) -> FileAttr {
                 ts_to_system(t.crtime),
             )
         })
-        .unwrap_or_else(|| {
-            let now = SystemTime::now();
-            (now, now, now, now)
-        });
+        // The epoch, not `now()`. An entry DSM sent no `time` for has an
+        // unknown timestamp, and `now()` answers that question differently
+        // every time it is asked — so nothing, kernel included, can ever cache
+        // an attribute for it, and the mount revalidates forever. A poor
+        // timestamp that stays put beats a plausible one that does not.
+        .unwrap_or((UNIX_EPOCH, UNIX_EPOCH, UNIX_EPOCH, UNIX_EPOCH));
 
     FileAttr {
         ino: INodeNo(ino),
@@ -191,9 +213,27 @@ const MAX_CONCURRENT_TRANSFERS: usize = 4;
 struct Transfers {
     client: Arc<SynologyClient>,
     cache: Arc<InodeCache>,
+    dir_cache: Arc<DirCache>,
     read_cache: Arc<ReadCache>,
     buffers: Buffers,
     limit: Arc<tokio::sync::Semaphore>,
+}
+
+/// Forget the listing of the directory `path` sits in.
+///
+/// Called wherever this mount changes what a directory contains. The TTL is a
+/// contract about changes made *elsewhere*; a file this process just created
+/// has to appear in the very next listing, or the mount contradicts itself.
+///
+/// Free rather than a method because both the filesystem and its transfer half
+/// change directory contents, and the rule is the same for each.
+fn forget_parent_listing(dir_cache: &DirCache, path: &str) {
+    let parent = match path.rfind('/') {
+        // A top-level share: its parent is the virtual root.
+        Some(0) | None => VIRTUAL_ROOT_PATH,
+        Some(cut) => &path[..cut],
+    };
+    dir_cache.invalidate(parent);
 }
 
 impl Transfers {
@@ -292,6 +332,7 @@ impl Transfers {
         drop(buf);
 
         self.cache.invalidate_path(&nas_path);
+        forget_parent_listing(&self.dir_cache, &nas_path);
         self.read_cache.invalidate_ino(ino);
         Ok(())
     }
@@ -360,6 +401,9 @@ impl Transfers {
 pub struct SynologyFS {
     client: Arc<SynologyClient>,
     cache: Arc<InodeCache>,
+    /// Directory listings, so a client that reads a directory repeatedly does
+    /// not become repeated load on the appliance. See [`DirCache`].
+    dir_cache: Arc<DirCache>,
     read_cache: Arc<ReadCache>,
     rt: tokio::runtime::Handle,
     write_buffers: Buffers,
@@ -371,9 +415,35 @@ pub struct SynologyFS {
 }
 
 impl SynologyFS {
+    /// A directory's entries, from the cache when they are there.
+    ///
+    /// The single place a listing is obtained, so the caching applies to every
+    /// caller rather than to whichever one remembered. `readdir` and `lookup`
+    /// both go through it, and both used to hit the network unconditionally —
+    /// which, for a directory the kernel reads three times per `ls`, is three
+    /// round trips to say one thing.
+    ///
+    /// The virtual root is a listing like any other; that it comes from
+    /// `list_share` rather than `list` is the only difference, and it is the
+    /// one that gets polled.
+    fn listing(&self, path: &str) -> Result<Arc<Vec<SynoFileInfo>>, SynoFsError> {
+        if let Some(cached) = self.dir_cache.get(path) {
+            return Ok(cached);
+        }
+        let entries = if path == VIRTUAL_ROOT_PATH {
+            self.block(self.client.list_shares())?
+        } else {
+            self.block(self.client.list_dir(path))?
+        };
+        // `insert` hands back what it stored, so this still works when caching
+        // is switched off (`--cache-ttl 0`) and nothing was stored at all.
+        Ok(self.dir_cache.insert(path, entries))
+    }
+
     pub fn new(
         client: Arc<SynologyClient>,
         cache: Arc<InodeCache>,
+        dir_cache: Arc<DirCache>,
         read_cache: Arc<ReadCache>,
         rt: tokio::runtime::Handle,
         owner: Ownership,
@@ -381,6 +451,7 @@ impl SynologyFS {
         Self {
             client,
             cache,
+            dir_cache,
             read_cache,
             rt,
             write_buffers: Arc::new(Mutex::new(HashMap::new())),
@@ -395,6 +466,7 @@ impl SynologyFS {
         Transfers {
             client: self.client.clone(),
             cache: self.cache.clone(),
+            dir_cache: self.dir_cache.clone(),
             read_cache: self.read_cache.clone(),
             buffers: self.write_buffers.clone(),
             limit: self.transfer_limit.clone(),
@@ -726,14 +798,14 @@ impl Filesystem for SynologyFS {
         // Looking up a share name directly under the virtual root.
         if parent_path == VIRTUAL_ROOT_PATH {
             debug!("lookup share: {}", name_str);
-            let shares = match self.block(self.client.list_shares()) {
+            let shares = match self.listing(VIRTUAL_ROOT_PATH) {
                 Ok(s) => s,
                 Err(e) => {
                     reply.error(errno(e.to_errno()));
                     return;
                 }
             };
-            match shares.into_iter().find(|s| s.name == name_str) {
+            match shares.iter().find(|s| s.name == name_str).cloned() {
                 Some(info) => {
                     let ino = self.cache.get_or_alloc_ino(&info.path);
                     let attr = self.syno_to_attr(ino, &info);
@@ -814,6 +886,17 @@ impl Filesystem for SynologyFS {
         }
     }
 
+    /// Nothing to open — a directory here is a listing, not a handle — but the
+    /// reply is the only place to tell the kernel it may cache one, and
+    /// fuser's default says nothing. See [`dir_open_flags`].
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if self.get_path_for_ino(ino.0).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        reply.opened(FileHandle(0), dir_open_flags(self.dir_cache.is_enabled()));
+    }
+
     fn readdir(
         &self,
         _req: &Request,
@@ -834,7 +917,7 @@ impl Filesystem for SynologyFS {
 
         // Virtual root: list FileStation shares instead of a real directory.
         let (entries, parent_ino) = if path == VIRTUAL_ROOT_PATH {
-            let shares = match self.block(self.client.list_shares()) {
+            let shares = match self.listing(VIRTUAL_ROOT_PATH) {
                 Ok(s) => s,
                 Err(e) => {
                     error!("readdir shares: {}", e);
@@ -845,7 +928,7 @@ impl Filesystem for SynologyFS {
             debug!("readdir root: got {} shares", shares.len());
             (shares, ROOT_INO)
         } else {
-            let entries = match self.block(self.client.list_dir(&path)) {
+            let entries = match self.listing(&path) {
                 Ok(e) => e,
                 Err(e) => {
                     error!("readdir {}: {}", path, e);
@@ -873,7 +956,7 @@ impl Filesystem for SynologyFS {
         all_entries.push((ino, FileType::Directory, ".".to_string()));
         all_entries.push((parent_ino, FileType::Directory, "..".to_string()));
 
-        for file_info in entries {
+        for file_info in entries.iter() {
             let child_ino = self.cache.get_or_alloc_ino(&file_info.path);
             let kind = if file_info.isdir {
                 FileType::Directory
@@ -881,7 +964,7 @@ impl Filesystem for SynologyFS {
                 FileType::RegularFile
             };
             let name = file_info.name.clone();
-            self.cache.insert(child_ino, file_info);
+            self.cache.insert(child_ino, file_info.clone());
             all_entries.push((child_ino, kind, name));
         }
 
@@ -1176,6 +1259,10 @@ impl Filesystem for SynologyFS {
         let new_path = format!("{}/{}", parent_path.trim_end_matches('/'), name_str);
         debug!("create: {}", new_path);
 
+        // The directory now has a file in it that its cached listing does not
+        // mention, and the upload does not happen until flush.
+        self.dir_cache.invalidate(&parent_path);
+
         // Defer the actual NAS upload to flush/release.  Allocate an inode and
         // seed the cache with a synthetic entry so getattr works before the first
         // flush.  The write buffer is marked new_file=true so flush uses
@@ -1243,6 +1330,7 @@ impl Filesystem for SynologyFS {
                     self.read_cache.invalidate_ino(ino);
                 }
                 self.cache.invalidate_path(&path);
+                forget_parent_listing(&self.dir_cache, &path);
                 reply.ok();
             }
             Err(e) => {
@@ -1273,6 +1361,8 @@ impl Filesystem for SynologyFS {
         match self.block(self.client.delete(&path)) {
             Ok(()) => {
                 self.cache.invalidate_prefix(&path);
+                self.dir_cache.invalidate_prefix(&path);
+                forget_parent_listing(&self.dir_cache, &path);
                 reply.ok();
             }
             Err(e) => {
@@ -1312,6 +1402,7 @@ impl Filesystem for SynologyFS {
                 let ino = self.cache.get_or_alloc_ino(&info.path);
                 let attr = self.syno_to_attr(ino, &info);
                 self.cache.insert(ino, info);
+                self.dir_cache.invalidate(&parent_path);
                 reply.entry(&TTL, &attr, fuser::Generation(0));
             }
             Err(e) => {
@@ -1375,6 +1466,7 @@ impl Filesystem for SynologyFS {
                     self.read_cache.invalidate_ino(ino);
                 }
                 self.cache.invalidate_path(&new_path);
+                forget_parent_listing(&self.dir_cache, &new_path);
                 let _ = self.block(self.client.delete(&new_path)); // ignore error — may not exist
             }
             match self.block(self.client.rename(&old_path, new_name_str)) {
@@ -1383,6 +1475,7 @@ impl Filesystem for SynologyFS {
                         self.read_cache.invalidate_ino(ino);
                     }
                     self.cache.invalidate_path(&old_path);
+                    forget_parent_listing(&self.dir_cache, &old_path);
                     let ino = self.cache.get_or_alloc_ino(&new_path);
                     self.cache.insert(ino, info);
                     reply.ok();
@@ -1413,6 +1506,7 @@ impl Filesystem for SynologyFS {
         // transfer, so it goes to the runtime rather than sitting on this
         // event-loop thread for the length of the copy.
         let cache = self.cache.clone();
+        let dir_cache = self.dir_cache.clone();
         let old = old_path.clone();
         let new = new_path.clone();
         self.start_move_across_dirs(
@@ -1422,6 +1516,11 @@ impl Filesystem for SynologyFS {
             move |r| match r {
                 Ok(()) => {
                     cache.invalidate_path(&old);
+                    // Both ends changed, and the move only lands when the
+                    // transfer does — so this cannot be done up front with the
+                    // same-directory case above.
+                    forget_parent_listing(&dir_cache, &old);
+                    forget_parent_listing(&dir_cache, &new);
                     reply.ok();
                 }
                 Err(e) => {
@@ -1544,6 +1643,7 @@ mod tests {
         let fs = SynologyFS::new(
             Arc::new(client_for(&server)),
             Arc::new(InodeCache::new(30)),
+            Arc::new(DirCache::new(30)),
             Arc::new(ReadCache::new(BLOCK, 64)),
             rt.handle().clone(),
             Ownership {
@@ -2405,6 +2505,7 @@ mod tests {
         let fs = SynologyFS::new(
             Arc::new(client),
             Arc::new(InodeCache::new(30)),
+            Arc::new(DirCache::new(30)),
             Arc::new(ReadCache::new(BLOCK, 64)),
             rt.handle().clone(),
             Ownership {
@@ -2534,5 +2635,178 @@ mod tests {
 
         let bodies = posted_bodies(&f);
         assert_eq!(bodies.len(), 1, "the empty file was uploaded");
+    }
+
+    // ── Listing cache ─────────────────────────────────────────────────────────
+
+    fn mount_share_listing(f: &Fixture) {
+        f.rt.block_on(
+            Mock::given(http_method("GET"))
+                .and(query_param("method", "list_share"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": {"total": 1, "offset": 0, "shares": [
+                        {"name": "homes", "path": "/homes", "isdir": true}
+                    ]}
+                })))
+                .mount(&f.server),
+        );
+    }
+
+    fn share_listings_asked_for(f: &Fixture) -> usize {
+        f.rt.block_on(f.server.received_requests())
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| {
+                r.url
+                    .query()
+                    .is_some_and(|q| q.contains("method=list_share"))
+            })
+            .count()
+    }
+
+    /// Regression: the mount asked the NAS for a listing every single time it
+    /// was asked for one, and the kernel asks more than once per directory
+    /// read — once for the entries, then again at the end offset to be told
+    /// there are no more. A desktop file manager polling a freshly-appeared
+    /// volume (GIO does exactly this) became a sustained stream of listings
+    /// against `synoscgi`, the shared CGI backend the whole appliance runs on:
+    /// roughly ten a second, indefinitely, for a directory nobody was looking
+    /// at any more.
+    #[test]
+    fn a_repeated_listing_is_served_without_asking_the_nas_again() {
+        let f = fixture();
+        mount_share_listing(&f);
+
+        let first = f.fs.listing(VIRTUAL_ROOT_PATH).expect("a listing");
+        let second = f.fs.listing(VIRTUAL_ROOT_PATH).expect("a listing");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1, "the same listing, served twice");
+        assert_eq!(
+            share_listings_asked_for(&f),
+            1,
+            "the second read has to come from the cache, or a polling client \
+             is a denial of service aimed at the appliance"
+        );
+    }
+
+    /// The cache may not outlive a change this mount itself made: a file
+    /// created and then listed has to be there, or the mount contradicts
+    /// itself within one process.
+    #[test]
+    fn a_listing_is_fetched_again_after_the_directory_changes() {
+        let f = fixture();
+        mount_share_listing(&f);
+
+        f.fs.listing(VIRTUAL_ROOT_PATH).expect("a listing");
+        f.fs.dir_cache.invalidate(VIRTUAL_ROOT_PATH);
+        f.fs.listing(VIRTUAL_ROOT_PATH).expect("a listing");
+
+        assert_eq!(share_listings_asked_for(&f), 2);
+    }
+
+    /// The virtual root is spelled `""`, so a top-level share's parent is not
+    /// what string arithmetic naively produces: `/homes` would otherwise
+    /// invalidate `""[..0]`, which is the same thing by luck rather than by
+    /// intent, and `homes` (no leading slash) would panic on the slice.
+    #[test]
+    fn the_parent_of_a_top_level_share_is_the_virtual_root() {
+        let cache = DirCache::new(30);
+        cache.insert(VIRTUAL_ROOT_PATH, vec![]);
+        cache.insert("/homes", vec![]);
+
+        forget_parent_listing(&cache, "/homes");
+
+        assert!(cache.get(VIRTUAL_ROOT_PATH).is_none(), "the root is stale");
+        assert!(
+            cache.get("/homes").is_some(),
+            "the share's own listing did not change; a file appeared beside it"
+        );
+    }
+
+    #[test]
+    fn the_parent_of_a_nested_path_is_the_directory_holding_it() {
+        let cache = DirCache::new(30);
+        cache.insert("/homes/chris", vec![]);
+        cache.insert("/homes", vec![]);
+
+        forget_parent_listing(&cache, "/homes/chris/notes.txt");
+
+        assert!(cache.get("/homes/chris").is_none());
+        assert!(cache.get("/homes").is_some(), "only one level up");
+    }
+
+    /// A name with no separator at all reaches this from a caller that built
+    /// it itself. Slicing on a `None` index would panic in a FUSE callback,
+    /// which takes the mount down rather than failing one operation.
+    #[test]
+    fn a_bare_name_falls_back_to_the_root_rather_than_panicking() {
+        let cache = DirCache::new(30);
+        cache.insert(VIRTUAL_ROOT_PATH, vec![]);
+
+        forget_parent_listing(&cache, "notes.txt");
+
+        assert!(cache.get(VIRTUAL_ROOT_PATH).is_none());
+    }
+
+    // ── Caches the kernel is allowed to keep ──────────────────────────────────
+
+    fn info_without_timestamps(path: &str) -> SynoFileInfo {
+        SynoFileInfo {
+            name: path.rsplit('/').next().unwrap_or("").to_string(),
+            path: path.to_string(),
+            isdir: false,
+            additional: None,
+            code: None,
+        }
+    }
+
+    /// Regression: an entry DSM sent no `time` for was given
+    /// `SystemTime::now()` — a *different* mtime on every single stat. Nothing
+    /// downstream can cache an attribute that changes each time it is asked
+    /// for, so the kernel has to revalidate everything about that inode
+    /// forever, and a mount that is doing nothing still looks busy.
+    ///
+    /// The epoch is a poor timestamp and an honest one: it says "not known",
+    /// which is the truth, and it says the same thing twice.
+    #[test]
+    fn an_entry_with_no_timestamps_gets_a_stable_one() {
+        let owner = Ownership {
+            uid: 1000,
+            gid: 1000,
+            umask: 0o022,
+        };
+
+        let first = file_attr(owner, 42, &info_without_timestamps("/homes/a.txt"));
+        let second = file_attr(owner, 42, &info_without_timestamps("/homes/a.txt"));
+
+        assert_eq!(first.mtime, second.mtime, "asking twice must answer twice");
+        assert_eq!(
+            first.mtime, UNIX_EPOCH,
+            "and the answer is 'not known', not 'now'"
+        );
+        assert_eq!(first.ctime, second.ctime);
+        assert_eq!(first.atime, second.atime);
+        assert_eq!(first.crtime, second.crtime);
+    }
+
+    /// Regression: `opendir` was never implemented, so fuser's default replied
+    /// with no flags and the kernel cached nothing about a directory. Every
+    /// `opendir` + `getdents` pair from every caller came all the way through
+    /// to us — a native filesystem would have served most of them from the
+    /// page cache and we would never have seen them. That is why a client
+    /// looping on `~/mnt` showed up as hundreds of `readdir` a second.
+    #[test]
+    fn a_directory_the_kernel_may_cache_says_so() {
+        assert!(dir_open_flags(true).contains(FopenFlags::FOPEN_CACHE_DIR));
+    }
+
+    /// `--cache-ttl 0` is somebody asking for no caching. Handing the kernel a
+    /// directory cache anyway would honour the flag in this process and ignore
+    /// it one layer up, which is worse than not having the flag.
+    #[test]
+    fn a_mount_that_asked_for_no_caching_does_not_get_one_from_the_kernel() {
+        assert!(!dir_open_flags(false).contains(FopenFlags::FOPEN_CACHE_DIR));
     }
 }

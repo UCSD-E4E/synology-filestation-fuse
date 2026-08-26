@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.5.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.5.1...synology_filestation-v0.5.2) (2026-08-26)
+
+
+### Miscellaneous Chores
+
+* **synology_filestation:** Synchronize synology-filestation versions
+
+## [0.5.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.5.0...synology_filestation-v0.5.1) (2026-08-26)
+
+
+### Miscellaneous Chores
+
+* **synology_filestation:** Synchronize synology-filestation versions
+
+## [0.5.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.4.3...synology_filestation-v0.5.0) (2026-08-26)
+
+
+### Miscellaneous Chores
+
+* **synology_filestation:** Synchronize synology-filestation versions
+
+## [0.4.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.4.2...synology_filestation-v0.4.3) (2026-08-25)
+
+
+### Miscellaneous Chores
+
+* **synology_filestation:** Synchronize synology-filestation versions
+
+## [0.4.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.4.1...synology_filestation-v0.4.2) (2026-08-25)
+
+
+### Miscellaneous Chores
+
+* **synology_filestation:** Synchronize synology-filestation versions
+
+## [0.4.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.4.0...synology_filestation-v0.4.1) (2026-08-25)
+
+
+### Miscellaneous Chores
+
+* **synology_filestation:** Synchronize synology-filestation versions
+
+## [0.4.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.3.1...synology_filestation-v0.4.0) (2026-08-25)
+
+
+### Miscellaneous Chores
+
+* **synology_filestation:** Synchronize synology-filestation versions
+
 ## [0.3.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.3.0...synology_filestation-v0.3.1) (2026-08-12)
 
 

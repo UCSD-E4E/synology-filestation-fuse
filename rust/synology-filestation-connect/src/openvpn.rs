@@ -37,7 +37,10 @@ pub struct OpenVpnTunnel {
     /// shared secret (it embeds `ta.key`), and the copy on disk is the one
     /// [`ProfileSource`](crate::profile::ProfileSource) keeps current.
     profile: PathBuf,
-    username: String,
+    /// The name sent to the server, already carrying its domain if there is
+    /// one. Kept finished rather than as parts: it is what goes on the wire,
+    /// and it is what the log has to name.
+    login: String,
     password: Zeroizing<String>,
     /// How long the whole thing may take, handshake included.
     patience: Duration,
@@ -48,7 +51,7 @@ impl std::fmt::Debug for OpenVpnTunnel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenVpnTunnel")
             .field("profile", &self.profile)
-            .field("username", &self.username)
+            .field("login", &self.login)
             .field("password", &"<redacted>")
             .field("patience", &self.patience)
             .finish()
@@ -56,15 +59,20 @@ impl std::fmt::Debug for OpenVpnTunnel {
 }
 
 impl OpenVpnTunnel {
+    /// `domain` is the directory the account lives in — `KRG` for an AD user,
+    /// `None` for a local one. It is not a separate credential; it decides
+    /// what the username has to look like, which is why it is taken here
+    /// rather than passed further down.
     pub fn new(
         profile: impl Into<PathBuf>,
         username: impl Into<String>,
         password: impl Into<String>,
+        domain: Option<&str>,
         patience: Duration,
     ) -> Self {
         Self {
             profile: profile.into(),
-            username: username.into(),
+            login: qualified(domain, &username.into()),
             password: Zeroizing::new(password.into()),
             patience,
         }
@@ -88,7 +96,7 @@ impl OpenVpnTunnel {
         let dial = (profile.remote.clone(), profile.port);
         let config = profile
             .into_config(Some(credentials(
-                self.username.clone(),
+                self.login.clone(),
                 self.password.to_string(),
             )))
             .map_err(|e| {
@@ -105,7 +113,13 @@ impl OpenVpnTunnel {
             TunnelUnavailable::Transient(format!("the vpn server {server} resolves to nothing"))
         })?;
 
-        debug!("tunnel: raising one to {server} for {host}:{port}");
+        // The login name, because an unqualified one is refused by DSM before
+        // the password is looked at and the server says only `AUTH_FAILED`. A
+        // name is not a secret; the password is, and never appears.
+        debug!(
+            "tunnel: raising one to {server} for {host}:{port}, as {}",
+            self.login
+        );
         let tunnel = OpenVpn::connect(config, remote).await.map_err(|e| {
             let why = format!("the vpn tunnel to {server} did not come up: {e}");
             // A rejected password is not a blip. Every attempt is a real
@@ -163,6 +177,27 @@ impl Tunnel for OpenVpnTunnel {
                 self.patience
             ))),
         }
+    }
+}
+
+/// The login name to send, for an account in `domain`.
+///
+/// DSM's `vpnauthd` runs a Synology pre-check — `SYNOWinsEnumAllDomains` and
+/// the privilege file — *before* the FreeRADIUS site config it then defers to.
+/// An unqualified name matches no local account in that pre-check, so it is
+/// refused as "Incorrect user name" and never reaches the `Realm` regex that
+/// would have accepted either form. The client therefore has to say which
+/// directory the account is in, even though the server could work it out.
+///
+/// A name that already says so is left alone: `KRG\KRG\user` fails the same
+/// pre-check, and the domain field and the username field are two places the
+/// same person can put the same prefix.
+fn qualified(domain: Option<&str>, username: &str) -> String {
+    match domain.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(domain) if !username.contains('\\') && !username.contains('@') => {
+            format!("{domain}\\{username}")
+        }
+        _ => username.to_string(),
     }
 }
 
@@ -230,5 +265,85 @@ mod tests {
     #[test]
     fn a_name_that_resolves_to_nothing_has_nothing_to_dial() {
         assert_eq!(pick_address(std::iter::empty()), None);
+    }
+
+    /// Regression: e4e-nas rejected `c.crutchfield.642` with a bare
+    /// `AUTH_FAILED` before the password was ever looked at. DSM's `vpnauthd`
+    /// runs a Synology pre-check — `SYNOWinsEnumAllDomains` plus the privilege
+    /// file — ahead of the FreeRADIUS site config, and an unqualified name
+    /// matches no local account there, so it is refused as "Incorrect user
+    /// name" and never reaches the `Realm` regex that would have handled it.
+    /// The domain the SMB leg already carries is the one this needs.
+    #[test]
+    fn an_ad_login_is_qualified_with_the_domain() {
+        assert_eq!(
+            qualified(Some("KRG"), "c.crutchfield.642"),
+            "KRG\\c.crutchfield.642"
+        );
+    }
+
+    /// Somebody who typed the prefix themselves has said it once. Saying it
+    /// again sends `KRG\KRG\…`, which fails the same pre-check for a new
+    /// reason and reads, in a log, exactly like the bug being fixed here.
+    #[test]
+    fn a_name_that_already_carries_its_domain_is_left_alone() {
+        assert_eq!(
+            qualified(Some("KRG"), "KRG\\c.crutchfield.642"),
+            "KRG\\c.crutchfield.642"
+        );
+    }
+
+    /// The other form the `Realm` regex handles, and one the pre-check
+    /// accepts, so it is qualified already.
+    #[test]
+    fn a_upn_is_qualified_already() {
+        assert_eq!(qualified(Some("KRG"), "user@krg.local"), "user@krg.local");
+    }
+
+    /// No domain is a local account on an appliance joined to nothing.
+    /// Prefixing an absent one would send `\admin`, which is not a name.
+    #[test]
+    fn a_login_with_no_domain_is_sent_as_typed() {
+        assert_eq!(qualified(None, "admin"), "admin");
+        assert_eq!(qualified(Some(""), "admin"), "admin");
+        assert_eq!(qualified(Some("  "), "admin"), "admin");
+    }
+
+    /// The qualifying has to happen where the tunnel is built, not at one of
+    /// the two call sites, or the CLI and the GUI get to disagree about it.
+    #[test]
+    fn the_tunnel_authenticates_as_the_qualified_name() {
+        let tunnel = OpenVpnTunnel::new(
+            "/nowhere/e4e-nas-vpn.ovpn",
+            "c.crutchfield.642",
+            "hunter2",
+            Some("KRG"),
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(tunnel.login, "KRG\\c.crutchfield.642");
+    }
+
+    /// The profile embeds `ta.key` and the password is a domain credential.
+    /// `Debug` is hand-written precisely so neither reaches a log; the login
+    /// name does, because not knowing what was sent is what made the live
+    /// failure cost a NAS-side investigation.
+    #[test]
+    fn debug_shows_the_login_and_never_the_password() {
+        let shown = format!(
+            "{:?}",
+            OpenVpnTunnel::new(
+                "/nowhere/e4e-nas-vpn.ovpn",
+                "c.crutchfield.642",
+                "hunter2",
+                Some("KRG"),
+                Duration::from_secs(1),
+            )
+        );
+
+        // `Debug` for a string escapes the separator, so this asserts on the
+        // two halves rather than on the form they are printed in.
+        assert!(shown.contains("KRG") && shown.contains("c.crutchfield.642"));
+        assert!(!shown.contains("hunter2"), "got {shown}");
     }
 }

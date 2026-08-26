@@ -58,7 +58,7 @@ fn written(text: &str) -> tempfile::NamedTempFile {
 }
 
 fn tunnel_for(profile: &std::path::Path, patience: Duration) -> OpenVpnTunnel {
-    OpenVpnTunnel::new(profile, "ad-user", "hunter2", patience)
+    OpenVpnTunnel::new(profile, "ad-user", "hunter2", None, patience)
 }
 
 #[tokio::test]

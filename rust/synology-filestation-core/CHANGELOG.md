@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.5.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.5.1...synology-filestation-core-v0.5.2) (2026-08-26)
+
+
+### Miscellaneous Chores
+
+* **synology-filestation-core:** Synchronize synology-filestation versions
+
+## [0.5.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.5.0...synology-filestation-core-v0.5.1) (2026-08-26)
+
+
+### Miscellaneous Chores
+
+* **synology-filestation-core:** Synchronize synology-filestation versions
+
+## [0.5.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.4.3...synology-filestation-core-v0.5.0) (2026-08-26)
+
+
+### Miscellaneous Chores
+
+* **synology-filestation-core:** Synchronize synology-filestation versions
+
+## [0.4.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.4.2...synology-filestation-core-v0.4.3) (2026-08-25)
+
+
+### Miscellaneous Chores
+
+* **synology-filestation-core:** Synchronize synology-filestation versions
+
+## [0.4.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.4.1...synology-filestation-core-v0.4.2) (2026-08-25)
+
+
+### Miscellaneous Chores
+
+* **synology-filestation-core:** Synchronize synology-filestation versions
+
+## [0.4.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.4.0...synology-filestation-core-v0.4.1) (2026-08-25)
+
+
+### Miscellaneous Chores
+
+* **synology-filestation-core:** Synchronize synology-filestation versions
+
+## [0.4.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.3.1...synology-filestation-core-v0.4.0) (2026-08-25)
+
+
+### Features
+
+* **fuse:** stream writes to the server as they are made ([a438b21](https://github.com/UCSD-E4E/synology-filestation/commit/a438b21ead8ed3a9e98ff37799645ab59a93a57f))
+* **fuse:** stream writes to the server as they are made ([aee913a](https://github.com/UCSD-E4E/synology-filestation/commit/aee913a7942c4467cabafef993f490a78c667460))
+* **smb:** let SMB take new files, not just replacements ([de61add](https://github.com/UCSD-E4E/synology-filestation/commit/de61add56ae5e2ffe1414319cd22109d4ccfea56))
+* **smb:** let SMB take new files, not just replacements ([c5eb0cb](https://github.com/UCSD-E4E/synology-filestation/commit/c5eb0cb4db3245c11b7c8f76438c094ef3e9bfef))
+* **smb:** open a file for writing, at an offset ([1a0f8db](https://github.com/UCSD-E4E/synology-filestation/commit/1a0f8db6bb7871bd2b70e5419a7373680dd89594))
+* **smb:** open a file for writing, at an offset ([0ae0f25](https://github.com/UCSD-E4E/synology-filestation/commit/0ae0f2572c1b8ab90884812f9df9d42f701ab571))
+* **smb:** serve listings and namespace changes over SMB ([422fbf3](https://github.com/UCSD-E4E/synology-filestation/commit/422fbf31ebe825448837e8857b7553d22ea31e13))
+* **smb:** serve listings and namespace changes over SMB ([f344684](https://github.com/UCSD-E4E/synology-filestation/commit/f344684dfc597cc1090a1ab9863ace20fe53b6bc))
+* **smb:** use the two SET_INFO operations the fork added ([11844c1](https://github.com/UCSD-E4E/synology-filestation/commit/11844c1fbec44ecbe8f86559d451a1cd9af0cdb7))
+* **smb:** use the two SET_INFO operations the fork added ([746ed14](https://github.com/UCSD-E4E/synology-filestation/commit/746ed14e0b73f7ee4add655d2cd1c17b4a72f035))
+
+
+### Bug Fixes
+
+* **core:** a declined backend must not strand its own breaker ([c3dacd1](https://github.com/UCSD-E4E/synology-filestation/commit/c3dacd17fec2fddfedf2ed048ee00a09f7e0643c))
+* **core:** address review — the trailing-slash hazard, and real SMB tests ([284130a](https://github.com/UCSD-E4E/synology-filestation/commit/284130afe2695443bf866ca4cb06533118ea59cf))
+* **core:** start the file over when DSM disowns the partial ([7b91436](https://github.com/UCSD-E4E/synology-filestation/commit/7b9143662b0b79b0bc39525bf9a722bdff776f16))
+* **core:** start the file over when DSM disowns the partial ([5ab59e3](https://github.com/UCSD-E4E/synology-filestation/commit/5ab59e31552260568d5e7de76df0de3d419e70ff))
+
 ## [0.3.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.3.0...synology-filestation-core-v0.3.1) (2026-08-12)
 
 

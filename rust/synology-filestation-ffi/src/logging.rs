@@ -11,8 +11,7 @@ use std::io::{self, Write};
 use std::os::raw::c_char;
 use std::sync::{Mutex, Once, OnceLock};
 
-use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{fmt, prelude::*, reload, Registry};
+use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
 /// C callback signature: `(level, line, user_data)`. `level` mirrors the
 /// `tracing::Level` ordering (1=ERROR … 5=TRACE); `line` is a NUL-terminated
@@ -35,28 +34,68 @@ static SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 static INIT: Once = Once::new();
 /// Handle to the reloadable level filter, so `set_level` can change verbosity
 /// after the subscriber is installed.
-static RELOAD: OnceLock<reload::Handle<LevelFilter, Registry>> = OnceLock::new();
+static RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
 fn sink() -> &'static Mutex<Option<Sink>> {
     SINK.get_or_init(|| Mutex::new(None))
 }
 
-fn parse_level(level: &str) -> LevelFilter {
-    match level.trim().to_ascii_lowercase().as_str() {
-        "error" => LevelFilter::ERROR,
-        "warn" => LevelFilter::WARN,
-        "info" => LevelFilter::INFO,
-        "debug" => LevelFilter::DEBUG,
-        "trace" => LevelFilter::TRACE,
-        _ => LevelFilter::INFO,
+/// The crates whose `debug!` a person asking for debug actually wants.
+///
+/// Everything else in the process — TLS, HTTP, the userspace TCP stack — is
+/// somebody else's diagnostic, and at debug it arrives faster than a log pane
+/// can render.
+const OURS: [&str; 6] = [
+    "synology_filestation_core",
+    "synology_filestation_fuse",
+    "synology_filestation_ffi",
+    "synology_filestation_connect",
+    "synology_filestation_openvpn",
+    "synology_filestation_smb",
+];
+
+/// The filter expression a requested level means.
+///
+/// A bare level is global, which is the whole bug: "debug" used to mean debug
+/// for every crate linked into the process. The verbose levels are therefore
+/// scoped to this workspace's crates, and everything else is left at `info` —
+/// left, not lowered, so a dependency's warning still arrives.
+///
+/// Anything that already looks like a filter expression is passed through
+/// untouched, matching what the CLI's `--log-level` accepts. Scoping the
+/// levels would otherwise remove the only way to ask a dependency a question.
+fn directives(level: &str) -> String {
+    let asked = level.trim();
+    if asked.contains('=') || asked.contains(',') {
+        return asked.to_string();
     }
+    let verbose = match asked.to_ascii_lowercase().as_str() {
+        "error" => return "error".to_string(),
+        "warn" => return "warn".to_string(),
+        "debug" => "debug",
+        "trace" => "trace",
+        // `info` and anything unrecognised. Unrecognised is deliberately the
+        // same as the default rather than an error: this arrives from a
+        // settings file, and a typo there should not silence the log.
+        _ => return "info".to_string(),
+    };
+    let mut out = String::from("info");
+    for target in OURS {
+        out.push(',');
+        out.push_str(target);
+        out.push('=');
+        out.push_str(verbose);
+    }
+    out
 }
 
 /// Change the active log verbosity. No-op until the subscriber is installed
 /// (the GUI registers a callback at startup, before any connect).
 pub fn set_level(level: &str) {
     if let Some(handle) = RELOAD.get() {
-        let _ = handle.reload(parse_level(level));
+        if let Ok(filter) = EnvFilter::try_new(directives(level)) {
+            let _ = handle.reload(filter);
+        }
     }
 }
 
@@ -77,7 +116,7 @@ pub unsafe fn set_callback(cb: Option<LogCb>, user_data: *mut c_void) {
         // INFO by default, reloadable via `set_level` so the GUI's log-level
         // control actually takes effect. Build the reload handle first so it is
         // available even if `try_init` later loses the global-default race.
-        let (filter, handle) = reload::Layer::new(LevelFilter::INFO);
+        let (filter, handle) = reload::Layer::new(EnvFilter::new("info"));
         let _ = RELOAD.set(handle);
         let _ = tracing_subscriber::registry()
             .with(filter)
@@ -141,6 +180,88 @@ fn dispatch(line: &str) {
     if let Some((cb, user_data)) = target {
         if let Ok(c) = CString::new(line) {
             cb(level_of(line), c.as_ptr(), user_data as *mut c_void);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the level was applied as a bare `LevelFilter`, which is
+    /// global. Asking for "debug" therefore turned on debug for *every* crate
+    /// in the process — rustls, hyper, reqwest, and, once a tunnel is up, the
+    /// userspace TCP stack packet by packet. Our own crates emit almost no
+    /// `debug!` at all, so nearly all of that volume was somebody else's, and
+    /// it arrived through a C callback into a GUI that appends to a string per
+    /// line. The log pane stopped being readable and the window stopped
+    /// responding, which is a poor reward for asking a question.
+    #[test]
+    fn debug_does_not_turn_on_the_whole_dependency_tree() {
+        let filter = directives("debug");
+
+        assert!(
+            filter.starts_with("info"),
+            "everything else stays where it was, got {filter}"
+        );
+        assert!(
+            filter.contains("synology_filestation_connect=debug"),
+            "and ours go verbose, got {filter}"
+        );
+        assert!(
+            filter.contains("synology_filestation_openvpn=debug"),
+            "the tunnel is the thing being diagnosed, got {filter}"
+        );
+    }
+
+    #[test]
+    fn trace_scopes_the_same_way() {
+        let filter = directives("trace");
+
+        assert!(filter.starts_with("info"), "got {filter}");
+        assert!(
+            filter.contains("synology_filestation_openvpn=trace"),
+            "got {filter}"
+        );
+    }
+
+    /// The quiet levels were never the problem, and rewriting them would hide
+    /// a dependency's warning — which is the one third-party message anybody
+    /// wants.
+    #[test]
+    fn a_quiet_level_stays_global() {
+        assert_eq!(directives("info"), "info");
+        assert_eq!(directives("warn"), "warn");
+        assert_eq!(directives("error"), "error");
+    }
+
+    #[test]
+    fn an_unknown_level_is_info_rather_than_silence() {
+        assert_eq!(directives("shout"), "info");
+        assert_eq!(directives(""), "info");
+    }
+
+    /// An escape hatch, matching what the CLI already accepts: anything that
+    /// looks like a filter expression is one, and is passed through untouched.
+    /// Without it, scoping the levels would take away the only way to ask a
+    /// dependency a question.
+    #[test]
+    fn an_explicit_filter_expression_is_left_alone() {
+        let asked = "warn,synology_filestation_openvpn=trace,rustls=debug";
+
+        assert_eq!(directives(asked), asked);
+        assert_eq!(directives("hyper=debug"), "hyper=debug");
+    }
+
+    /// A directive string that does not parse would leave the subscriber on
+    /// whatever it had, silently ignoring the setting.
+    #[test]
+    fn every_level_produces_something_that_parses() {
+        for level in ["error", "warn", "info", "debug", "trace", "nonsense"] {
+            assert!(
+                tracing_subscriber::EnvFilter::try_new(directives(level)).is_ok(),
+                "{level} produced an unparseable filter"
+            );
         }
     }
 }

@@ -302,7 +302,7 @@ struct Reachable<'a> {
     host: &'a str,
     username: &'a str,
     password: &'a str,
-    smb_domain: Option<&'a str>,
+    domain: Option<&'a str>,
     /// Where the OpenVPN profile is kept, if an escalation is allowed at all.
     vpn_profile: Option<&'a str>,
     /// The NAS's address inside that tunnel, which its public name does not
@@ -361,6 +361,7 @@ async fn reach(client: SynologyClient, settings: Reachable<'_>) -> (SynologyClie
             profile,
             settings.username,
             settings.password,
+            settings.domain,
             VPN_PATIENCE,
         )),
         None => Box::new(NoTunnel),
@@ -385,7 +386,7 @@ async fn reach(client: SynologyClient, settings: Reachable<'_>) -> (SynologyClie
                 &host,
                 settings.username,
                 settings.password,
-                settings.smb_domain,
+                settings.domain,
             )
             .await
             {
@@ -408,7 +409,7 @@ async fn reach(client: SynologyClient, settings: Reachable<'_>) -> (SynologyClie
         Ok(SmbRoute::Tunnelled { host, connection }) => {
             info!("Transport: SMB, through a tunnel to {host}");
             let mut cfg = SmbConfig::new(&host, settings.username, settings.password);
-            cfg.domain = settings.smb_domain.unwrap_or_default().to_string();
+            cfg.domain = settings.domain.unwrap_or_default().to_string();
             match SmbTransport::over(connection, &cfg).await {
                 Ok(smb) => (
                     synology_filestation_smb::attach(client, Arc::new(smb)),
@@ -468,12 +469,15 @@ pub unsafe extern "C" fn syno_connect(
     // so the GUI exposes this as a per-connection checkbox — but it makes the
     // connection encrypted without being authenticated, so it is opt-in.
     verify_ssl: bool,
-    // The NetBIOS domain SMB authenticates in, for an appliance joined to a
-    // directory; null for a local DSM user. Without it a directory account is
-    // checked against the appliance's own accounts, fails, and SMB is silently
-    // skipped — the reason this consumer has been on the HTTP path even on a
-    // network where the NAS answers directly.
-    smb_domain: *const c_char,
+    // The NetBIOS domain the account lives in, for an appliance joined to a
+    // directory; null for a local DSM user. Both legs that authenticate
+    // against the directory need it, for different reasons. SMB: without it a
+    // directory account is checked against the appliance's own accounts,
+    // fails, and SMB is silently skipped — the reason this consumer has been
+    // on the HTTP path even on a network where the NAS answers directly. VPN:
+    // DSM refuses a name that does not carry it before the password is looked
+    // at, and reports only `AUTH_FAILED`.
+    domain: *const c_char,
     // Where the OpenVPN profile is kept, and where the NAS answers inside the
     // tunnel it describes. Both null means no escalation is possible, and a
     // NAS that does not answer directly is reached over HTTP as before.
@@ -499,7 +503,7 @@ pub unsafe extern "C" fn syno_connect(
             Err(c) => return c,
         };
         let otp = opt_str(otp);
-        let smb_domain = opt_str(smb_domain);
+        let domain = opt_str(domain);
         let vpn_profile = opt_str(vpn_profile);
         let vpn_host = opt_str(vpn_host);
         let vpn_profile_remote = opt_str(vpn_profile_remote);
@@ -582,7 +586,7 @@ pub unsafe extern "C" fn syno_connect(
                         host,
                         username,
                         password,
-                        smb_domain,
+                        domain,
                         vpn_profile,
                         vpn_host,
                         vpn_profile_remote,
@@ -1537,7 +1541,7 @@ mod tests {
                 // is right to — so the fix is not to write one.
                 username: "",
                 password: "",
-                smb_domain: Some("EXAMPLE"),
+                domain: Some("EXAMPLE"),
                 vpn_profile: None,
                 vpn_host: None,
                 vpn_profile_remote: None,

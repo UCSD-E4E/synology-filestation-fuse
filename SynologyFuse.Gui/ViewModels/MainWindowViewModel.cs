@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -14,6 +15,15 @@ namespace SynologyFuse.Gui.ViewModels;
 public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 {
     private readonly MountService _mountService = new();
+
+    /// <summary>The log pane, bounded so a chatty session cannot grow it
+    /// without limit. See <see cref="LogBuffer"/>.</summary>
+    private readonly LogBuffer _log = new();
+
+    /// <summary>1 while a pane refresh is already queued on the dispatcher, so
+    /// a burst of lines coalesces into one update. `Interlocked`, because
+    /// lines arrive off the UI thread.</summary>
+    private int _logFlushPending;
 
     /// <summary>The action the OTP banner is gating: either a full mount or a
     /// connection test. Set when a connect attempt reports OTP-required so
@@ -35,7 +45,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _cacheTtl = s.CacheTtl;
         _readCacheMb = s.ReadCacheMb;
         _logLevel = s.LogLevel;
-        _smbDomain = s.SmbDomain;
+        _domain = s.Domain;
         _vpnProfile = s.VpnProfile;
         _vpnHost = s.VpnHost;
         _vpnProfileNas = s.VpnProfileNas;
@@ -104,11 +114,13 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private string _logLevel = "info"; // overwritten by constructor; default satisfies nullable analysis
 
-    /// <summary>NetBIOS domain for SMB — `KRG` for an AD account, empty for a
-    /// local DSM user. Empty against an AD account is why a connection ends up
-    /// on the slower HTTP path without saying so.</summary>
+    /// <summary>NetBIOS domain the account lives in — `KRG` for an AD account,
+    /// empty for a local DSM user. Both directory-authenticated legs need it:
+    /// empty against an AD account is why a connection ends up on the slower
+    /// HTTP path without saying so, and why the VPN is refused before the
+    /// password is checked.</summary>
     [ObservableProperty]
-    private string _smbDomain = "";
+    private string _domain = "";
 
     /// <summary>The OpenVPN profile on this computer, if there is already one
     /// here. Left empty, one is downloaded to a copy kept beside the settings —
@@ -384,7 +396,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         CacheTtl = (ulong)CacheTtl,
         ReadCacheMb = (ulong)ReadCacheMb,
         LogLevel = LogLevel,
-        SmbDomain = SmbDomain,
+        Domain = Domain,
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
         VpnProfileNas = VpnProfileNas,
@@ -401,7 +413,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         CacheTtl = CacheTtl,
         ReadCacheMb = ReadCacheMb,
         LogLevel = LogLevel,
-        SmbDomain = SmbDomain,
+        Domain = Domain,
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
         VpnProfileNas = VpnProfileNas,
@@ -409,8 +421,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 
     // ── Event handlers ────────────────────────────────────────────────────────
 
-    private void OnOutput(string line) =>
-        Dispatcher.UIThread.Post(() => AppendLog(line));
+    private void OnOutput(string line) => AppendLog(line);
 
     /// <summary>Surface a failure everywhere it belongs: the banner carries the
     /// cause and the remedy, the status bar the headline, the log pane the raw
@@ -425,11 +436,33 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
             : $"Error: {ErrorBanner.Title}");
     }
 
+    /// <summary>
+    /// Record a line and arrange for the pane to catch up.
+    ///
+    /// The line goes into the buffer on whatever thread produced it — the
+    /// native log callback does not run on the UI thread — and the pane is
+    /// refreshed once per dispatcher turn rather than once per line. That
+    /// coalescing is the point: a VPN handshake at debug level delivers lines
+    /// far faster than a TextBox can be re-rendered, and posting one update
+    /// each is what stopped the window responding.
+    /// </summary>
     private void AppendLog(string line)
     {
-        LogOutput = string.IsNullOrEmpty(LogOutput)
-            ? line
-            : LogOutput + Environment.NewLine + line;
+        _log.Append(line);
+
+        // Already queued: the flush that runs will pick this line up too, so
+        // a burst of a thousand lines costs one update rather than a thousand.
+        if (Interlocked.Exchange(ref _logFlushPending, 1) == 1) return;
+
+        Dispatcher.UIThread.Post(
+            () =>
+            {
+                Interlocked.Exchange(ref _logFlushPending, 0);
+                LogOutput = _log.Text;
+            },
+            // Behind anything the user is waiting on. The log is context, not
+            // the task.
+            DispatcherPriority.Background);
     }
 
     public void Dispose()

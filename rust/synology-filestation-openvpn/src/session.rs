@@ -841,6 +841,36 @@ impl Session {
                 reply.cipher.clone().unwrap_or_default(),
             ));
         }
+        // The one place the negotiated tunnel is described. Everything here was
+        // already parsed and stored and never mentioned, which left "the tunnel
+        // is up but nothing answered at the NAS" indistinguishable from "we
+        // landed on a different subnet from the address we dialled". The
+        // address is the fact that separates them, and it is not a secret —
+        // the credentials never appear.
+        tracing::info!(
+            "tunnel: ready as {} (cipher {}, peer-id {})",
+            match reply.ifconfig {
+                // As a prefix, not as the two values the server sent. Under
+                // `topology net30` — OpenVPN 2.5's default, and what DSM runs
+                // — the second value is the *peer*, not a mask, and printing
+                // it as one is actively misleading: it reads as a /32-ish
+                // netmask and sends the reader after a routing fault that is
+                // not there.
+                Some((address, second)) => {
+                    let ifconfig = crate::ip::Ifconfig::from_push(address, second);
+                    format!("{}/{}", ifconfig.address, ifconfig.prefix)
+                }
+                // A point-to-point server assigns nothing, which is worth
+                // saying out loud rather than printing an empty space.
+                None => "no address assigned".to_string(),
+            },
+            reply.cipher.as_deref().unwrap_or("unspecified"),
+            match reply.peer_id {
+                Some(id) => format!("{id:?}"),
+                None => "none".to_string(),
+            }
+        );
+
         self.push = Some(reply);
         self.phase = Phase::Ready;
         self.open_tunnel()
