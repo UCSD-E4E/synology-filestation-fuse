@@ -658,3 +658,29 @@ async fn a_bulk_write_gets_through_at_a_usable_rate() {
         "4 MiB took {took:?} even in-process"
     );
 }
+
+#[tokio::test]
+async fn a_stream_that_breaks_says_which_way_it_broke() {
+    // What a caller mid-transfer actually got: "the tunnel stack has stopped",
+    // and nothing else. The loop has five exits and took all of them in
+    // silence, so a peer that closed, a link that went and a socket the stack
+    // itself gave up on were one sentence — and the one thing the sentence did
+    // not say was which.
+    let (mut stream, ask, _heard) = connected().await;
+    ask.send(Ask::Vanish).await.expect("the link fails");
+
+    let mut rest = Vec::new();
+    let failed = tokio::time::timeout(PATIENCE, stream.read_to_end(&mut rest))
+        .await
+        .expect("it does not wait forever")
+        .expect_err("a link that died is not a peer that finished");
+
+    assert!(
+        failed.to_string().contains("because"),
+        "the error says why it ended, not only that it did: {failed}"
+    );
+    assert!(
+        failed.to_string().contains("tunnel"),
+        "and names the tunnel as the thing that went: {failed}"
+    );
+}

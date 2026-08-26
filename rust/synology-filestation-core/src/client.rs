@@ -1249,7 +1249,7 @@ impl SynologyClient {
                     return Ok(());
                 }
                 Err(e) if e.category() == ErrorCategory::Transport => {
-                    warn!("stream read backend failed (transient), falling back: {e}");
+                    warn!("stream read backend failed for {remote_path} (transient), falling back: {e}");
                     entry.breaker.lock().unwrap().on_failure(Instant::now());
                     continue;
                 }
@@ -1332,7 +1332,7 @@ impl SynologyClient {
                     return Ok(bytes);
                 }
                 Err(e) if e.category() == ErrorCategory::Transport => {
-                    warn!("read backend failed (transient), falling back: {e}");
+                    warn!("read backend failed for {path} (transient), falling back: {e}");
                     entry.breaker.lock().unwrap().on_failure(Instant::now());
                     continue;
                 }
