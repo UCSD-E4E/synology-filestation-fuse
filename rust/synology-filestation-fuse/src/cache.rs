@@ -149,6 +149,88 @@ impl InodeCache {
 }
 
 // ---------------------------------------------------------------------------
+// Directory listings
+// ---------------------------------------------------------------------------
+
+/// Directory listings, keyed by the directory's path.
+///
+/// `readdir` used to ask the NAS every time it was called, and the kernel calls
+/// it more than once per directory read: once for the entries, then again at
+/// the end offset to be told there are no more. A desktop file manager polling
+/// a freshly-appeared volume — which is what GIO does — turned that into a
+/// sustained stream of listings against `synoscgi`, the shared CGI backend the
+/// whole appliance runs on. That is the same backend the transfer throttle in
+/// the core client exists to protect.
+///
+/// The TTL is `--cache-ttl`, the one that already governs metadata, so this
+/// inherits a staleness contract the mount has always had rather than
+/// inventing a second one. Our own mutations invalidate immediately; only a
+/// change made from another machine waits for the TTL.
+pub struct DirCache {
+    /// lowercase(path) → the listing. Lowercased because DSM is
+    /// case-insensitive, and two spellings of one directory must not become
+    /// two listings that can disagree.
+    listings: Cache<String, Arc<Vec<SynoFileInfo>>>,
+    /// `--cache-ttl 0` is how somebody asks for no caching. moka reads a zero
+    /// TTL as "expire immediately", which is nearly the same but still lets an
+    /// entry inserted and read in one instant hit. Honouring the flag exactly
+    /// is cheaper to reason about than almost honouring it.
+    enabled: bool,
+}
+
+impl DirCache {
+    pub fn new(ttl_secs: u64) -> Self {
+        Self {
+            listings: Cache::builder()
+                .max_capacity(1_000)
+                .time_to_live(Duration::from_secs(ttl_secs))
+                .build(),
+            enabled: ttl_secs > 0,
+        }
+    }
+
+    pub fn get(&self, path: &str) -> Option<Arc<Vec<SynoFileInfo>>> {
+        if !self.enabled {
+            return None;
+        }
+        self.listings.get(&path.to_lowercase())
+    }
+
+    /// Cache a listing, and hand back the shared copy.
+    ///
+    /// Returning it matters when caching is off: the caller still needs the
+    /// entries it just fetched, and looking them back up would find nothing.
+    pub fn insert(&self, path: &str, entries: Vec<SynoFileInfo>) -> Arc<Vec<SynoFileInfo>> {
+        let entries = Arc::new(entries);
+        if self.enabled {
+            self.listings
+                .insert(path.to_lowercase(), Arc::clone(&entries));
+        }
+        entries
+    }
+
+    /// Forget one directory's listing, after something in it changed.
+    pub fn invalidate(&self, path: &str) {
+        self.listings.invalidate(&path.to_lowercase());
+    }
+
+    /// Forget a directory and everything under it, for a removal or a rename.
+    ///
+    /// The trailing separator is what keeps `/photostudio` out of a sweep of
+    /// `/photos` — the same distinction [`InodeCache::invalidate_prefix`]
+    /// draws.
+    pub fn invalidate_prefix(&self, prefix: &str) {
+        let prefix = prefix.to_lowercase();
+        let under = format!("{prefix}/");
+        for (key, _) in self.listings.iter() {
+            if *key == prefix || key.starts_with(&under) {
+                self.listings.invalidate(key.as_str());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Block-level read cache for file data
 // ---------------------------------------------------------------------------
 
@@ -569,5 +651,90 @@ mod tests {
         rc.invalidate_ino(1);
         // The in-flight marker should have been cleared along with the cached block.
         assert!(rc.claim_inflight(1, 0));
+    }
+
+    // ── DirCache ──────────────────────────────────────────────────────────────
+
+    /// Regression: `readdir` called the NAS unconditionally, and nothing cached
+    /// the answer. A desktop file manager polling the mount — which is what
+    /// GIO does the moment a volume appears — turned into a sustained ~10
+    /// `list_shares` per second against `synoscgi`, the shared CGI backend the
+    /// whole appliance runs on. One directory read cost three round trips: the
+    /// listing, the kernel's follow-up at the end offset, and its repeat.
+    #[test]
+    fn a_listing_is_served_from_the_cache_the_second_time() {
+        let cache = DirCache::new(30);
+
+        assert!(cache.get("/photos").is_none(), "nothing cached yet");
+        cache.insert("/photos", vec![make_file_info("/photos/a.jpg")]);
+
+        let hit = cache.get("/photos").expect("the listing was just cached");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].path, "/photos/a.jpg");
+    }
+
+    /// The same case-insensitivity the inode map uses: DSM treats paths
+    /// case-insensitively, so two spellings must not become two listings that
+    /// can disagree with each other.
+    #[test]
+    fn a_listing_is_found_whatever_case_it_is_asked_for() {
+        let cache = DirCache::new(30);
+        cache.insert("/Photos", vec![make_file_info("/Photos/a.jpg")]);
+
+        assert!(cache.get("/photos").is_some());
+        assert!(cache.get("/PHOTOS").is_some());
+    }
+
+    /// Our own mutations cannot wait for the TTL: a file created and then
+    /// listed has to be there, or the mount contradicts itself.
+    #[test]
+    fn a_changed_directory_is_listed_again_rather_than_from_the_cache() {
+        let cache = DirCache::new(30);
+        cache.insert("/photos", vec![make_file_info("/photos/a.jpg")]);
+
+        cache.invalidate("/photos");
+
+        assert!(cache.get("/photos").is_none());
+    }
+
+    /// A directory that was removed or renamed takes its descendants with it,
+    /// exactly as `InodeCache::invalidate_prefix` already does for inodes.
+    #[test]
+    fn removing_a_directory_forgets_the_listings_underneath_it() {
+        let cache = DirCache::new(30);
+        cache.insert("/photos", vec![make_file_info("/photos/a.jpg")]);
+        cache.insert("/photos/2026", vec![make_file_info("/photos/2026/b.jpg")]);
+        cache.insert("/photostudio", vec![make_file_info("/photostudio/c.jpg")]);
+
+        cache.invalidate_prefix("/photos");
+
+        assert!(cache.get("/photos").is_none());
+        assert!(cache.get("/photos/2026").is_none());
+        assert!(
+            cache.get("/photostudio").is_some(),
+            "a sibling whose name merely starts the same way is not underneath it"
+        );
+    }
+
+    /// `--cache-ttl 0` is how somebody asks for no caching at all. Serving a
+    /// stale listing to them would be ignoring the flag.
+    #[test]
+    fn a_zero_ttl_caches_nothing() {
+        let cache = DirCache::new(0);
+        cache.insert("/photos", vec![make_file_info("/photos/a.jpg")]);
+
+        assert!(cache.get("/photos").is_none());
+    }
+
+    /// ...but the caller still needs the listing it just fetched. Caching off
+    /// means "do not remember this", not "lose it".
+    #[test]
+    fn a_disabled_cache_still_hands_back_what_was_put_in_it() {
+        let cache = DirCache::new(0);
+
+        let stored = cache.insert("/photos", vec![make_file_info("/photos/a.jpg")]);
+
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].path, "/photos/a.jpg");
     }
 }

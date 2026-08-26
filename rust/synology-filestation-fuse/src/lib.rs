@@ -213,11 +213,13 @@ pub fn spawn_mount(
     mountpoint: PathBuf,
     opts: MountOptions,
 ) -> Result<MountHandle, SynoFsError> {
-    use cache::{InodeCache, ReadCache, READ_BLOCK_SIZE};
+    use cache::{DirCache, InodeCache, ReadCache, READ_BLOCK_SIZE};
     use fs::SynologyFS;
     use tracing::info;
 
     let cache = Arc::new(InodeCache::new(opts.cache_ttl));
+    // The same TTL as the metadata cache: one flag, one staleness contract.
+    let dir_cache = Arc::new(DirCache::new(opts.cache_ttl));
     let max_blocks = (opts.read_cache_mb * 1024 * 1024) / READ_BLOCK_SIZE;
     let read_cache = Arc::new(ReadCache::new(READ_BLOCK_SIZE, max_blocks.max(1)));
     let uid = unsafe { libc::getuid() };
@@ -237,7 +239,7 @@ pub fn spawn_mount(
         READ_BLOCK_SIZE / (1024 * 1024)
     );
 
-    let fs = SynologyFS::new(client.clone(), cache, read_cache, rt, owner);
+    let fs = SynologyFS::new(client.clone(), cache, dir_cache, read_cache, rt, owner);
 
     // As a non-root user, allow_other requires `user_allow_other` in
     // /etc/fuse.conf; running as root always permits it.
