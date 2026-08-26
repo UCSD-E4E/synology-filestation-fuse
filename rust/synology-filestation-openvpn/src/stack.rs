@@ -43,12 +43,33 @@ use tokio_util::sync::PollSender;
 use crate::ip::Ifconfig;
 use crate::Error;
 
-/// What the tunnel's MTU leaves for a TCP payload.
+/// The largest datagram we will put on the wire, outer headers included.
 ///
-/// The server pushes `mssfix 1450`, and the packets we hand it are already
-/// inside an encrypted datagram. Claiming more than fits would produce
-/// fragmentation the tunnel cannot do anything useful with.
-const MTU: usize = 1400;
+/// The server pushes `mssfix 1450`, which is its statement of what the path
+/// between here and it carries in one piece.
+pub const LINK: usize = 1450;
+
+/// The headers the kernel puts in front of our datagram, counted as IPv6 so
+/// that an IPv4 path has twenty bytes spare rather than twenty too few.
+pub const OUTER: usize = 40 + 8;
+
+/// What wrapping an IP packet for the data channel costs.
+///
+/// A P_DATA_V2 header (opcode plus a three-byte peer id), an HMAC-SHA-512 tag,
+/// the CBC IV, the four-byte packet id that is encrypted alongside the payload,
+/// and PKCS#7 padding — which always adds at least one byte and at most a full
+/// block, so a full block is what has to be reserved.
+const WRAP: usize = 4 + 64 + 16 + 4 + 16;
+
+/// What the tunnel's MTU leaves for an IP packet.
+///
+/// Derived rather than chosen, because choosing it is what went wrong: 1400
+/// looked like a comfortable margin under `mssfix 1450` and was not, once
+/// [`WRAP`] was added — an MTU-sized packet came to 1540 bytes on the wire, the
+/// kernel answered `EMSGSIZE`, and the tunnel died a few milliseconds into the
+/// first bulk write. Only full-size packets were ever affected, which is why
+/// connecting and browsing looked fine and copying a file did not.
+pub const MTU: usize = LINK - OUTER - WRAP;
 
 /// How much each direction may buffer inside the stack.
 ///

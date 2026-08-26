@@ -287,3 +287,33 @@ fn a_data_packet_for_another_key_says_so_rather_than_crying_forgery() {
         Error::OtherKeyId(KeyId::new(1).expect("one fits"), KeyId::FIRST)
     );
 }
+
+/// The stack's MTU is a promise about what comes out of here, and it was one
+/// this code could not keep.
+///
+/// Wrapping an IP packet costs a P_DATA_V2 header, a 64-byte HMAC-SHA-512 tag,
+/// a 16-byte IV, the four-byte packet id that is encrypted alongside the
+/// payload, and PKCS#7 padding that always adds at least one byte. At an MTU of
+/// 1400 that came to 1492 bytes of UDP payload — 1520 on the wire — which no
+/// ordinary path takes, so the kernel refused it with `EMSGSIZE` rather than
+/// sending it.
+///
+/// Nothing small enough noticed. The handshake fits, a directory listing fits,
+/// a short read fits; a bulk write fills every segment to the MSS, and then
+/// every segment carrying data is one the socket will not take. It presented as
+/// a copy that died seconds in with `Input/output error`.
+#[test]
+fn a_full_size_packet_fits_what_the_wire_takes() {
+    let mut client = client();
+    let datagram = client
+        .encrypt(&vec![0u8; synology_filestation_openvpn::MTU])
+        .expect("a full-size packet is encryptable");
+
+    let on_the_wire = synology_filestation_openvpn::OUTER + datagram.len();
+    assert!(
+        on_the_wire <= synology_filestation_openvpn::LINK,
+        "an MTU-sized packet becomes {on_the_wire} bytes on the wire, and the \
+         link carries {}",
+        synology_filestation_openvpn::LINK,
+    );
+}
