@@ -12,9 +12,10 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-# What the tunnel negotiated reaches a person only as log output. Without it,
-# a tunnel that comes up and then carries nothing is indistinguishable from one
-# that landed on the wrong subnet.
+# What the tunnel negotiated reaches a person only as log output, and so does
+# how a transfer is going: without it, a tunnel that comes up and carries
+# nothing is indistinguishable from one that landed on the wrong subnet, and a
+# slow tunnel from a stuck one.
 tracing = "0.1"
 # SHA-512 is what the server is configured with (`auth SHA512` in the published
 # .ovpn). See `tls_auth.rs` for why that is a constant here and not a knob.

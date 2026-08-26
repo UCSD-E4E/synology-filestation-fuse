@@ -52,9 +52,21 @@ const MTU: usize = 1400;
 
 /// How much each direction may buffer inside the stack.
 ///
-/// A window, in effect: this is what the far end is allowed to have in flight
-/// before it must wait for us to read.
-const BUFFER: usize = 64 * 1024;
+/// This is the window, and the window is the speed limit: a sender may have
+/// this much unacknowledged, so throughput cannot exceed it divided by the
+/// round trip, however fast the link underneath is. At 64 KiB — where this
+/// started — that is about 2 MB/s over a 30 ms path, and no amount of
+/// bandwidth changes it.
+///
+/// So it is sized not to be the constraint rather than to be comfortable. Four
+/// mebibytes carries roughly a gigabit at 30 ms, and about 300 Mbit even on a
+/// 100 ms path — past anything a NAS at the end of a VPN is going to do. The
+/// cost is eight mebibytes of buffer for the one connection this stack exists
+/// to carry, which is not a trade worth thinking about twice.
+///
+/// It is not capped at 65535 by the protocol: `smoltcp` derives its window
+/// scale (RFC 7323) from this capacity, so the advertised window grows with it.
+const BUFFER: usize = 4 * 1024 * 1024;
 
 /// The largest piece of a write handed to the stack at once.
 ///
@@ -69,6 +81,14 @@ const WRITE_CHUNK: usize = 16 * 1024;
 /// window is — and a deep queue here would let the far end believe bytes had
 /// been read that are still in a channel.
 const QUEUE_DEPTH: usize = 8;
+
+/// How often a transfer in progress says how it is going.
+///
+/// A write queue backing up above this stack looks the same whether the tunnel
+/// is slow or stuck, and those want opposite responses. This is the difference:
+/// bytes still moving is a link doing its best, bytes that stopped is something
+/// wedged.
+const REPORT_EVERY: Duration = Duration::from_secs(10);
 
 /// A ceiling on how long the loop will sleep when `smoltcp` asks for nothing.
 ///
@@ -111,6 +131,11 @@ impl TunnelDevice {
         self.inbox.push_back(packet);
     }
 
+    /// Whether the tunnel has room for another packet right now.
+    pub fn is_full(&self) -> bool {
+        self.outbound.capacity() == 0
+    }
+
     /// Packets handed to the tunnel, and packets taken from it.
     pub fn traffic(&self) -> (usize, usize) {
         (self.sent.get(), self.received)
@@ -147,6 +172,12 @@ impl Device for TunnelDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        // `None` means "busy, ask me again", and `smoltcp` keeps the data.
+        // Handing back a token we cannot honour is how the stack came to lose
+        // packets it believed it had sent — see [`TunnelTx::consume`].
+        if self.is_full() {
+            return None;
+        }
         Some(TunnelTx {
             outbound: &self.outbound,
             sent: &self.sent,
@@ -173,11 +204,18 @@ impl TxToken for TunnelTx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        // Dropped if the tunnel is gone or its queue is full, which is what a
-        // link does with a packet it cannot carry. TCP above will send it
-        // again.
-        let _ = self.outbound.try_send(buffer);
-        self.sent.set(self.sent.get() + 1);
+        // A token is only handed out when there was room (see `transmit`), so
+        // this is expected to succeed. It used to be the ordinary path, and
+        // dropping here was excused as what a link does with a packet it cannot
+        // carry — but this "link" is a channel to a task in the same process,
+        // so the loss was ours to manufacture. TCP read it as congestion and
+        // backed off, and a bulk write collapsed to retransmissions.
+        // Counted only if it went: this number answers "was anything ever
+        // sent", and a packet the tunnel would not take is precisely what it
+        // must not claim.
+        if self.outbound.try_send(buffer).is_ok() {
+            self.sent.set(self.sent.get() + 1);
+        }
         result
     }
 }
@@ -375,6 +413,7 @@ impl TunnelStream {
 
         let task = tokio::spawn(drive(
             Driver {
+                outbound: device.outbound.clone(),
                 device,
                 interface,
                 sockets,
@@ -584,6 +623,12 @@ struct Driver {
     handle: SocketHandle,
     /// Packets arriving from the tunnel.
     inbound: mpsc::Receiver<Vec<u8>>,
+    /// The same sender the device holds, for waiting on room in the tunnel.
+    ///
+    /// Now that a full tunnel means `transmit` refuses, `smoltcp` asks to be
+    /// polled again immediately — so without something to wait for, the loop
+    /// would spin at full tilt until the tunnel drained.
+    outbound: mpsc::Sender<Vec<u8>>,
     /// Bytes the caller wants sent.
     from_caller: mpsc::Receiver<Vec<u8>>,
     /// How much of what the caller wrote is still ours to deliver.
@@ -628,6 +673,9 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
     let mut queued: Vec<u8> = Vec::new();
     // How many bytes have been taken from the caller's queue, ever.
     let mut accepted: u64 = 0;
+    // What the last report said, so the next one can be a rate.
+    let mut reported_at = StdInstant::now();
+    let mut reported_acknowledged: u64 = 0;
     // What was last said about all this, so that stopping can say it again
     // with the truth about having stopped attached.
     let mut last = *driver.progress.borrow();
@@ -705,6 +753,27 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
             }
         }
 
+        // How a transfer is going, while there is one. Both halves matter: a
+        // rate says whether the link is moving, and what is waiting for an
+        // acknowledgement says whether the window is the thing limiting it.
+        let waiting_to_be_acknowledged = driver.socket().send_queue();
+        if reported_at.elapsed() >= REPORT_EVERY {
+            let acknowledged = last.acknowledged;
+            let moved = acknowledged.saturating_sub(reported_acknowledged);
+            if moved > 0 || waiting_to_be_acknowledged > 0 {
+                let rate = moved as f64 / reported_at.elapsed().as_secs_f64() / 1024.0;
+                tracing::info!(
+                    "tunnel: {:.0} KiB/s out, {} KiB waiting to be acknowledged of a \
+                     {} KiB window",
+                    rate,
+                    waiting_to_be_acknowledged / 1024,
+                    BUFFER / 1024,
+                );
+            }
+            reported_at = StdInstant::now();
+            reported_acknowledged = acknowledged;
+        }
+
         // The peer has closed its half and everything it sent has been
         // handed over. Letting go of the sender here is the end of stream a
         // reader above is waiting for — and doing it on this condition rather
@@ -752,6 +821,9 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
 
         // Whether there are bytes waiting on a reader that has not caught up.
         let waiting_on_reader = driver.socket().can_recv() && driver.to_caller.is_some();
+        // And whether the tunnel is too full to take what the stack wants to
+        // send, in which case room appearing is a reason to wake.
+        let waiting_on_tunnel = driver.device.is_full();
         let accepting_writes = queued.is_empty() && !closing;
         let delay = driver
             .interface
@@ -794,6 +866,10 @@ async fn drive(mut driver: Driver, up: tokio::sync::oneshot::Sender<Result<(), E
                     None => std::future::pending().await,
                 }
             }, if waiting_on_reader => {}
+
+            // Room in the tunnel, for a stack that has something to send and
+            // nowhere to put it.
+            _ = driver.outbound.reserve(), if waiting_on_tunnel => {}
 
             _ = tokio::time::sleep(delay) => {}
         }
