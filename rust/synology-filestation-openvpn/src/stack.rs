@@ -302,6 +302,17 @@ impl TunnelStream {
         remote: (Ipv4Addr, u16),
         patience: Duration,
     ) -> Result<Self, Error> {
+        // Both ends of the question "is the NAS even on our subnet?". The push
+        // reply says what we were given; this says what we then dialled, and
+        // the pair is what turns "nothing answered" into an answer.
+        tracing::debug!(
+            "stack: connecting {}/{} → {}:{} inside the tunnel",
+            ifconfig.address,
+            ifconfig.prefix,
+            remote.0,
+            remote.1
+        );
+
         let mut device = TunnelDevice::new(outbound);
         let started = StdInstant::now();
 
