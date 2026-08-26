@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.4](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.5.3...synology-filestation-core-v0.5.4) (2026-08-26)
+
+
+### Bug Fixes
+
+* **openvpn:** say why the stack stopped, instead of only that it did ([b11633f](https://github.com/UCSD-E4E/synology-filestation/commit/b11633fe8f26960c796cfe07acbfda04d92a4b6a))
+* **openvpn:** say why the stack stopped, instead of only that it did ([614f649](https://github.com/UCSD-E4E/synology-filestation/commit/614f649c5bbd52fcd394791f0086afafca5a1cd1))
+
 ## [0.5.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.5.2...synology-filestation-core-v0.5.3) (2026-08-26)
 
 

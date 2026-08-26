@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.4](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.5.3...synology-filestation-gui-v0.5.4) (2026-08-26)
+
+
+### Bug Fixes
+
+* **openvpn:** a datagram that will not send is not the end of the tunnel ([5f0c42d](https://github.com/UCSD-E4E/synology-filestation/commit/5f0c42d7753704a959839a9bcb089e106e5ceeab))
+* **openvpn:** a datagram that will not send is not the end of the tunnel ([8a97de5](https://github.com/UCSD-E4E/synology-filestation/commit/8a97de5b5f0199f232ec5cc645bd8f395bdecd3f))
+* **openvpn:** say why the stack stopped, instead of only that it did ([b11633f](https://github.com/UCSD-E4E/synology-filestation/commit/b11633fe8f26960c796cfe07acbfda04d92a4b6a))
+* **openvpn:** say why the stack stopped, instead of only that it did ([614f649](https://github.com/UCSD-E4E/synology-filestation/commit/614f649c5bbd52fcd394791f0086afafca5a1cd1))
+* **openvpn:** size a datagram so the wire will take it ([406cbf3](https://github.com/UCSD-E4E/synology-filestation/commit/406cbf322046db7be280d0a53d2bf09d691225b6))
+* **openvpn:** size a datagram so the wire will take it ([9d893a8](https://github.com/UCSD-E4E/synology-filestation/commit/9d893a88719cebb78f36f0b4e001a623cabe3b3d))
+* **smb:** pick up the shorter write queue ([2f93a95](https://github.com/UCSD-E4E/synology-filestation/commit/2f93a954aac9087c907f797d5bad481e3b1ff560))
+* **smb:** pick up the shorter write queue ([7359cad](https://github.com/UCSD-E4E/synology-filestation/commit/7359cadf4533aba3155ccb03e3979871c2ddd5cd))
+
 ## [0.5.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.5.2...synology-filestation-gui-v0.5.3) (2026-08-26)
 
 
