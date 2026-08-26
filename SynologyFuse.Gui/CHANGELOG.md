@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.4.3...synology-filestation-gui-v0.5.0) (2026-08-26)
+
+
+### Features
+
+* **openvpn:** say what the tunnel negotiated ([fbfa8e3](https://github.com/UCSD-E4E/synology-filestation/commit/fbfa8e39394ca6cf12540abca3c2ee163d990b27))
+* **openvpn:** say what the tunnel negotiated ([3628113](https://github.com/UCSD-E4E/synology-filestation/commit/36281130043dc18d3b9b8e1c5520177004285737))
+
+
+### Bug Fixes
+
+* **fuse:** cache directory listings instead of re-asking the NAS ([a3805ee](https://github.com/UCSD-E4E/synology-filestation/commit/a3805ee5f0a657f612731fce53232ce90ae38666))
+* **fuse:** cache directory listings instead of re-asking the NAS ([28cf37f](https://github.com/UCSD-E4E/synology-filestation/commit/28cf37f52b9928962cdfc6eede972aa221123609))
+
 ## [0.4.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.4.2...synology-filestation-gui-v0.4.3) (2026-08-25)
 
 
