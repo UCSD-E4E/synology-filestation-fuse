@@ -228,6 +228,24 @@ impl Drop for Tunnel {
 
 /// Whether a socket error is about this moment rather than about the tunnel.
 ///
+/// Only asked of the **receive** side. A failed *send* never ends the tunnel,
+/// whatever it was: UDP does not promise delivery, so a datagram the kernel
+/// would not take is indistinguishable from one dropped on the way, and both
+/// layers above already handle that — OpenVPN's reliability layer retransmits
+/// the control channel, TCP retransmits everything else.
+///
+/// It used to end the session unless the error was one of the kinds below.
+/// `ENOBUFS` is not among them — it has no `ErrorKind` of its own and arrives
+/// as `Uncategorized` — and it is exactly what a burst produces when an
+/// interface queue fills, which is what a megabyte of SMB write is. So a copy
+/// killed its own tunnel a few milliseconds in, and every layer above reported
+/// something true and useless: the stack stopped, the connection was torn
+/// down, the write failed.
+///
+/// Nothing is swallowed silently: a send that fails is logged, and a tunnel
+/// where none of them are going anywhere stops answering — which the peer
+/// timeout notices, with a reason that says so.
+///
 /// The socket is `connect`ed, which is what lets the loop use `send`/`recv`
 /// without carrying the peer address around — and which also means the kernel
 /// reports ICMP back to us. A server that has not finished starting, a NAT
@@ -271,14 +289,8 @@ async fn run(
                 break;
             };
             if let Err(error) = socket.send(&datagram).await {
-                // A link that cannot carry this datagram now. The layer above
-                // will send it again.
-                if is_transient(&error) {
-                    continue;
-                }
-                let error = Error::Io(error.to_string());
-                break_with(&mut ready, error.clone());
-                return finish(failure, error);
+                // Never fatal, whatever it is — see `is_transient`.
+                tracing::debug!("tunnel: a datagram did not go out: {error}");
             }
         }
         if let Some(error) = session.failure() {
@@ -367,12 +379,8 @@ async fn run(
                 Some(payload) => match session.send_payload(Instant::now(), &payload) {
                     Ok(datagram) => {
                         if let Err(error) = socket.send(&datagram).await {
-                            if !is_transient(&error) {
-                                break Error::Io(error.to_string());
-                            }
-                            // Dropped, as a link drops what it cannot carry.
-                            // What sits above this tunnel is TCP, and TCP's
-                            // answer to a lost segment is to send it again.
+                            // Never fatal, whatever it is — see `is_transient`.
+                            tracing::debug!("tunnel: a datagram did not go out: {error}");
                         }
                     }
                     Err(error) if error.is_fatal() => break error,
@@ -401,6 +409,11 @@ fn break_with(
 }
 
 fn finish(failure: LinkFailure, error: Error) {
+    // Logged as well as recorded. Recording it serves whoever thinks to ask;
+    // this serves the person reading the log after their copy failed, who
+    // otherwise sees every layer above report the consequence and nothing
+    // report the cause.
+    tracing::warn!("tunnel: stopped because {error}");
     failure.set(error);
 }
 
