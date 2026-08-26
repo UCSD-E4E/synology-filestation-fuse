@@ -760,7 +760,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1621,7 +1621,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2181,7 +2181,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2246,7 +2246,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2492,7 +2492,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 [[package]]
 name = "smb2"
 version = "0.18.1"
-source = "git+https://github.com/UCSD-E4E/smb2?rev=392f57377b93211816a4546d2aa2ae2de1551c58#392f57377b93211816a4546d2aa2ae2de1551c58"
+source = "git+https://github.com/UCSD-E4E/smb2?rev=66262fdf48ef8a4bc9c0b24299fd60dad6c7bfb8#66262fdf48ef8a4bc9c0b24299fd60dad6c7bfb8"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm",
@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "synology-filestation-core"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2646,7 +2646,7 @@ dependencies = [
 
 [[package]]
 name = "synology-filestation-fuse"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2713,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "synology_filestation"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
@@ -2754,10 +2754,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3246,7 +3246,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
