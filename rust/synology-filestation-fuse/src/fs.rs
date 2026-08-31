@@ -84,9 +84,10 @@ struct WriteBuffer {
     /// Allows the first upload to use overwrite=false, skipping the
     /// delete-before-upload round trips. Cleared once an upload succeeds.
     new_file: bool,
-    /// Set when a streamed write failed. The file on the server is short and
-    /// the handle is gone, so `close` must report that rather than claim the
-    /// write landed.
+    /// Set when a write failed. Streamed, the file on the server is short and
+    /// the handle is gone; buffered, the buffer no longer matches what the
+    /// caller wrote. Either way `close` must report that rather than claim the
+    /// write landed — or, worse, upload what is left over the destination.
     broken: bool,
 }
 
@@ -574,9 +575,16 @@ impl SynologyFS {
                     }
                 }
                 WriteSink::Buffered(spill) => {
-                    spill
-                        .write_at(offset, data)
-                        .map_err(|e| SynoFsError::Io(e.to_string()))?;
+                    if let Err(e) = spill.write_at(offset, data) {
+                        // The buffer no longer holds what the caller wrote, and
+                        // the upload path cannot tell a short buffer from a
+                        // short file — it would publish the truncated version
+                        // over the destination. Abandon the handle the same way
+                        // a failed streamed write does, so `close` reports the
+                        // failure instead of a file that never landed.
+                        buf.broken = true;
+                        return Err(SynoFsError::Io(e.to_string()));
+                    }
                 }
             }
             buf.dirty = true;
@@ -2607,6 +2615,54 @@ mod tests {
         let f = fixture();
         let sink = f.fs.open_sink("/share/plain.bin");
         assert!(matches!(sink, WriteSink::Buffered(_)));
+    }
+
+    /// Regression: a 6 MB+ copy onto the mount ended as a **zero-byte file on
+    /// the NAS**. The buffer's spill to a temp file failed (`ENOENT` — the temp
+    /// directory was gone), which emptied it, and unlike the streamed path a
+    /// failed *buffered* write left the handle looking healthy: still dirty,
+    /// not broken. `close(2)` then happily uploaded what was left — nothing —
+    /// over the destination. The write reported EIO *and* the file was lost.
+    ///
+    /// A write that failed must take the handle with it, so close reports the
+    /// failure instead of publishing a short file.
+    #[test]
+    fn a_failed_buffered_write_is_not_uploaded_as_a_truncated_file() {
+        let f = fixture();
+        mount_upload_ok(&f);
+
+        let dir = std::env::temp_dir().join("synofs-fs-spill-dir-that-does-not-exist");
+        assert!(!dir.exists(), "the test needs this path to be absent");
+
+        let fh = f.fs.next_fh.fetch_add(1, Ordering::Relaxed);
+        f.fs.write_buffers.lock().unwrap().insert(
+            fh,
+            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+                nas_path: "/share/big.zip".to_string(),
+                ino: 9,
+                sink: WriteSink::Buffered(SpillBuffer::with_spill_at_in(8, dir)),
+                dirty: false,
+                new_file: true,
+                broken: false,
+            })),
+        );
+
+        f.fs.write_buffer_at(fh, 0, b"12345678")
+            .expect("this much still fits in memory");
+        let err =
+            f.fs.write_buffer_at(fh, 8, b"overflow")
+                .expect_err("the spill had nowhere to go, so write(2) must say so");
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+
+        let err =
+            f.fs.finish_upload(fh)
+                .expect_err("close must not claim a file landed when a write failed");
+        assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+        assert_eq!(
+            posted_bodies(&f).len(),
+            0,
+            "nothing was uploaded over the destination"
+        );
     }
 
     #[test]
