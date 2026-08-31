@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.5](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.4...synology-filestation-fuse-v0.5.5) (2026-08-31)
+
+
+### Bug Fixes
+
+* **fuse:** a dead stream must not fail a write nothing has left yet ([5e7d5fb](https://github.com/UCSD-E4E/synology-filestation/commit/5e7d5fb1b15c458e69986dca719ee63180da638a))
+* **fuse:** a dead stream must not fail a write nothing has left yet ([b1edb69](https://github.com/UCSD-E4E/synology-filestation/commit/b1edb6992a46d2fd236e80fb8a9b4d7ced127fc3))
+* **fuse:** do not spill into the working directory on Windows ([0e0a920](https://github.com/UCSD-E4E/synology-filestation/commit/0e0a92002f152bc702fdc3a7258d8db05fc5cbe7))
+* **fuse:** do not spill into the working directory on Windows ([35507b9](https://github.com/UCSD-E4E/synology-filestation/commit/35507b99c70c8f358459ba90711e4bb88b9ee6c5))
+* **fuse:** keep spilling after the shell that started the mount is gone ([0b9be75](https://github.com/UCSD-E4E/synology-filestation/commit/0b9be756f89d4c4eb41163ceadb5662582a57050))
+* **fuse:** keep spilling after the shell that started the mount is gone ([915bd71](https://github.com/UCSD-E4E/synology-filestation/commit/915bd7181aae49cfba9aeaf668903f600d3b4f4f))
+* **fuse:** stop a failed spill from uploading an empty file over the destination ([1eb64a6](https://github.com/UCSD-E4E/synology-filestation/commit/1eb64a668a3e34679b02242bc0b28c653c48bc7b))
+* **fuse:** stop a failed spill from uploading an empty file over the destination ([4d505ec](https://github.com/UCSD-E4E/synology-filestation/commit/4d505ecc6ab0e99c0a7044f26e97c48f37b13f1a))
+
 ## [0.5.4](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.3...synology-filestation-fuse-v0.5.4) (2026-08-26)
 
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.5](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.5.4...synology-filestation-gui-v0.5.5) (2026-08-31)
+
+
+### Bug Fixes
+
+* **fuse:** keep spilling after the shell that started the mount is gone ([0b9be75](https://github.com/UCSD-E4E/synology-filestation/commit/0b9be756f89d4c4eb41163ceadb5662582a57050))
+* **fuse:** keep spilling after the shell that started the mount is gone ([915bd71](https://github.com/UCSD-E4E/synology-filestation/commit/915bd7181aae49cfba9aeaf668903f600d3b4f4f))
+
 ## [0.5.4](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.5.3...synology-filestation-gui-v0.5.4) (2026-08-26)
 
 

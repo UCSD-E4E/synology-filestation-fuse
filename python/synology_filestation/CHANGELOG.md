@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.5](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.5.4...synology_filestation-v0.5.5) (2026-08-31)
+
+
+### Miscellaneous Chores
+
+* **synology_filestation:** Synchronize synology-filestation versions
+
 ## [0.5.4](https://github.com/UCSD-E4E/synology-filestation/compare/synology_filestation-v0.5.3...synology_filestation-v0.5.4) (2026-08-26)
 
 
