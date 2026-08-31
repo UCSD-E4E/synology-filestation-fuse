@@ -1,0 +1,716 @@
+//! Making a slice upload safe: retry, verification, MD5, and lost partials.
+
+use super::*;
+
+// ── slice upload: retry, and the verification that makes it safe ──────────
+//
+// DSM offers no resume. The server appends each slice to its tmpfile and
+// never reports how many bytes it holds — `FileUploader_T9JY.js` computes
+// every offset client-side and, on any error, gives up on the whole file.
+// So a resent slice is exact only when the request never reached the
+// server; if the body went out and the answer was lost, resending may
+// append the same 10 MiB twice.
+//
+// We resend anyway, because the alternative is discarding a multi-GB
+// upload over one blip, and we make it safe by checking what actually
+// landed: the size always, plus a server-side MD5 (SYNO.FileStation.MD5
+// v2 — the API File Station's own properties dialog calls) whenever a
+// resend could have doubled a slice. A retry on the *first* slice can't
+// double anything: without a tmpfile handle the resend opens a fresh
+// partial, so it skips the hash.
+
+/// md5 of `scratch_file(_, 2500)`'s byte pattern, from `md5sum` rather than
+/// from our own hasher, so the test can disagree with the implementation.
+const SCRATCH_2500_MD5: &str = "babbd9d63dca99cb8d4cc054ba70829d";
+
+fn slice_ok() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "success": true,
+        "data": {"blSkip": false, "tmpfile": "slice.1.0.9224"}
+    }))
+}
+
+/// Answer `getinfo` for the uploaded file with `size` bytes.
+async fn mount_getinfo_size(server: &MockServer, size: u64) {
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "getinfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "data": {"files": [{
+                "name": "big.bin",
+                "path": "/share/big.bin",
+                "isdir": false,
+                "additional": {"size": size, "owner": null, "time": null, "perm": null}
+            }]}
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Answer the two-step MD5 task API with `digest`.
+async fn mount_md5(server: &MockServer, digest: &str) {
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("api", "SYNO.FileStation.MD5"))
+        .and(query_param("method", "start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"taskid": "md5-1"}
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("api", "SYNO.FileStation.MD5"))
+        .and(query_param("method", "status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"finished": true, "md5": digest}
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn md5_calls(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.url
+                .query()
+                .is_some_and(|q| q.contains("SYNO.FileStation.MD5"))
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn slice_upload_resends_a_failed_slice_on_the_same_tmpfile() {
+    let server = MockServer::start().await;
+    // Slice 1 goes out, slice 2 gets a 503, then everything succeeds.
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .mount(&server)
+        .await;
+    mount_getinfo_size(&server, 2500).await;
+    mount_md5(&server, SCRATCH_2500_MD5).await;
+
+    let local = scratch_file("retry.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .expect("a blip on one slice does not cost the file");
+
+    let posts = slice_posts(&server).await;
+    assert_eq!(posts.len(), 4, "3 slices plus one resend");
+    // The resend continues the same partial file rather than starting over.
+    let tmps: Vec<_> = posts.iter().map(|r| header_of(r, "X-TMP-FILE")).collect();
+    assert_eq!(tmps[1], tmps[2], "the resend targets the same tmpfile");
+    assert_eq!(
+        header_of(&posts[3], "X-FILE-CHUNK-END").as_deref(),
+        Some("true"),
+        "the upload still terminates on the final slice"
+    );
+    std::fs::remove_file(&local).ok();
+}
+
+#[tokio::test]
+async fn slice_upload_hashes_the_result_after_a_resend_that_could_have_doubled() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .mount(&server)
+        .await;
+    mount_getinfo_size(&server, 2500).await;
+    mount_md5(&server, SCRATCH_2500_MD5).await;
+
+    let local = scratch_file("hashed.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .unwrap();
+
+    assert!(
+        md5_calls(&server).await >= 2,
+        "a risky resend is verified by start + status"
+    );
+    std::fs::remove_file(&local).ok();
+}
+
+#[tokio::test]
+async fn slice_upload_skips_the_hash_when_nothing_could_have_doubled() {
+    // The happy path pays for one getinfo, never for a NAS-side hash of a
+    // multi-GB file.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .mount(&server)
+        .await;
+    mount_getinfo_size(&server, 2500).await;
+    mount_md5(&server, SCRATCH_2500_MD5).await;
+
+    let local = scratch_file("clean.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .unwrap();
+
+    assert_eq!(md5_calls(&server).await, 0, "no resend, no hash");
+    std::fs::remove_file(&local).ok();
+}
+
+#[tokio::test]
+async fn resending_the_first_slice_needs_no_hash() {
+    // Slice 1 has no tmpfile to append to, so its resend opens a fresh
+    // partial file. Nothing can be doubled, and the orphaned partial is the
+    // server's to reap.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .mount(&server)
+        .await;
+    mount_getinfo_size(&server, 2500).await;
+    mount_md5(&server, SCRATCH_2500_MD5).await;
+
+    let local = scratch_file("firstfail.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .unwrap();
+
+    let posts = slice_posts(&server).await;
+    assert_eq!(posts.len(), 4, "3 slices plus the first slice's resend");
+    assert!(
+        header_of(&posts[1], "X-TMP-FILE").is_none(),
+        "the resend of slice 1 opens a new partial rather than continuing one"
+    );
+    assert_eq!(md5_calls(&server).await, 0, "nothing could have doubled");
+    std::fs::remove_file(&local).ok();
+}
+
+#[tokio::test]
+async fn slice_upload_fails_when_the_landed_size_is_wrong() {
+    // The cheap half of the safety net: a doubled slice that DSM kept makes
+    // the file too big, and no hash is needed to see it.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .mount(&server)
+        .await;
+    mount_getinfo_size(&server, 3524).await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "delete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true
+        })))
+        .mount(&server)
+        .await;
+
+    let local = scratch_file("wrongsize.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    let err = client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+
+    let deleted = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
+    assert!(deleted, "a file we cannot vouch for is not left behind");
+    std::fs::remove_file(&local).ok();
+}
+
+#[tokio::test]
+async fn slice_upload_fails_when_the_server_hash_disagrees() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .mount(&server)
+        .await;
+    // Right size, wrong content — exactly what a doubled slice looks like
+    // if DSM trims the partial back to X-FILE-SIZE.
+    mount_getinfo_size(&server, 2500).await;
+    mount_md5(&server, "00000000000000000000000000000000").await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "delete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true
+        })))
+        .mount(&server)
+        .await;
+
+    let local = scratch_file("badhash.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    let err = client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+
+    let deleted = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
+    assert!(
+        deleted,
+        "the corrupt file is removed, not reported as success"
+    );
+    std::fs::remove_file(&local).ok();
+}
+
+#[tokio::test]
+async fn slice_upload_accepts_a_result_it_cannot_verify() {
+    // DSM answering "no such API" is a verdict, not a hiccup: the appliance
+    // simply cannot hash for us. The upload itself succeeded and there is no
+    // evidence of harm, so that answer is accepted with a warning rather
+    // than turned into a failure — the documented residual risk of
+    // resending a slice. Contrast the unreachable case below.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .mount(&server)
+        .await;
+    mount_getinfo_size(&server, 2500).await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("api", "SYNO.FileStation.MD5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 102}
+        })))
+        .mount(&server)
+        .await;
+
+    let local = scratch_file("noverify.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .expect("an unverifiable upload is not a failed one");
+    std::fs::remove_file(&local).ok();
+}
+
+#[tokio::test]
+async fn slice_upload_gives_up_after_the_attempt_bound() {
+    // Bounded, per the outer-retry contract: this client never spins on a
+    // slice forever.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let local = scratch_file("hopeless.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    let err = client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+    assert_eq!(
+        slice_posts(&server).await.len(),
+        3,
+        "one slice, three attempts, then the error surfaces"
+    );
+    std::fs::remove_file(&local).ok();
+}
+
+// ── SYNO.FileStation.MD5 ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn md5_polls_the_task_until_it_finishes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"taskid": "md5-7"}
+        })))
+        .mount(&server)
+        .await;
+    // DSM reads the file to answer, so the first status call says "not yet".
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"finished": false}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"finished": true, "md5": "d41d8cd98f00b204e9800998ecf8427e"}
+        })))
+        .mount(&server)
+        .await;
+
+    let digest = client_for(&server).md5("/share/big.bin").await.unwrap();
+    assert_eq!(digest, "d41d8cd98f00b204e9800998ecf8427e");
+
+    let taskids: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "taskid")
+                .map(|(_, v)| v.to_string())
+        })
+        .collect();
+    assert_eq!(
+        taskids,
+        vec!["md5-7", "md5-7"],
+        "both polls carry the task id start handed back"
+    );
+}
+
+#[tokio::test]
+async fn md5_surfaces_an_api_error_rather_than_polling_forever() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 400}
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client_for(&server).md5("/share/big.bin").await.unwrap_err();
+    assert!(matches!(err, SynoFsError::ApiError(400)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn slice_upload_tolerates_a_size_that_settles() {
+    // The listing can lag a write DSM has just accepted — the same lag
+    // `clear_for_overwrite` polls through. A disagreement is confirmed
+    // before it costs the file, because the alternative is deleting a
+    // perfectly good upload.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "getinfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "data": {"files": [{
+                "name": "big.bin", "path": "/share/big.bin", "isdir": false,
+                "additional": {"size": 1024, "owner": null, "time": null, "perm": null}
+            }]}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_getinfo_size(&server, 2500).await;
+
+    let local = scratch_file("settles.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .expect("a listing that catches up is not a corrupt upload");
+
+    let deleted = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
+    assert!(!deleted, "a good upload is never deleted");
+    std::fs::remove_file(&local).ok();
+}
+
+#[tokio::test]
+async fn slice_upload_will_not_vouch_when_the_hash_check_cannot_run() {
+    // A hash check we could not *reach* is different from one DSM refused:
+    // it leaves us with a resend that may have doubled a slice and no way
+    // to tell. Report the failure rather than claim a verified write — but
+    // do not delete, because there is no evidence the file is bad and
+    // destroying a probably-good upload is the worse mistake. The caller's
+    // retry re-uploads over it.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .mount(&server)
+        .await;
+    mount_getinfo_size(&server, 2500).await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("api", "SYNO.FileStation.MD5"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let local = scratch_file("unreachable.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    let err = client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+
+    let deleted = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.query().is_some_and(|q| q.contains("method=delete")));
+    assert!(
+        !deleted,
+        "an unverified file is kept; only a proven bad one goes"
+    );
+    std::fs::remove_file(&local).ok();
+}
+
+// ── when the server loses the partial ────────────────────────────────────
+//
+// Observed against e4e-nas on 2026-08-12: a 540 MiB upload lost its
+// connection at slice 54 (`Connection timed out (os error 110)` off-campus,
+// where SMB is firewalled and everything goes over HTTP), the slice was
+// resent on the same X-TMP-FILE, and DSM answered 401 — "unknown error of
+// file operation", its way of saying that partial is no longer a thing it
+// will append to. Treating that as fatal loses the whole file.
+//
+// DSM offers exactly one recovery: a fresh partial. So the upload starts
+// over rather than failing, bounded by the same attempt count. A restart
+// also clears the doubt from the resend that provoked it — a new tmpfile
+// cannot contain a doubled slice.
+
+#[tokio::test]
+async fn slice_upload_starts_over_when_the_server_rejects_the_partial() {
+    let server = MockServer::start().await;
+    // Slice 1 lands, slice 2's connection dies, and the resend is met with
+    // 401 — the partial is gone.
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 401}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .mount(&server)
+        .await;
+    // Nothing of ours landed before the restart.
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "getinfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 408}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_getinfo_size(&server, 2500).await;
+
+    let local = scratch_file("restart.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .expect("a rejected partial costs the transfer, not the file");
+
+    let posts = slice_posts(&server).await;
+    assert_eq!(
+        posts.len(),
+        6,
+        "slice 1, slice 2, its resend, then all 3 slices again"
+    );
+    assert!(
+        header_of(&posts[3], "X-TMP-FILE").is_none(),
+        "the restart opens a fresh partial instead of continuing the dead one"
+    );
+    std::fs::remove_file(&local).ok();
+}
+
+#[tokio::test]
+async fn slice_upload_does_not_start_over_for_a_verdict_about_the_file() {
+    // A restart is for a partial the server threw away. Permission, quota
+    // and the like are answers about the write itself: re-uploading the
+    // whole file cannot change them, and doing it anyway would hammer the
+    // NAS with gigabytes for nothing.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 1805}
+        })))
+        .mount(&server)
+        .await;
+
+    let local = scratch_file("denied.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    let err = client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SynoFsError::ApiError(1805)), "got {err:?}");
+    assert_eq!(
+        slice_posts(&server).await.len(),
+        2,
+        "no restart, no further slices"
+    );
+    std::fs::remove_file(&local).ok();
+}
+
+#[tokio::test]
+async fn slice_upload_notices_the_file_landed_before_starting_over() {
+    // The final slice's response can be the thing that gets lost. Starting
+    // over would then re-send the whole file (and, with overwrite=false,
+    // collide with what we already wrote), so a restart looks first.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(slice_ok())
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 401}
+        })))
+        .mount(&server)
+        .await;
+    mount_getinfo_size(&server, 2500).await;
+    mount_md5(&server, SCRATCH_2500_MD5).await;
+
+    let local = scratch_file("landed.bin", 2500);
+    let client = client_for(&server).with_slice_size(1024);
+    client
+        .upload_from_path(&local, "/share", "big.bin", false)
+        .await
+        .expect("the file is on the NAS; that is what success means");
+
+    assert_eq!(
+        slice_posts(&server).await.len(),
+        4,
+        "3 slices plus the resend — the file is not sent a second time"
+    );
+    assert!(
+        md5_calls(&server).await >= 2,
+        "it landed via a resend, so its contents are checked"
+    );
+    std::fs::remove_file(&local).ok();
+}
