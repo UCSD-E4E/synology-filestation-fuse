@@ -166,6 +166,7 @@ fn seed_dirty_buffer_fh(f: &Fixture, fh: u64, nas_path: &str, data: &[u8]) -> u6
             nas_path: nas_path.to_string(),
             ino,
             sink: WriteSink::Buffered(buf),
+            streamed: false,
             dirty: true,
             new_file: true,
             broken: false,

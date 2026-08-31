@@ -413,6 +413,7 @@ impl Filesystem for SynologyFS {
                 sink: self.open_sink(&path),
                 nas_path: path,
                 ino,
+                streamed: false,
                 dirty: false,
                 new_file: false,
                 broken: false,
@@ -569,6 +570,7 @@ impl Filesystem for SynologyFS {
                 // nothing to do and the file never reached the NAS at all —
                 // it lived in the inode cache until the TTL expired and then
                 // vanished.
+                streamed: false,
                 dirty: true,
                 new_file: true,
                 broken: false,

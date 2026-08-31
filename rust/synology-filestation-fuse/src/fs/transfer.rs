@@ -43,6 +43,11 @@ pub(super) struct WriteBuffer {
     /// Allows the first upload to use overwrite=false, skipping the
     /// delete-before-upload round trips. Cleared once an upload succeeds.
     pub(super) new_file: bool,
+    /// Set once a streamed write has actually reached the server. Until then
+    /// a failed stream can still be replaced by the buffered path; after it,
+    /// the file on the server is a prefix only this handle could complete.
+    pub(super) streamed: bool,
+
     /// Set when a write failed. Streamed, the file on the server is short and
     /// the handle is gone; buffered, the buffer no longer matches what the
     /// caller wrote. Either way `close` must report that rather than claim the
