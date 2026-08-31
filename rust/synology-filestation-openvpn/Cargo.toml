@@ -41,7 +41,7 @@ rustls-pemfile = "2"
 # The data channel's cipher, as e4e-nas is configured. Not AEAD: DSM offers
 # CBC, so the packet carries a separate HMAC.
 aes = "0.8"
-cbc = { version = "0.1", features = ["alloc"] }
+cbc = { version = "0.2", features = ["alloc"] }
 md-5 = "0.10"
 sha1 = "0.10"
 # Session ids have to be unpredictable, not merely distinct.
