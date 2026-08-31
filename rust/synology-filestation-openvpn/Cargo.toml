@@ -43,7 +43,7 @@ rustls-pemfile = "2"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 md-5 = "0.10"
-sha1 = "0.10"
+sha1 = "0.11"
 # Session ids have to be unpredictable, not merely distinct.
 rand = "0.10"
 thiserror = "2"
