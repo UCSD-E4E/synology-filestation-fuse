@@ -45,7 +45,7 @@ cbc = { version = "0.1", features = ["alloc"] }
 md-5 = "0.10"
 sha1 = "0.10"
 # Session ids have to be unpredictable, not merely distinct.
-rand = "0.9"
+rand = "0.10"
 thiserror = "2"
 # The driver owns the socket and the timers. Everything below it stays
 # sans-io, which is what let the rest of this crate be tested without a
