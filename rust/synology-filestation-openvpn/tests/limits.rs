@@ -131,6 +131,7 @@ fn sign_as_client(
     packet_id: u32,
     net_time: u32,
 ) -> Vec<u8> {
+    use hmac::digest::KeyInit;
     use hmac::{Hmac, Mac};
     use sha2::Sha512;
 
