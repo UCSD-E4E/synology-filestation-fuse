@@ -28,7 +28,8 @@
 //! encrypts perfectly and neither can read anything.
 
 use aes::cipher::block_padding::Pkcs7;
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
+use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -190,7 +191,7 @@ impl DataChannel {
         plaintext.extend_from_slice(payload);
 
         let ciphertext = Encryptor::new(&self.keys.encrypt_cipher.into(), &iv.into())
-            .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+            .encrypt_padded_vec::<Pkcs7>(&plaintext);
 
         let mut mac = <Hmac<Sha512>>::new_from_slice(&self.keys.encrypt_hmac)
             .expect("HMAC accepts any key length");
@@ -263,7 +264,7 @@ impl DataChannel {
             .expect("the slice is exactly IV_LEN long");
         let plaintext = Zeroizing::new(
             Decryptor::new(&self.keys.decrypt_cipher.into(), &iv.into())
-                .decrypt_padded_vec_mut::<Pkcs7>(&datagram[iv_end..])
+                .decrypt_padded_vec::<Pkcs7>(&datagram[iv_end..])
                 .map_err(|_| Error::BadPadding)?,
         );
 

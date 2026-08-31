@@ -20,6 +20,7 @@
 //! sort of detail that is invisible when it is wrong, because the far end
 //! answers a bad HMAC with silence.
 
+use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use zeroize::Zeroizing;

@@ -138,7 +138,7 @@ fn p_hash<M: Mac + KeyInit>(secret: &[u8], seed: &[u8], out: &mut [u8]) {
     // final `zeroize()` call, because the loop replaces `a` each round and
     // only the last one would otherwise be cleared.
     let mac = |data: &[&[u8]]| -> Zeroizing<Vec<u8>> {
-        let mut hmac = <M as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+        let mut hmac = <M as KeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
         for part in data {
             hmac.update(part);
         }
