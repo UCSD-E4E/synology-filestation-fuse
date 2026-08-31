@@ -59,6 +59,11 @@ fn usable_or_fallback(candidate: PathBuf) -> PathBuf {
     if candidate.is_dir() {
         return candidate;
     }
+    let Some(fallback) = FALLBACK_SPILL_DIR else {
+        // Nothing better to offer, so let the write fail where it is rather
+        // than picking a directory nobody asked for.
+        return candidate;
+    };
     // Log once: a mount that falls back does it for every handle it opens.
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
@@ -67,19 +72,26 @@ fn usable_or_fallback(candidate: PathBuf) -> PathBuf {
              (A mount started from a `nix develop` shell outlives the directory that \
              shell sets $TMPDIR to.)",
             candidate.display(),
-            FALLBACK_SPILL_DIR,
+            fallback,
         );
     });
-    PathBuf::from(FALLBACK_SPILL_DIR)
+    PathBuf::from(fallback)
 }
 
-/// Where to spill when `$TMPDIR` names nothing. On Unix this is what
-/// `std::env::temp_dir()` defaults to; on Windows `GetTempPath2` always
-/// answers, so the candidate is kept and this is never reached.
+/// Where to spill when `$TMPDIR` names nothing.
+///
+/// On Unix this is what `std::env::temp_dir()` falls back to anyway, so
+/// choosing it here only restores the behaviour of an unset `$TMPDIR`.
+///
+/// Windows gets none: `GetTempPath2` already synthesises a path from several
+/// environment variables and finally the system directory, so a missing one is
+/// not the recoverable case it is on Unix — and the obvious stand-in, the
+/// process's working directory, is where a multi-gigabyte spill file would do
+/// the most damage.
 #[cfg(unix)]
-const FALLBACK_SPILL_DIR: &str = "/tmp";
-#[cfg(windows)]
-const FALLBACK_SPILL_DIR: &str = ".";
+const FALLBACK_SPILL_DIR: Option<&str> = Some("/tmp");
+#[cfg(not(unix))]
+const FALLBACK_SPILL_DIR: Option<&str> = None;
 
 /// Files larger than this are written to a temp file instead of RAM. Sized to
 /// cover the overwhelming majority of desktop file writes while capping what a
@@ -349,6 +361,7 @@ mod tests {
     /// of the process's life. No file over the threshold could be written at
     /// all, which is not a temp-directory problem as far as the user is
     /// concerned: it is "copying a large file to the NAS returns EIO".
+    #[cfg(unix)]
     #[test]
     fn a_temp_dir_that_no_longer_exists_falls_back_to_one_that_does() {
         let gone = std::env::temp_dir().join("synofs-nix-shell-that-already-exited");
