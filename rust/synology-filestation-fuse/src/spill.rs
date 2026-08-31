@@ -27,8 +27,8 @@ const SPILL_NAME_ATTEMPTS: u32 = 8;
 /// not a secret, which is why the open refuses to follow an existing path.
 static SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn temp_path(seq: u64, attempt: u32) -> PathBuf {
-    std::env::temp_dir().join(format!(
+fn temp_path(dir: &Path, seq: u64, attempt: u32) -> PathBuf {
+    dir.join(format!(
         "synofs-write-{}-{seq}-{attempt}.tmp",
         std::process::id()
     ))
@@ -57,6 +57,9 @@ pub struct SpillBuffer {
     /// extends the buffer the same way in both stores.
     len: u64,
     spill_at: usize,
+    /// Directory this buffer spills into. Configurable so the tests can point
+    /// it somewhere unusable; every caller uses the process temp directory.
+    dir: PathBuf,
 }
 
 impl SpillBuffer {
@@ -65,11 +68,16 @@ impl SpillBuffer {
     }
 
     pub fn with_spill_at(spill_at: usize) -> Self {
+        Self::with_spill_at_in(spill_at, std::env::temp_dir())
+    }
+
+    pub fn with_spill_at_in(spill_at: usize, dir: PathBuf) -> Self {
         SpillBuffer {
             store: Store::Memory(Vec::new()),
             seq: SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             len: 0,
             spill_at,
+            dir,
         }
     }
     /// Current logical length. Used by the WebDAV backend to append, and by the
@@ -160,7 +168,9 @@ impl SpillBuffer {
     /// Move the accumulated bytes out of RAM and onto disk.
     fn spill(&mut self) -> std::io::Result<()> {
         // Moved, not cloned: a clone would briefly double the very allocation
-        // this type exists to bound.
+        // this type exists to bound. Moved *back* on every failure path below,
+        // though — dropping it there emptied the buffer without a word, and
+        // the mount then uploaded that emptiness over the destination file.
         let existing = match &mut self.store {
             Store::Memory(v) => std::mem::take(v),
             Store::Spilled { .. } => return Ok(()),
@@ -186,16 +196,27 @@ impl SpillBuffer {
 
         let mut last_err = None;
         for attempt in 0..SPILL_NAME_ATTEMPTS {
-            let path = temp_path(self.seq, attempt);
+            let path = temp_path(&self.dir, self.seq, attempt);
             match opts.open(&path) {
-                Ok(mut file) => {
-                    file.write_all(&existing)?;
-                    self.store = Store::Spilled { file, path };
-                    return Ok(());
-                }
+                Ok(mut file) => match file.write_all(&existing) {
+                    Ok(()) => {
+                        self.store = Store::Spilled { file, path };
+                        return Ok(());
+                    }
+                    // A half-written spill file is worse than none: leave
+                    // nothing behind, and hand the bytes back to the caller's
+                    // buffer so the failure costs only this write.
+                    Err(e) => {
+                        drop(file);
+                        let _ = std::fs::remove_file(&path);
+                        self.store = Store::Memory(existing);
+                        return Err(e);
+                    }
+                },
                 Err(e) => last_err = Some(e),
             }
         }
+        self.store = Store::Memory(existing);
         Err(last_err.unwrap_or_else(|| std::io::Error::other("no spill path available")))
     }
 }
@@ -430,6 +451,35 @@ mod tests {
         assert_eq!(mode, 0o600, "spill file must be owner-only, got {mode:04o}");
     }
 
+    /// Regression: `spill` moved the in-memory bytes out of the store *before*
+    /// it knew it had a file to put them in, so a temp file it could not create
+    /// took the buffer's contents with it — silently. The handle was then an
+    /// empty buffer that still called itself dirty, and the mount uploaded
+    /// exactly that over the destination: a multi-megabyte copy landed on the
+    /// NAS as a zero-byte file. A spill that cannot happen must fail the write
+    /// and leave the buffer exactly as it found it.
+    #[test]
+    fn a_spill_that_cannot_open_its_file_keeps_the_bytes_it_already_had() {
+        let dir = std::env::temp_dir().join("synofs-spill-dir-that-does-not-exist");
+        assert!(!dir.exists(), "the test needs this path to be absent");
+
+        let mut b = SpillBuffer::with_spill_at_in(8, dir);
+        b.write_at(0, b"precious").unwrap();
+
+        let err = b
+            .write_at(8, &[1u8; 64])
+            .expect_err("there is nowhere to spill to, so the write must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "got {err:?}");
+
+        assert!(!b.is_spilled(), "the buffer is still in memory");
+        assert_eq!(b.len(), 8, "the failed write did not extend the buffer");
+        assert_eq!(
+            b.as_bytes().unwrap(),
+            b"precious",
+            "the bytes written before the failed spill are still there"
+        );
+    }
+
     #[test]
     fn spill_does_not_clobber_an_occupied_candidate_path() {
         // The temp dir is world-writable on Unix, so a predictable name opened
@@ -437,7 +487,7 @@ mod tests {
         // symlink to one) and have us destroy it. Spilling must step over an
         // occupied name, not truncate it.
         let mut b = SpillBuffer::with_spill_at(4);
-        let occupied = temp_path(b.seq, 0);
+        let occupied = temp_path(&b.dir, b.seq, 0);
         std::fs::write(&occupied, b"precious").unwrap();
 
         b.write_at(0, &[6u8; 16]).unwrap();
