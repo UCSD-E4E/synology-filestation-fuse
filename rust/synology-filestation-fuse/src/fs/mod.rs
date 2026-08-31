@@ -188,18 +188,41 @@ impl SynologyFS {
         // the speed of the link rather than the speed of the local disk.
         self.rt.block_on(async move {
             let mut buf = handle.lock().await;
+            // Set when a streamed write failed with nothing of this file on the
+            // server yet, so the handle can still take the buffered path.
+            let mut fall_back = false;
             match &mut buf.sink {
                 WriteSink::Streamed(slot) => {
                     let stream = slot
                         .as_mut()
                         .ok_or_else(|| SynoFsError::Io("write to a closed handle".into()))?;
-                    if let Err(e) = stream.write_at(offset, data).await {
-                        // Whatever is on the server is now short of what the
-                        // caller asked for. Drop the handle so `close` cannot
-                        // report success over a failed write.
-                        *slot = None;
-                        buf.broken = true;
-                        return Err(e);
+                    match stream.write_at(offset, data).await {
+                        Ok(()) => buf.streamed = true,
+                        Err(e) => {
+                            // The stream is finished either way: whatever is on
+                            // the server is short of what the caller asked for.
+                            *slot = None;
+                            // But if nothing of this file ever left the machine,
+                            // there is nothing to be consistent with. The
+                            // buffered path can still carry the whole file — it
+                            // is what this mount did for every write before
+                            // streaming existed — so use it rather than failing
+                            // a copy the HTTP API would have completed. Only for
+                            // a file this handle is writing whole: over an
+                            // existing one, the buffer holds what was written
+                            // after the switch and uploading it would publish a
+                            // file with a hole where the rest used to be.
+                            if buf.streamed || !buf.new_file {
+                                buf.broken = true;
+                                return Err(e);
+                            }
+                            warn!(
+                                "streamed write to {} failed ({e}); \
+                                 buffering this handle instead",
+                                buf.nas_path
+                            );
+                            fall_back = true;
+                        }
                     }
                 }
                 WriteSink::Buffered(spill) => {
@@ -213,6 +236,16 @@ impl SynologyFS {
                         buf.broken = true;
                         return Err(SynoFsError::Io(e.to_string()));
                     }
+                }
+            }
+            if fall_back {
+                buf.sink = WriteSink::Buffered(SpillBuffer::new());
+                let WriteSink::Buffered(spill) = &mut buf.sink else {
+                    unreachable!("just assigned")
+                };
+                if let Err(e) = spill.write_at(offset, data) {
+                    buf.broken = true;
+                    return Err(SynoFsError::Io(e.to_string()));
                 }
             }
             buf.dirty = true;

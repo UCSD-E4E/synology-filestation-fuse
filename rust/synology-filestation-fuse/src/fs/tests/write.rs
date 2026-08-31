@@ -511,19 +511,25 @@ type SeenWrites = Arc<StdMutex<Vec<(u64, Vec<u8>)>>>;
 struct RecordingSink {
     writes: SeenWrites,
     closed: Arc<AtomicBool>,
-    fail_writes: bool,
+    /// Writes from this one onward fail; `None` never fails. `Some(0)` is a
+    /// link that was dead before the first byte — what a mount sees when the
+    /// SMB session died while the handle sat open.
+    fails_from: Option<usize>,
 }
 
 struct RecordingHandle {
     writes: SeenWrites,
     closed: Arc<AtomicBool>,
-    fail_writes: bool,
+    fails_from: Option<usize>,
+    seen: usize,
 }
 
 #[async_trait::async_trait]
 impl WriteHandle for RecordingHandle {
     async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), SynoFsError> {
-        if self.fail_writes {
+        let n = self.seen;
+        self.seen += 1;
+        if self.fails_from.is_some_and(|first| n >= first) {
             return Err(SynoFsError::Io("the link died mid-write".into()));
         }
         self.writes.lock().unwrap().push((offset, data.to_vec()));
@@ -545,17 +551,22 @@ impl synology_filestation_core::transport::OpenWriteTransport for RecordingSink 
         Ok(Box::new(RecordingHandle {
             writes: self.writes.clone(),
             closed: self.closed.clone(),
-            fail_writes: self.fail_writes,
+            fails_from: self.fails_from,
+            seen: 0,
         }))
     }
 }
 
 /// A fixture whose client can stream, plus the sink it streams into.
 fn streaming_fixture(fail_writes: bool) -> (Fixture, Arc<RecordingSink>) {
+    streaming_fixture_failing_from(fail_writes.then_some(0))
+}
+
+fn streaming_fixture_failing_from(fails_from: Option<usize>) -> (Fixture, Arc<RecordingSink>) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let server = rt.block_on(MockServer::start());
     let sink = Arc::new(RecordingSink {
-        fail_writes,
+        fails_from,
         ..Default::default()
     });
     let client = client_for(&server).with_open_write_transport(sink.clone());
@@ -576,6 +587,17 @@ fn streaming_fixture(fail_writes: bool) -> (Fixture, Arc<RecordingSink>) {
 
 /// Open a handle whose sink comes from the client, the way `create` does.
 fn streamed_handle(f: &Fixture, nas_path: &str) -> u64 {
+    streamed_handle_with(f, nas_path, true)
+}
+
+/// Same, for a handle onto a file that was already on the NAS: the buffered
+/// path cannot stand in for one of those, since it would upload the bytes this
+/// handle happens to write over the whole of what is there.
+fn streamed_handle_onto_an_existing_file(f: &Fixture, nas_path: &str) -> u64 {
+    streamed_handle_with(f, nas_path, false)
+}
+
+fn streamed_handle_with(f: &Fixture, nas_path: &str, new_file: bool) -> u64 {
     let fh = f.fs.next_fh.fetch_add(1, Ordering::Relaxed);
     let sink = f.fs.open_sink(nas_path);
     assert!(
@@ -588,8 +610,9 @@ fn streamed_handle(f: &Fixture, nas_path: &str) -> u64 {
             nas_path: nas_path.to_string(),
             ino: 42,
             sink,
+            streamed: false,
             dirty: false,
-            new_file: true,
+            new_file,
             broken: false,
         })),
     );
@@ -640,7 +663,7 @@ fn a_failed_streamed_write_is_reported_at_the_write_and_again_at_close() {
     // whole reason to stream — and close must not then report success over
     // a file the server never fully received.
     let (f, sink) = streaming_fixture(true);
-    let fh = streamed_handle(&f, "/share/doomed.bin");
+    let fh = streamed_handle_onto_an_existing_file(&f, "/share/doomed.bin");
 
     let err =
         f.fs.write_buffer_at(fh, 0, b"payload")
@@ -655,6 +678,71 @@ fn a_failed_streamed_write_is_reported_at_the_write_and_again_at_close() {
         !sink.closed.load(Ordering::SeqCst),
         "the handle was abandoned, not closed as if it were fine"
     );
+}
+
+/// Regression: the SMB backend opens a handle for an existing path without
+/// touching the wire — deliberately, so it does not have to guess an offset —
+/// so a dead session is invisible at open. The client's ladder therefore
+/// records a success, its circuit breaker stays closed, and the doomed handle
+/// reaches the mount. The first write then failed with
+/// `smb: Disconnected from server`, the handle was abandoned, and `close`
+/// reported the failure: **no file could be copied to the NAS at all**, even
+/// though the HTTP path the metadata calls had already fallen back to was
+/// working fine.
+///
+/// Nothing had left the machine at that point, so there is nothing to be
+/// consistent with: the handle can still take the buffered path, which is what
+/// this mount did for every write before streaming existed.
+#[test]
+fn a_streamed_write_that_fails_before_anything_lands_is_buffered_instead() {
+    let (f, sink) = streaming_fixture(true);
+    mount_upload_ok(&f);
+    let fh = streamed_handle(&f, "/share/copied.bin");
+
+    f.fs.write_buffer_at(fh, 0, b"payload")
+        .expect("a stream that never sent anything must not fail the write");
+
+    f.fs.finish_upload(fh).expect("close");
+
+    assert!(
+        sink.writes.lock().unwrap().is_empty(),
+        "the stream took nothing"
+    );
+    let posted = posted_bodies(&f);
+    assert_eq!(posted.len(), 1, "one upload, over HTTP");
+    assert!(
+        posted[0].windows(7).any(|w| w == b"payload"),
+        "carrying the bytes the stream would not take"
+    );
+}
+
+/// The other half of the rule. Once the server has some of the file, the
+/// buffered path cannot stand in: it holds only what was written after the
+/// switch, and uploading that would publish a file with a hole where the
+/// streamed bytes were. There is nothing to do but report the failure.
+#[test]
+fn a_streamed_write_that_fails_after_bytes_landed_still_breaks_the_handle() {
+    let (f, sink) = streaming_fixture_failing_from(Some(1));
+    mount_upload_ok(&f);
+    let fh = streamed_handle(&f, "/share/half-sent.bin");
+
+    f.fs.write_buffer_at(fh, 0, b"first")
+        .expect("this one lands");
+    let err =
+        f.fs.write_buffer_at(fh, 5, b"second")
+            .expect_err("the link died with bytes already on the server");
+    assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+
+    let err =
+        f.fs.finish_upload(fh)
+            .expect_err("close must not claim a file landed when a write failed");
+    assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+    assert_eq!(
+        sink.writes.lock().unwrap().len(),
+        1,
+        "only the first landed"
+    );
+    assert!(posted_bodies(&f).is_empty(), "and nothing was uploaded");
 }
 
 #[test]
@@ -690,6 +778,7 @@ fn a_failed_buffered_write_is_not_uploaded_as_a_truncated_file() {
             nas_path: "/share/big.zip".to_string(),
             ino: 9,
             sink: WriteSink::Buffered(SpillBuffer::with_spill_at_in(8, dir)),
+            streamed: false,
             dirty: false,
             new_file: true,
             broken: false,
@@ -730,6 +819,7 @@ fn creating_a_file_and_writing_nothing_still_puts_it_on_the_nas() {
             ino: 7,
             sink: WriteSink::Buffered(SpillBuffer::new()),
             // What `create` now seeds.
+            streamed: false,
             dirty: true,
             new_file: true,
             broken: false,
