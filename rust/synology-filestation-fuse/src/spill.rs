@@ -14,6 +14,8 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use tracing::warn;
+
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 
@@ -33,6 +35,51 @@ fn temp_path(dir: &Path, seq: u64, attempt: u32) -> PathBuf {
         std::process::id()
     ))
 }
+
+/// Where spills go: `$TMPDIR` when it is usable, a real directory when it is
+/// not.
+///
+/// `std::env::temp_dir()` is `$TMPDIR`, read fresh on every call — and a
+/// `nix develop` shell points it at a directory it deletes on exit. A mount
+/// started from such a shell keeps running after it, at which point every
+/// spill fails with `ENOENT`: no file over the threshold can be written for
+/// the rest of the process's life. The user sees "copying a large file to the
+/// NAS returns EIO", with nothing to suggest a temp directory is involved.
+///
+/// So a temp directory that is not there is stepped over rather than trusted.
+/// The fallback is what `temp_dir()` itself would have returned had `$TMPDIR`
+/// been unset, so this only ever *widens* where a spill may land.
+fn spill_dir() -> PathBuf {
+    usable_or_fallback(std::env::temp_dir())
+}
+
+/// Split out of [`spill_dir`] so the decision is testable without mutating the
+/// process environment, which no test can do safely while others run.
+fn usable_or_fallback(candidate: PathBuf) -> PathBuf {
+    if candidate.is_dir() {
+        return candidate;
+    }
+    // Log once: a mount that falls back does it for every handle it opens.
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        warn!(
+            "temp directory {} does not exist — large writes will spill to {} instead. \
+             (A mount started from a `nix develop` shell outlives the directory that \
+             shell sets $TMPDIR to.)",
+            candidate.display(),
+            FALLBACK_SPILL_DIR,
+        );
+    });
+    PathBuf::from(FALLBACK_SPILL_DIR)
+}
+
+/// Where to spill when `$TMPDIR` names nothing. On Unix this is what
+/// `std::env::temp_dir()` defaults to; on Windows `GetTempPath2` always
+/// answers, so the candidate is kept and this is never reached.
+#[cfg(unix)]
+const FALLBACK_SPILL_DIR: &str = "/tmp";
+#[cfg(windows)]
+const FALLBACK_SPILL_DIR: &str = ".";
 
 /// Files larger than this are written to a temp file instead of RAM. Sized to
 /// cover the overwhelming majority of desktop file writes while capping what a
@@ -68,7 +115,7 @@ impl SpillBuffer {
     }
 
     pub fn with_spill_at(spill_at: usize) -> Self {
-        Self::with_spill_at_in(spill_at, std::env::temp_dir())
+        Self::with_spill_at_in(spill_at, spill_dir())
     }
 
     pub fn with_spill_at_in(spill_at: usize, dir: PathBuf) -> Self {
@@ -295,6 +342,38 @@ pub async fn upload_payload(
 mod tests {
     use super::*;
 
+
+    /// Regression: the mount is routinely started from a `nix develop` shell,
+    /// which sets `$TMPDIR` to a directory it deletes when the shell exits. The
+    /// mount outlives the shell, so `std::env::temp_dir()` then names a
+    /// directory that is gone — and every spill failed with ENOENT for the rest
+    /// of the process's life. No file over the threshold could be written at
+    /// all, which is not a temp-directory problem as far as the user is
+    /// concerned: it is "copying a large file to the NAS returns EIO".
+    #[test]
+    fn a_temp_dir_that_no_longer_exists_falls_back_to_one_that_does() {
+        let gone = std::env::temp_dir().join("synofs-nix-shell-that-already-exited");
+        assert!(!gone.exists(), "the test needs this path to be absent");
+
+        let chosen = usable_or_fallback(gone.clone());
+
+        assert_ne!(chosen, gone, "a directory that is not there cannot be used");
+        assert!(chosen.is_dir(), "and the fallback has to actually exist");
+    }
+
+    #[test]
+    fn a_temp_dir_that_is_there_is_used_as_it_is() {
+        let real = std::env::temp_dir();
+        assert_eq!(usable_or_fallback(real.clone()), real);
+    }
+
+    #[test]
+    fn a_buffer_built_the_normal_way_spills_somewhere_real() {
+        let mut b = SpillBuffer::with_spill_at(4);
+        b.write_at(0, &[1u8; 32])
+            .expect("the default spill directory must be usable");
+        assert!(b.is_spilled());
+    }
     #[test]
     fn small_writes_stay_in_memory() {
         let mut b = SpillBuffer::with_spill_at(1024);
