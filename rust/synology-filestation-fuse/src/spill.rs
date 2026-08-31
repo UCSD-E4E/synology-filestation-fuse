@@ -342,7 +342,6 @@ pub async fn upload_payload(
 mod tests {
     use super::*;
 
-
     /// Regression: the mount is routinely started from a `nix develop` shell,
     /// which sets `$TMPDIR` to a directory it deletes when the shell exits. The
     /// mount outlives the shell, so `std::env::temp_dir()` then names a
