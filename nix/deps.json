@@ -5,6 +5,11 @@
     "hash": "sha256-GTv2rouQKTrLcryoodYujka0YKSFJ/Xx8Y9ikHPZ130="
   },
   {
+    "pname": "Avalonia",
+    "version": "12.1.2",
+    "hash": "sha256-mZh0FMY6w5kzRqhKhSAG35Y/+Dn5bRQFV+4x+IUNsI8="
+  },
+  {
     "pname": "Avalonia.Angle.Windows.Natives",
     "version": "2.1.27548.20260419",
     "hash": "sha256-dtZ5AQl+kXPRVe/EwrfSyOMSLywuBBUCjrDIhHijhvk="
@@ -55,14 +60,19 @@
     "hash": "sha256-Ewx9x7XsVrmv3Z2TkqVzTASxloSijLftrkYB9YK5MBE="
   },
   {
+    "pname": "Avalonia.Remote.Protocol",
+    "version": "12.1.2",
+    "hash": "sha256-IPuepoUzVR+llgU9CInvkrTYW00CVHdzewzE6QYcZV0="
+  },
+  {
     "pname": "Avalonia.Skia",
     "version": "12.1.1",
     "hash": "sha256-9oPb5fXc395iy4vuDMdeO5vsldn5JHlso2J72ov6TyU="
   },
   {
     "pname": "Avalonia.Themes.Fluent",
-    "version": "12.1.1",
-    "hash": "sha256-YnRV5nn276iYP7PfbX+u9K3xpD3RX4jN80K3rvHEbbQ="
+    "version": "12.1.2",
+    "hash": "sha256-wBngLXs5jn3Pk+UWz+uz9ftGPOStpt++NQTHswsvPr8="
   },
   {
     "pname": "Avalonia.Wayland",
