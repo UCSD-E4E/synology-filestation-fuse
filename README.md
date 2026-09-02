@@ -360,6 +360,7 @@ synology-filestation-fuse --host <NAS_HOST> -u <USERNAME> [OPTIONS] <MOUNTPOINT>
 | `--insecure` | Accept any TLS certificate (self-signed, expired, wrong hostname). Needed for a stock DSM certificate; the connection is then encrypted but **not** authenticated. Env: `SYNO_INSECURE` | `false` |
 | `--cache-ttl <SECS>` | Metadata cache TTL in seconds *(Linux only)* | `30` |
 | `--read-cache-mb <MiB>` | Read cache size in MiB *(Linux only)* | `256` |
+| `--prefetch-blocks <N>` | Speculative read-ahead depth in 256 KiB blocks; `0` disables it. Read-ahead only fires for a reader that is streaming, and the window at open only for a container that keeps its index at the end. A bulk walk over a corpus reads each file once, so it wants `0` *(Linux only)* | `16` |
 | `--uid <UID>` | Owner reported for every mounted entry. DSM's own uids name accounts on the appliance, not on this machine, so they are never used *(Linux only)* | *(mounting user)* |
 | `--gid <GID>` | Group reported for every mounted entry *(Linux only)* | *(mounting user's group)* |
 | `--umask <MASK>` | Octal umask for the permissions the mount reports; `022` gives `0755` directories and `0644` files *(Linux only)* | `022` |

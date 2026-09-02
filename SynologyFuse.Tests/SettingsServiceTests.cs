@@ -81,6 +81,7 @@ public class SettingsServiceTests : IDisposable
                 "Mountpoint": "/mnt/nas",
                 "CacheTtl": 60,
                 "ReadCacheMb": 512,
+                "PrefetchBlocks": 4,
                 "LogLevel": "debug"
             }
             """);
@@ -94,7 +95,25 @@ public class SettingsServiceTests : IDisposable
         Assert.Equal("/mnt/nas", s.Mountpoint);
         Assert.Equal(60m, s.CacheTtl);
         Assert.Equal(512m, s.ReadCacheMb);
+        Assert.Equal(4m, s.PrefetchBlocks);
         Assert.Equal("debug", s.LogLevel);
+    }
+
+    /// <summary>A settings file written before the prefetch knob existed must
+    /// keep the behaviour it had, not silently switch speculation off.</summary>
+    [Fact]
+    public void Load_SettingsWithoutPrefetchBlocks_KeepsTheDefaultWindow()
+    {
+        File.WriteAllText(_path, """
+            {
+                "Host": "nas.example.com",
+                "Mountpoint": "/mnt/nas"
+            }
+            """);
+
+        var s = SettingsService.Load(_path);
+
+        Assert.Equal(16m, s.PrefetchBlocks);
     }
 
     [Fact]
@@ -134,6 +153,7 @@ public class SettingsServiceTests : IDisposable
             Mountpoint = "/mnt/mynas",
             CacheTtl = 45m,
             ReadCacheMb = 128m,
+            PrefetchBlocks = 8m,
             LogLevel = "warn",
         };
 

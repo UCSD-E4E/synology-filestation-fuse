@@ -142,13 +142,14 @@ public sealed class SynoClient : IDisposable
 
     /// <summary>Mount the share at <paramref name="mountpoint"/> in-process.
     /// Returns once the mount is established (or throws on failure).</summary>
-    public void Mount(string mountpoint, ulong cacheTtl, ulong readCacheMb)
+    public void Mount(string mountpoint, ulong cacheTtl, ulong readCacheMb, ulong prefetchBlocks)
     {
         // Tear down any prior mount first so a second Mount() can't orphan the
         // previous native SynoMount (and its background worker / runtime).
         Unmount();
         var err = default(NativeError);
-        int rc = syno_mount(_client, mountpoint, cacheTtl, readCacheMb, out var mount, ref err);
+        int rc = syno_mount(
+            _client, mountpoint, cacheTtl, readCacheMb, prefetchBlocks, out var mount, ref err);
         Check(rc, ref err);
         _mount = mount;
     }
