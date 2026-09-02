@@ -119,10 +119,23 @@ impl<S: AsyncRead + AsyncWrite + Send> TransportReceive for StreamTransport<S> {
 /// A stream that stopped in the middle of a message is a connection that
 /// ended, not a short message — which is the distinction that keeps a
 /// truncated response from being handed upwards as a real one.
+///
+/// Both cases are logged, because this is the only place that knows *how* the
+/// stream ended and `Error::Disconnected` carries nothing: a mount losing its
+/// link reported "Disconnected from server" and no more, which does not
+/// separate a peer that closed the connection from a link that was cut under
+/// it. The errno does, and it is one of the few facts available about a leg
+/// that terminates inside this process. Once per dead connection — `smb2`
+/// drives one receive loop per connection — not once per waiting request.
 fn ended(error: std::io::Error) -> Error {
     if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        tracing::warn!(
+            "smb: the stream reached end of file — the peer closed the connection, \
+             or the link carrying it went away"
+        );
         Error::Disconnected
     } else {
+        tracing::warn!(kind = ?error.kind(), "smb: the stream failed: {error}");
         Error::Io(error)
     }
 }
