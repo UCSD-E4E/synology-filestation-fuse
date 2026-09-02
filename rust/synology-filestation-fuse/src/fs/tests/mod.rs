@@ -9,6 +9,8 @@ use super::attr::*;
 use super::transfer::*;
 use super::*;
 use std::collections::HashMap as Map;
+
+use crate::DEFAULT_PREFETCH_BLOCKS;
 use synology_filestation_core::types::{SynoAdditional, SynoOwner, SynoPerm};
 use wiremock::matchers::{method as http_method, path as http_path, query_param};
 use wiremock::{Mock, MockServer, Request as WmRequest, Respond, ResponseTemplate};
@@ -35,6 +37,10 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_prefetch(DEFAULT_PREFETCH_BLOCKS)
+}
+
+fn fixture_with_prefetch(depth: u64) -> Fixture {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let server = rt.block_on(MockServer::start());
     let fs = SynologyFS::new(
@@ -48,6 +54,7 @@ fn fixture() -> Fixture {
             gid: 1000,
             umask: 0o022,
         },
+        depth,
     );
     Fixture { fs, server, rt }
 }
@@ -59,12 +66,23 @@ fn fixture() -> Fixture {
 struct RangeFile {
     body: Vec<u8>,
     short: Map<u64, usize>,
+    /// Held open this long, so a test can count what is in flight at once.
+    delay: Option<Duration>,
+}
+
+impl RangeFile {
+    fn delayed(&self, t: ResponseTemplate) -> ResponseTemplate {
+        match self.delay {
+            Some(d) => t.set_delay(d),
+            None => t,
+        }
+    }
 }
 
 impl Respond for RangeFile {
     fn respond(&self, req: &WmRequest) -> ResponseTemplate {
         if self.body.is_empty() {
-            return ResponseTemplate::new(200).set_body_bytes(Vec::new());
+            return self.delayed(ResponseTemplate::new(200).set_body_bytes(Vec::new()));
         }
         let (start, end) = match req.headers.get("range").and_then(|v| v.to_str().ok()) {
             Some(r) => {
@@ -80,14 +98,14 @@ impl Respond for RangeFile {
             None => (0, self.body.len() as u64 - 1),
         };
         if start as usize >= self.body.len() {
-            return ResponseTemplate::new(416);
+            return self.delayed(ResponseTemplate::new(416));
         }
         let end = (end as usize).min(self.body.len() - 1);
         let mut slice = self.body[start as usize..=end].to_vec();
         if let Some(&cap) = self.short.get(&start) {
             slice.truncate(cap);
         }
-        ResponseTemplate::new(206).set_body_bytes(slice)
+        self.delayed(ResponseTemplate::new(206).set_body_bytes(slice))
     }
 }
 
@@ -96,7 +114,11 @@ fn mount_download(f: &Fixture, body: Vec<u8>, short: Map<u64, usize>) {
         Mock::given(http_method("GET"))
             .and(http_path("/webapi/entry.cgi"))
             .and(query_param("method", "download"))
-            .respond_with(RangeFile { body, short })
+            .respond_with(RangeFile {
+                body,
+                short,
+                delay: None,
+            })
             .mount(&f.server),
     );
 }
@@ -173,4 +195,41 @@ fn seed_dirty_buffer_fh(f: &Fixture, fh: u64, nas_path: &str, data: &[u8]) -> u6
         })),
     );
     fh
+}
+
+/// A download that stays on the wire long enough for a test to count what is
+/// in flight at one moment.
+fn mount_download_slow(f: &Fixture, body: Vec<u8>, delay: Duration) {
+    f.rt.block_on(
+        Mock::given(http_method("GET"))
+            .and(http_path("/webapi/entry.cgi"))
+            .and(query_param("method", "download"))
+            .respond_with(RangeFile {
+                body,
+                short: Map::new(),
+                delay: Some(delay),
+            })
+            .mount(&f.server),
+    );
+}
+
+/// Put block 0 in the read cache, so `prime_open` can sniff it without the
+/// synchronous download first. A test that measures what is in flight at one
+/// moment must not serialise on the one fetch it does not care about.
+fn seed_block0(f: &Fixture, ino: u64, magic: &[u8]) {
+    let mut block = ramp(BLOCK as usize);
+    block[..magic.len()].copy_from_slice(magic);
+    f.fs.read_cache.insert(ino, 0, bytes::Bytes::from(block));
+}
+
+/// Wait for a condition, briefly. `JoinHandle::abort` is asynchronous: the
+/// cancelled task's cleanup lands shortly after the call, not during it.
+fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
 }

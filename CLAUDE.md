@@ -160,7 +160,8 @@ The GUI path goes: MountService.cs / SynoClient.cs → P/Invoke (Interop/NativeM
 | `main.rs`   | CLI binary: parsing (clap), interactive prompts, login, then calls `lib.rs::spawn_mount` and parks on Ctrl-C |
 | `lib.rs`    | Library surface: `spawn_mount`/`MountHandle` (non-blocking, background mount) + `is_otp_required`, shared by the CLI and the FFI crate |
 | `fs.rs`     | Linux FUSE backend. Metadata callbacks use `runtime.block_on()`; **file transfers do not** — `flush`/`release` (upload), `setattr` (truncate) and cross-directory `rename` hand the transfer to the Tokio runtime via `start_*` and reply to the kernel from there, so no transfer ever occupies an event-loop thread. Transfers are capped at `MAX_CONCURRENT_TRANSFERS` (the event loop used to be that limit by accident) and each open handle has its own buffer lock. The session also runs a multi-threaded event loop (`MountOptions::io_threads`, `--fuse-threads`) for the remaining blocking callbacks |
-| `cache.rs`  | Linux only — `InodeCache` (TTL metadata), `ReadCache` (LRU block cache, 256 KiB blocks, prefetch) |
+| `cache.rs`  | Linux only — `InodeCache` (TTL metadata), `ReadCache` (LRU block cache, 256 KiB blocks) |
+| `prefetch.rs` | Linux only — what to speculate on and when: the container sniff that decides the open window, the sequential-detection ramp behind `read`, and `InflightGuard` |
 | `webdav.rs` | macOS WebDAV backend; directory moves are download→upload→delete |
 | `winfs.rs`  | Windows WinFsp backend; in-memory write buffers flushed atomically on close |
 
@@ -199,7 +200,7 @@ Who enables it:
 |---|---|---|
 | Python `Client`/`AsyncClient` | **on by default** (all levers, incl. the belt); tunable/disable via `login(..., throttle=…, max_concurrency=…, …)` | The bulk consumer (e.g. a Temporal pipeline staging `.ORF` files) — the one that saturated the NAS. |
 | FFI `syno_connect` (GUI) | **on**, concurrency + backoff + retry cap, **belt off** (`min_interval=0`) | The same client Arc also backs a GUI-initiated mount; spacing every ranged block read would stall interactive streaming. |
-| FUSE/CLI (`main.rs`) | **off** | Interactive mount; the 16-block prefetch fan-out must stay responsive. |
+| FUSE/CLI (`main.rs`) | **off** | Interactive mount; streaming must stay responsive. The prefetch fan-out — the thing that actually made this path the highest-concurrency consumer — is bounded separately by `MAX_CONCURRENT_PREFETCH`. |
 
 **Temporal / outer-retry contract:** this client caps retries and then raises — do **not** nest it under your own inner retry loop. Let the activity fail and let Temporal reschedule with its (longer, jittered) backoff. Two nested retry loops are what produced the 200–250×-per-file storm.
 
@@ -220,7 +221,8 @@ MVVM pattern (Avalonia). The GUI calls the Rust core **directly via the FFI cdyl
 ### Caching (Linux Only)
 
 - **`InodeCache`**: inode↔path bidirectional map with 30 s TTL (configurable via `--cache-ttl`)
-- **`ReadCache`**: fixed-size block cache (default 256 MiB, `--read-cache-mb`); background prefetch of next 16 blocks
+- **`ReadCache`**: fixed-size block cache (default 256 MiB, `--read-cache-mb`)
+- **Prefetch** (`--prefetch-blocks`, default 16, `0` disables): speculation is no longer unconditional. `open` fetches block 0 eagerly and the full head-plus-tail media window **only** when block 0 sniffs as a container that keeps its index at the end (MP4/MOV, Matroska/WebM, AVI, ASF) — a seek to EOF is by definition not sequential, so no access-pattern heuristic could ever predict that tail, which is why it has to be decided from the file itself. Everything else gets block 0 plus a ramp: `read` prefetches only when a read continues the last one on that handle, growing 2→4→8→16. Blocks past EOF are never requested, and `release` aborts a file's outstanding prefetch once its last handle closes. Concurrency is capped at `MAX_CONCURRENT_PREFETCH` (16), separately from `MAX_CONCURRENT_TRANSFERS` (4) — it has to be wide enough for one file's whole open window or a video open serialises into waves
 
 ## Known Limitations
 

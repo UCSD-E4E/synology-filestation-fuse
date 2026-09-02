@@ -15,12 +15,14 @@ use synology_filestation_core::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
 
 mod attr;
 mod callbacks;
+mod prefetch;
 #[cfg(test)]
 mod tests;
 mod transfer;
 
 use attr::file_attr;
 pub use attr::Ownership;
+use prefetch::{is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_CONCURRENT_PREFETCH};
 use transfer::{Buffers, Transfers, WriteBuffer, WriteSink, MAX_CONCURRENT_TRANSFERS};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -41,6 +43,16 @@ pub struct SynologyFS {
     transfer_limit: Arc<tokio::sync::Semaphore>,
     next_fh: AtomicU64,
     owner: Ownership,
+    /// Bounds speculative block downloads. See [`MAX_CONCURRENT_PREFETCH`].
+    prefetch_limit: Arc<tokio::sync::Semaphore>,
+    /// Depth of the speculative window, in blocks. `0` switches it off.
+    prefetch_blocks: u64,
+    /// Per-handle sequential-read state, paired with the inode the handle is
+    /// on so that closing one handle only cancels prefetch when it is the last
+    /// handle on that file.
+    read_ahead: Arc<Mutex<HashMap<u64, (u64, ReadAhead)>>>,
+    /// Speculative downloads still running, so a close can abandon them.
+    prefetch_tasks: Arc<Mutex<HashMap<u64, Vec<tokio::task::JoinHandle<()>>>>>,
 }
 
 impl SynologyFS {
@@ -76,6 +88,7 @@ impl SynologyFS {
         read_cache: Arc<ReadCache>,
         rt: tokio::runtime::Handle,
         owner: Ownership,
+        prefetch_blocks: u64,
     ) -> Self {
         Self {
             client,
@@ -87,6 +100,10 @@ impl SynologyFS {
             transfer_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
             next_fh: AtomicU64::new(1),
             owner,
+            prefetch_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PREFETCH)),
+            prefetch_blocks,
+            read_ahead: Arc::new(Mutex::new(HashMap::new())),
+            prefetch_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -279,10 +296,172 @@ impl SynologyFS {
         self.write_buffers.lock().unwrap().get(&fh).cloned()
     }
 
+    // ── Speculative prefetch ──────────────────────────────────────────────
+
+    /// Fetch block 0, then decide from what block 0 turns out to be whether
+    /// this file gets the media window.
+    ///
+    /// The sniff is free here and nowhere else: block 0 is downloaded
+    /// synchronously anyway, so that the caller's first `read` is a guaranteed
+    /// cache hit, and it is in hand at exactly the point the decision has to
+    /// be made. Getting it wrong in the safe direction costs a few on-demand
+    /// reads; getting it wrong the other way is what made every 5 MiB JPEG
+    /// cost 5 MiB to look at.
+    pub(super) fn prime_open(&self, fh: u64, ino: u64, path: &str) {
+        self.read_ahead
+            .lock()
+            .unwrap()
+            .insert(fh, (ino, ReadAhead::default()));
+
+        let block_size = self.read_cache.block_size;
+        let Some(total_blocks) = self.total_blocks(ino) else {
+            return;
+        };
+
+        // If block 0 is cached as an empty EOF sentinel but the file is known
+        // to be non-empty, evict the stale sentinel so we re-download real
+        // data below. This can happen when a previous read attempt received an
+        // empty body or HTTP 416 for a block that should have content.
+        if let Some(b) = self.read_cache.get(ino, 0) {
+            if b.is_empty() {
+                debug!("open: evicting stale EOF sentinel for ino={} block=0", ino);
+                self.read_cache.invalidate_block(ino, 0);
+            }
+        }
+
+        // Block 0 synchronously. If another task already claimed it, skip — it
+        // will be in cache when read() runs.
+        if !self.read_cache.contains(ino, 0) && self.read_cache.claim_inflight(ino, 0) {
+            match self.block(self.client.download(path, 0, block_size)) {
+                Ok(data) if !data.is_empty() => self.read_cache.insert(ino, 0, data),
+                _ => self.read_cache.cancel_inflight(ino, 0),
+            }
+        }
+
+        // Without block 0 there is nothing to sniff, so claim nothing further:
+        // the ramp in `read_ahead` still covers a reader that goes on reading.
+        let Some(head) = self.read_cache.get(ino, 0) else {
+            return;
+        };
+        for block_idx in open_window(total_blocks, self.prefetch_blocks, is_indexed_media(&head)) {
+            self.spawn_prefetch(ino, path, block_idx);
+        }
+    }
+
+    /// Start whatever read-ahead this read has earned.
+    ///
+    /// Nothing, for a first read or a seek — the header-scan pattern any
+    /// thumbnailer, indexer or `file(1)` uses must cost the block it asked
+    /// for and no more. A reader that keeps going gets a window that doubles
+    /// up to `--prefetch-blocks`.
+    pub(super) fn read_ahead(&self, fh: u64, ino: u64, path: &str, offset: u64, size: u64) {
+        let block_size = self.read_cache.block_size;
+        let total_blocks = self.total_blocks(ino);
+        let blocks = {
+            let mut handles = self.read_ahead.lock().unwrap();
+            let (_, state) = handles.entry(fh).or_insert((ino, ReadAhead::default()));
+            state.advance(offset, size, block_size, total_blocks, self.prefetch_blocks)
+        };
+        for block_idx in blocks {
+            self.spawn_prefetch(ino, path, block_idx);
+        }
+    }
+
+    /// Forget a handle, and abandon the file's speculation once the last
+    /// handle on it is gone.
+    ///
+    /// Closing used to leave the whole open window still downloading. In a
+    /// file-at-a-time walk that meant every closed file went on stealing
+    /// bandwidth from its successors — which is what turned a nine-file scan
+    /// into a spread of 0.6 s to 13.4 s for the same work.
+    pub(super) fn end_read(&self, fh: u64, ino: u64) {
+        let last_handle = {
+            let mut handles = self.read_ahead.lock().unwrap();
+            handles.remove(&fh);
+            !handles.values().any(|(other, _)| *other == ino)
+        };
+        if last_handle {
+            if let Some(tasks) = self.prefetch_tasks.lock().unwrap().remove(&ino) {
+                for task in tasks {
+                    task.abort();
+                }
+            }
+        }
+    }
+
+    /// The file's length in blocks, or `None` when the size is not cached.
+    fn total_blocks(&self, ino: u64) -> Option<u64> {
+        self.cache
+            .get_size_for_ino(ino)
+            .filter(|size| *size > 0)
+            .map(|size| size.div_ceil(self.read_cache.block_size))
+    }
+
+    /// Queue one speculative block, unless it is already cached or claimed.
+    fn spawn_prefetch(&self, ino: u64, path: &str, block_idx: u64) {
+        if self.read_cache.contains(ino, block_idx)
+            || !self.read_cache.claim_inflight(ino, block_idx)
+        {
+            return;
+        }
+        let mut guard = InflightGuard::new(self.read_cache.clone(), ino, block_idx);
+        let client = self.client.clone();
+        let read_cache = self.read_cache.clone();
+        let limit = self.prefetch_limit.clone();
+        let block_size = self.read_cache.block_size;
+        let path = path.to_string();
+
+        let task = self.rt.spawn(async move {
+            // Acquired inside the task, so the cap bounds what is on the wire
+            // rather than what has been queued — and so an abort while waiting
+            // for a permit costs nothing at all.
+            let Ok(_permit) = limit.acquire().await else {
+                return;
+            };
+            if let Ok(data) = client
+                .download(&path, block_idx * block_size, block_size)
+                .await
+            {
+                read_cache.insert(ino, block_idx, data); // empty == EOF sentinel
+                guard.disarm();
+            }
+        });
+
+        let mut tasks = self.prefetch_tasks.lock().unwrap();
+        let for_ino = tasks.entry(ino).or_default();
+        for_ino.retain(|task| !task.is_finished());
+        for_ino.push(task);
+    }
+
+    /// Test seam: block until this inode's queued prefetch has settled.
+    #[cfg(test)]
+    pub(super) fn await_prefetch(&self, ino: u64) {
+        let tasks = self
+            .prefetch_tasks
+            .lock()
+            .unwrap()
+            .remove(&ino)
+            .unwrap_or_default();
+        for task in tasks {
+            let _ = self.rt.block_on(task);
+        }
+    }
+
+    /// Test seam: how many of this inode's prefetch tasks are still running.
+    #[cfg(test)]
+    pub(super) fn outstanding_prefetch(&self, ino: u64) -> usize {
+        self.prefetch_tasks
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .map(|tasks| tasks.iter().filter(|task| !task.is_finished()).count())
+            .unwrap_or(0)
+    }
+
     /// Assemble a byte range for `read`, block by block, out of the read cache.
     ///
     /// Split out of the `read` callback so the assembly rules are testable
-    /// without a live mount; `read` keeps the prefetch and the reply.
+    /// without a live mount; `read` keeps the read-ahead and the reply.
     fn read_range(
         &self,
         ino: u64,

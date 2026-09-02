@@ -581,6 +581,7 @@ fn streaming_fixture_failing_from(fails_from: Option<usize>) -> (Fixture, Arc<Re
             gid: 1000,
             umask: 0o022,
         },
+        DEFAULT_PREFETCH_BLOCKS,
     );
     (Fixture { fs, server, rt }, sink)
 }
