@@ -22,7 +22,10 @@ mod transfer;
 
 use attr::file_attr;
 pub use attr::Ownership;
-use prefetch::{is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_CONCURRENT_PREFETCH};
+use prefetch::{
+    is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_CONCURRENT_PREFETCH,
+    MAX_PREFETCH_SPAN,
+};
 use transfer::{Buffers, Transfers, WriteBuffer, WriteSink, MAX_CONCURRENT_TRANSFERS};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -343,9 +346,8 @@ impl SynologyFS {
         let Some(head) = self.read_cache.get(ino, 0) else {
             return;
         };
-        for block_idx in open_window(total_blocks, self.prefetch_blocks, is_indexed_media(&head)) {
-            self.spawn_prefetch(ino, path, block_idx);
-        }
+        let window = open_window(total_blocks, self.prefetch_blocks, is_indexed_media(&head));
+        self.spawn_prefetch(ino, path, window);
     }
 
     /// Start whatever read-ahead this read has earned.
@@ -362,9 +364,7 @@ impl SynologyFS {
             let (_, state) = handles.entry(fh).or_insert((ino, ReadAhead::default()));
             state.advance(offset, size, block_size, total_blocks, self.prefetch_blocks)
         };
-        for block_idx in blocks {
-            self.spawn_prefetch(ino, path, block_idx);
-        }
+        self.spawn_prefetch(ino, path, blocks);
     }
 
     /// Forget a handle, and abandon the file's speculation once the last
@@ -397,18 +397,47 @@ impl SynologyFS {
             .map(|size| size.div_ceil(self.read_cache.block_size))
     }
 
-    /// Queue one speculative block, unless it is already cached or claimed.
-    fn spawn_prefetch(&self, ino: u64, path: &str, block_idx: u64) {
-        if self.read_cache.contains(ino, block_idx)
-            || !self.read_cache.claim_inflight(ino, block_idx)
-        {
-            return;
+    /// Queue speculative blocks, contiguous ones together.
+    ///
+    /// Blocks that follow each other are fetched as a single ranged read and
+    /// split back into blocks on arrival. The window covers the same bytes it
+    /// always did; what changes is that a fifteen-block head is one request
+    /// rather than fifteen. On a transport where a read costs a round trip on
+    /// an open handle, that ratio *is* the cost of the window.
+    ///
+    /// A block already cached or already claimed by somebody else ends the run
+    /// rather than joining it, so a run only ever covers blocks this call owns.
+    fn spawn_prefetch(&self, ino: u64, path: &str, blocks: Vec<u64>) {
+        let mut run: Vec<u64> = Vec::new();
+        for block_idx in blocks {
+            let ours = !self.read_cache.contains(ino, block_idx)
+                && self.read_cache.claim_inflight(ino, block_idx);
+            let continues = run.last().is_some_and(|last| last + 1 == block_idx)
+                && run.len() < MAX_PREFETCH_SPAN;
+            if !ours || !continues {
+                self.spawn_run(ino, path, std::mem::take(&mut run));
+            }
+            if ours {
+                run.push(block_idx);
+            }
         }
-        let mut guard = InflightGuard::new(self.read_cache.clone(), ino, block_idx);
+        self.spawn_run(ino, path, run);
+    }
+
+    /// Fetch one contiguous run of already-claimed blocks in a single request.
+    fn spawn_run(&self, ino: u64, path: &str, blocks: Vec<u64>) {
+        let Some(&first) = blocks.first() else {
+            return;
+        };
+        let block_size = self.read_cache.block_size;
+        let span = blocks.len() as u64 * block_size;
+        let guards: Vec<InflightGuard> = blocks
+            .iter()
+            .map(|&idx| InflightGuard::new(self.read_cache.clone(), ino, idx))
+            .collect();
         let client = self.client.clone();
         let read_cache = self.read_cache.clone();
         let limit = self.prefetch_limit.clone();
-        let block_size = self.read_cache.block_size;
         let path = path.to_string();
 
         let task = self.rt.spawn(async move {
@@ -418,11 +447,22 @@ impl SynologyFS {
             let Ok(_permit) = limit.acquire().await else {
                 return;
             };
-            if let Ok(data) = client
-                .download(&path, block_idx * block_size, block_size)
-                .await
-            {
-                read_cache.insert(ino, block_idx, data); // empty == EOF sentinel
+            let mut guards = guards;
+            let Ok(data) = client.download(&path, first * block_size, span).await else {
+                return; // the guards release every claim in the run
+            };
+            // Split the response back into the blocks it covers. A response
+            // shorter than the span is EOF: the block it straddles keeps what
+            // came back, and the blocks past it get the empty sentinel — the
+            // same contract a block-at-a-time fetch had.
+            for (n, guard) in guards.iter_mut().enumerate() {
+                let from = n * block_size as usize;
+                let piece = if from >= data.len() {
+                    bytes::Bytes::new()
+                } else {
+                    data.slice(from..(from + block_size as usize).min(data.len()))
+                };
+                read_cache.insert(ino, first + n as u64, piece);
                 guard.disarm();
             }
         });

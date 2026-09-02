@@ -27,6 +27,7 @@
 
 pub mod error;
 pub mod framing;
+mod handles;
 pub mod path;
 pub mod transport;
 

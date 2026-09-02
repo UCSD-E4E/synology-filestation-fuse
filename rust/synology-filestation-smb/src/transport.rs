@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use smb2::{ClientConfig, RenameOptions, SmbClient, Tree};
+use smb2::{ClientConfig, FileReader, RenameOptions, SmbClient, Tree};
 use synology_filestation_core::{
     MetadataTransport, OpenWriteTransport, ReadTransport, StreamReadTransport,
     StreamWriteTransport, SynoAdditional, SynoFileInfo, SynoFsError, SynoTime, SynologyClient,
@@ -28,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::error::to_syno_error;
+use crate::handles::{HandleCache, MAX_CACHED_HANDLES};
 use crate::path::SmbPath;
 
 /// Process-wide sequence making temp write names unique so concurrent writers
@@ -352,6 +353,9 @@ struct Inner {
 /// An authenticated SMB connection that reads NAS files.
 pub struct SmbTransport {
     inner: Arc<Mutex<Inner>>,
+    /// Open read handles, so a block read is one round trip rather than a
+    /// CREATE, a READ and a CLOSE. See [`crate::handles`].
+    handles: Arc<HandleCache<FileReader>>,
     /// Tracks whether the SMB link needs re-establishing. `smb2` doesn't
     /// auto-reconnect, so without this a mount would degrade to HTTP permanently
     /// after one network flap.
@@ -379,6 +383,7 @@ impl SmbTransport {
                 client,
                 trees: HashMap::new(),
             })),
+            handles: Arc::new(HandleCache::new(MAX_CACHED_HANDLES)),
             reconnect: Arc::new(ReconnectState::default()),
         })
     }
@@ -460,6 +465,7 @@ impl SmbTransport {
                 client,
                 trees: HashMap::new(),
             })),
+            handles: Arc::new(HandleCache::new(MAX_CACHED_HANDLES)),
             // Nothing here knows how to reopen that stream, so nothing here
             // will pretend it might.
             reconnect: Arc::new(ReconnectState::never()),
@@ -499,6 +505,10 @@ impl SmbTransport {
             .map_err(|e| self.mark_and_map(&e))?;
         if reconnected {
             trees.clear(); // the cached trees belonged to the dead session
+                           // and so did every open file handle on it. Dropping rather than
+                           // closing them is right here: the session they belonged to is
+                           // gone, so there is nothing left to close them against.
+            drop(self.handles.clear());
         }
         if !trees.contains_key(share) {
             let tree = client
@@ -568,10 +578,86 @@ impl SmbTransport {
         })
     }
 
-    /// Read `length` bytes at `offset`. `length == 0` reads the whole file
-    /// (from `offset == 0`), mirroring the core HTTP client's `download`
-    /// contract. Ranged reads are chunked to the server's `MaxReadSize` by the
-    /// underlying SMB layer, so any `length` is valid.
+    /// An open read handle for `logical`, from the cache when one is there.
+    ///
+    /// The lock is held only long enough to attach the share and take cheap
+    /// `Arc` clones of the connection and the tree — never across a round trip.
+    /// `smb2` is built for exactly this: `Connection` is an `Arc` over shared
+    /// state with its own credit accounting and receiver task, and its own docs
+    /// say concurrent users of one session need no external locking. Holding
+    /// the transport mutex across the CREATE and the READ made every block read
+    /// on the whole mount wait for every other one.
+    async fn reader_for(
+        &self,
+        loc: &SmbPath,
+        logical: &str,
+    ) -> Result<Arc<FileReader>, SynoFsError> {
+        self.close_free_handles().await;
+        if let Some(reader) = self.handles.get(logical) {
+            return Ok(reader);
+        }
+
+        let (conn, tree) = {
+            let mut guard = self.inner.lock().await;
+            let Inner { client, trees } = &mut *guard;
+            self.ensure_ready(client, trees, &loc.share).await?;
+            let tree = trees.get(&loc.share).expect("tree just ensured").clone();
+            (client.connection_mut().clone(), tree)
+        };
+
+        let reader = Arc::new(
+            std::sync::Arc::new(tree)
+                .open_file_reader(conn, &loc.path)
+                .await
+                .map_err(|e| self.mark_and_map(&e))?,
+        );
+        let displaced = self.handles.insert(logical, reader.clone());
+        self.close_handles(displaced).await;
+        Ok(reader)
+    }
+
+    /// Close handles the cache has finished with, parking any that a read is
+    /// still using — dropping one instead would leak the open file on the
+    /// appliance until the session ends.
+    async fn close_handles(&self, handles: Vec<Arc<FileReader>>) {
+        for handle in handles {
+            match Arc::try_unwrap(handle) {
+                Ok(reader) => {
+                    if let Err(e) = reader.close().await {
+                        tracing::debug!(error = %e, "smb: closing a read handle");
+                    }
+                }
+                Err(still_in_use) => self.handles.defer(still_in_use),
+            }
+        }
+    }
+
+    /// Close whatever was parked earlier and has since come free.
+    async fn close_free_handles(&self) {
+        let free = self.handles.take_free();
+        if !free.is_empty() {
+            self.close_handles(free).await;
+        }
+    }
+
+    /// Forget the handle for one path, closing it.
+    async fn forget_handle(&self, logical: &str) {
+        let dropped = self.handles.invalidate(logical);
+        self.close_handles(dropped).await;
+    }
+
+    /// Forget every handle at or under `logical`.
+    async fn forget_handles_under(&self, logical: &str) {
+        let dropped = self.handles.invalidate_prefix(logical);
+        self.close_handles(dropped).await;
+    }
+
+    /// Read `length` bytes at `offset`.
+    ///
+    /// One SMB2 READ on a handle that stays open between calls, with no lock
+    /// held while it is in flight. This used to be a CREATE, a READ and a
+    /// CLOSE, all three serialised behind the transport mutex — three round
+    /// trips per 256 KiB block, one block at a time, for the whole mount.
     pub async fn read(
         &self,
         logical: &str,
@@ -582,29 +668,24 @@ impl SmbTransport {
             return self.read_full(logical).await;
         }
         let loc = SmbPath::from_logical(logical)?;
-        let guard = self.inner.lock().await;
-        // open_file_reader takes &SmbClient + &Tree (shared); ensure the tree
-        // under a short mutable reborrow, then read.
-        let mut guard = guard;
-        {
-            let Inner { client, trees } = &mut *guard;
-            self.ensure_ready(client, trees, &loc.share).await?;
+        let reader = self.reader_for(&loc, logical).await?;
+        match reader.read_at(offset, length).await {
+            Ok(data) => Ok(Bytes::from(data)),
+            Err(e) => {
+                // The handle may be why this failed — a session that went away
+                // takes its file handles with it. Drop it so the next read
+                // opens a fresh one rather than retrying a dead one forever.
+                self.forget_handle(logical).await;
+                Err(self.mark_and_map(&e))
+            }
         }
-        let Inner { client, trees } = &*guard;
-        let tree = trees.get(&loc.share).expect("tree just ensured");
-        let reader = client
-            .open_file_reader(tree, &loc.path)
-            .await
-            .map_err(|e| self.mark_and_map(&e))?;
-        let data = reader
-            .read_at(offset, length)
-            .await
-            .map_err(|e| self.mark_and_map(&e))?;
-        Ok(Bytes::from(data))
     }
 
     /// Delete a file at `logical`.
     pub async fn delete(&self, logical: &str) -> Result<(), SynoFsError> {
+        // A handle held open on a file being deleted is both a stale cache
+        // entry and, on SMB, a reason the delete itself can fail.
+        self.forget_handles_under(logical).await;
         let loc = SmbPath::from_logical(logical)?;
         let mut guard = self.inner.lock().await;
         let Inner { client, trees } = &mut *guard;
@@ -701,6 +782,7 @@ impl SmbTransport {
     /// atomic replace needs `ReplaceIfExists=true` in the SMB layer — tracked as
     /// a follow-up.
     pub async fn write_atomic(&self, logical: &str, data: &[u8]) -> Result<(), SynoFsError> {
+        self.forget_handle(logical).await;
         let loc = SmbPath::from_logical(logical)?;
         let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = part_name(&loc.path, seq);
@@ -794,6 +876,7 @@ impl SmbTransport {
     }
 
     pub async fn write_from_path(&self, logical: &str, local: &Path) -> Result<(), SynoFsError> {
+        self.forget_handle(logical).await;
         let loc = SmbPath::from_logical(logical)?;
         let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = part_name(&loc.path, seq);
@@ -1190,6 +1273,9 @@ impl MetadataTransport for SmbTransport {
     }
 
     async fn rename(&self, old_path: &str, new_name: &str) -> Result<SynoFileInfo, SynoFsError> {
+        // The name a handle was opened under is gone; anything underneath a
+        // renamed directory goes with it.
+        self.forget_handles_under(old_path).await;
         let from = SmbPath::from_logical(old_path)?;
         let new_logical = sibling_path(old_path, new_name);
         let to = SmbPath::from_logical(&new_logical)?;
@@ -1243,6 +1329,7 @@ impl MetadataTransport for SmbTransport {
     }
 
     async fn truncate(&self, path: &str, size: u64) -> Result<(), SynoFsError> {
+        self.forget_handle(path).await;
         let loc = SmbPath::from_logical(path)?;
         let mut guard = self.inner.lock().await;
         let Inner { client, trees } = &mut *guard;
@@ -1390,6 +1477,7 @@ impl OpenWriteTransport for SmbTransport {
         path: &str,
         mode: WriteOpen,
     ) -> Result<Box<dyn WriteHandle>, SynoFsError> {
+        self.forget_handle(path).await;
         let loc = SmbPath::from_logical(path)?;
         let mut handle = SmbWriteHandle {
             inner: Arc::clone(&self.inner),

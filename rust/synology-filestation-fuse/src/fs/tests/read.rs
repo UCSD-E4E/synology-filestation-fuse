@@ -256,10 +256,11 @@ fn opening_a_media_file_still_fetches_the_head_and_the_tail() {
     f.fs.prime_open(1, ino, "/share/clip.mp4");
     f.fs.await_prefetch(ino);
 
-    let mut got: Vec<u64> = downloaded_starts(&f).iter().map(|s| s / BLOCK).collect();
-    got.sort_unstable();
+    let cached: Vec<u64> = (0..22)
+        .filter(|b| f.fs.read_cache.contains(ino, *b))
+        .collect();
     assert_eq!(
-        got,
+        cached,
         vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 21],
         "the media window is unchanged: block 0, the head, and the last four"
     );
@@ -302,10 +303,19 @@ fn a_sequential_reader_still_gets_read_ahead() {
     f.fs.read_ahead(1, ino, "/share/photo.jpg", BLOCK, BLOCK);
     f.fs.await_prefetch(ino);
 
-    let mut got: Vec<u64> = downloaded_starts(&f).iter().map(|s| s / BLOCK).collect();
-    got.sort_unstable();
-    got.dedup();
-    assert_eq!(got, vec![0, 2, 3], "the ramp opens at two blocks");
+    let cached: Vec<u64> = (0..22)
+        .filter(|b| f.fs.read_cache.contains(ino, *b))
+        .collect();
+    assert_eq!(
+        cached,
+        vec![0, 2, 3],
+        "the ramp opens at two blocks — fetched as one run, cached as two"
+    );
+    assert_eq!(
+        downloaded_starts(&f),
+        vec![0, 2 * BLOCK],
+        "and those two blocks cost one request, not two"
+    );
 }
 
 /// Closing the file used to leave up to 4 MiB still downloading, competing
@@ -411,4 +421,102 @@ fn depth_zero_turns_the_speculation_off_entirely() {
     f.fs.await_prefetch(ino);
 
     assert_eq!(downloaded_starts(&f), vec![0]);
+}
+
+/// The window is the right *blocks*, but it used to be fetched one block per
+/// request — nineteen round trips to move a contiguous run. Over SMB that is
+/// the difference between one READ and nineteen, and round trips are what this
+/// mount is short of.
+#[test]
+fn a_contiguous_window_is_asked_for_in_one_request() {
+    let f = fixture();
+    mount_download(
+        &f,
+        body_with_magic(MP4_MAGIC, 22 * BLOCK as usize),
+        Map::new(),
+    );
+    let ino = seed_size(&f, "/share/clip.mp4", 22 * BLOCK);
+
+    f.fs.prime_open(1, ino, "/share/clip.mp4");
+    f.fs.await_prefetch(ino);
+
+    let mut starts = downloaded_starts(&f);
+    starts.sort_unstable();
+    assert_eq!(
+        starts,
+        vec![0, BLOCK, 18 * BLOCK],
+        "block 0 synchronously, then the head as one run and the tail as another"
+    );
+}
+
+/// Coalescing must not change what ends up cached: every block of the run is
+/// still individually addressable afterwards.
+#[test]
+fn a_coalesced_run_still_fills_every_block_it_covered() {
+    let f = fixture();
+    mount_download(
+        &f,
+        body_with_magic(MP4_MAGIC, 22 * BLOCK as usize),
+        Map::new(),
+    );
+    let ino = seed_size(&f, "/share/clip.mp4", 22 * BLOCK);
+
+    f.fs.prime_open(1, ino, "/share/clip.mp4");
+    f.fs.await_prefetch(ino);
+
+    for b in 1..16u64 {
+        let block = f.fs.read_cache.get(ino, b).expect("block {b} of the run");
+        assert_eq!(block.len(), BLOCK as usize, "block {b} is whole");
+    }
+}
+
+/// The bytes a coalesced run stores must land in the right blocks — splitting
+/// one response into blocks is exactly where an off-by-one silently serves the
+/// wrong file offsets.
+#[test]
+fn a_coalesced_run_puts_the_bytes_at_the_right_offsets() {
+    let f = fixture();
+    let body = body_with_magic(MP4_MAGIC, 22 * BLOCK as usize);
+    mount_download(&f, body.clone(), Map::new());
+    let ino = seed_size(&f, "/share/clip.mp4", 22 * BLOCK);
+
+    f.fs.prime_open(1, ino, "/share/clip.mp4");
+    f.fs.await_prefetch(ino);
+
+    for b in [1u64, 7, 15, 18, 21] {
+        let got = f.fs.read_cache.get(ino, b).expect("a cached block");
+        let start = (b * BLOCK) as usize;
+        assert_eq!(
+            got.as_ref(),
+            &body[start..start + BLOCK as usize],
+            "block {b} holds the bytes at its own offset"
+        );
+    }
+}
+
+/// A run that runs off the end of the file gets a short response. The block it
+/// straddles keeps its real bytes and the rest are EOF — the same contract a
+/// per-block fetch had.
+#[test]
+fn a_run_that_reaches_eof_stores_the_partial_block_it_got() {
+    let f = fixture();
+    // 3.5 blocks: the media window asks for blocks 1..3, and block 3 is half.
+    let len = 3 * BLOCK as usize + BLOCK as usize / 2;
+    let body = body_with_magic(MP4_MAGIC, len);
+    mount_download(&f, body.clone(), Map::new());
+    let ino = seed_size(&f, "/share/clip.mp4", len as u64);
+
+    f.fs.prime_open(1, ino, "/share/clip.mp4");
+    f.fs.await_prefetch(ino);
+
+    let tail =
+        f.fs.read_cache
+            .get(ino, 3)
+            .expect("the final partial block");
+    assert_eq!(
+        tail.len(),
+        BLOCK as usize / 2,
+        "half a block is what exists"
+    );
+    assert_eq!(tail.as_ref(), &body[3 * BLOCK as usize..]);
 }

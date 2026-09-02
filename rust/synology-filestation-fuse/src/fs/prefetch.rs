@@ -39,6 +39,14 @@ const TAIL_BLOCKS: u64 = 4;
 /// Where a sequential run's window starts before it begins doubling.
 const RAMP_START: u64 = 2;
 
+/// Most blocks to ask for in a single ranged read.
+///
+/// Contiguous blocks are fetched as one request rather than one request each:
+/// the window is the same bytes either way, but nineteen round trips become
+/// two. Over SMB — where a read is a round trip on a handle rather than a
+/// fresh HTTP request — that is most of the cost of the window.
+pub(super) const MAX_PREFETCH_SPAN: usize = 16;
+
 /// Does block 0 look like a container that keeps its index at the end?
 ///
 /// Only containers that actually need the tail qualify. A JPEG or a raw file
