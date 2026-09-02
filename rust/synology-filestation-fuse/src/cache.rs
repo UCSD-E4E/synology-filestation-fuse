@@ -253,6 +253,12 @@ pub const READ_BLOCK_SIZE: u64 = 256 * 1024;
 /// from it: freeing a live owner's claim is what turned a slow mount into a
 /// stalled one, because the next reader started the same download again and
 /// made the queue longer.
+///
+/// That reading holds only because no claim outlives the decision to run.
+/// Speculation takes the budget it needs before it spawns anything and gives
+/// its claims straight back when it cannot have it — see `spawn_run` — rather
+/// than queueing for a permit while holding them, precisely so a waiter here
+/// is never parked behind a download that has not started.
 pub const BLOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A block being downloaded, and the doorbell its waiters sleep on.
