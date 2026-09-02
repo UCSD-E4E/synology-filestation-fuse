@@ -41,6 +41,13 @@ pub const DEFAULT_UMASK: u16 = 0o022;
 /// is missing — so the redial is one call, and it is the same call the mount
 /// made at startup.
 ///
+/// It also answers a question the first stream's answer does not settle:
+/// **which leg** reaches the NAS now. A laptop carried back onto the network
+/// gets `Direct`, and a direct address is a stream too — dialling it here is
+/// what lets the mount that came up through a tunnel go on working over TCP,
+/// on the same transport, without a remount. Where the bytes come from is
+/// exactly what this layer exists to stop mattering.
+///
 /// Shared by the CLI and the FFI binding, which build the same transport.
 pub fn reopen_through(
     chain: Arc<Chain>,
@@ -52,14 +59,7 @@ pub fn reopen_through(
                 Ok(SmbRoute::Tunnelled { connection, .. }) => {
                     Ok(Box::new(connection) as BoxedStream)
                 }
-                // The transport is stream-shaped and cannot change legs under
-                // itself: a machine carried back onto the network wants a
-                // whole new transport, not a new stream for this one. Saying
-                // so beats reporting the tunnel as merely unreachable.
-                Ok(SmbRoute::Direct { host }) => Err(SynoFsError::Io(format!(
-                    "the tunnel is gone and {host} now answers directly; \
-                     remount to use it"
-                ))),
+                Ok(SmbRoute::Direct { host }) => dial_direct(&host).await,
                 Ok(SmbRoute::Unavailable) => {
                     Err(SynoFsError::Io("SMB cannot be reached at all".into()))
                 }
@@ -67,6 +67,24 @@ pub fn reopen_through(
             }
         })
     }
+}
+
+/// Dial the SMB port on a host the chain says answers directly.
+///
+/// The port is appended only when the host does not already carry one, the
+/// same rule `SmbConfig::addr` follows — a route naming `host:port` means that
+/// port, and appending 445 to it produces an address that resolves to nothing.
+async fn dial_direct(host: &str) -> Result<BoxedStream, SynoFsError> {
+    const SMB_PORT: u16 = 445;
+    let addr = if host.contains(':') {
+        host.to_string()
+    } else {
+        format!("{host}:{SMB_PORT}")
+    };
+    tokio::net::TcpStream::connect(&addr)
+        .await
+        .map(|stream| Box::new(stream) as BoxedStream)
+        .map_err(|e| SynoFsError::Io(format!("dialling {addr}: {e}")))
 }
 
 /// Default depth of the Linux backend's speculative read-ahead window, in
@@ -839,5 +857,61 @@ mod tests {
         let without = session_config(false, &opts);
         assert_eq!(without.acl, SessionACL::Owner);
         assert!(!without.mount_options.contains(&MountOption::AutoUnmount));
+    }
+}
+
+#[cfg(test)]
+mod redial_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use synology_filestation_connect::{
+        Endpoints, NoTunnel, Prober, TransportPolicy, DEFAULT_RECHECK,
+    };
+
+    /// A NAS that answers, without dialling anything to find out — so the only
+    /// connection the listener below sees is the one the redial makes.
+    struct Answers;
+
+    #[async_trait]
+    impl Prober for Answers {
+        async fn smb_reachable(&self, _host: &str) -> bool {
+            true
+        }
+    }
+
+    /// Regression: a mount whose tunnel is gone, on a machine that can now
+    /// reach the NAS directly, refused to reopen at all. The redial reported
+    /// that the leg had changed and gave up, so SMB stayed dead for the life
+    /// of the mount — with the NAS one TCP connection away, and every
+    /// operation still paying a failed SMB attempt before falling back to
+    /// HTTP. A stream is a stream: where the bytes come from is exactly what
+    /// this layer exists to stop mattering.
+    #[tokio::test]
+    async fn a_tunnel_that_became_a_direct_route_still_reopens() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to answer on");
+        let host = listener.local_addr().expect("its address").to_string();
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let chain = Arc::new(Chain::new(
+            TransportPolicy::default(),
+            Endpoints::public_only(host),
+            Box::new(Answers),
+            Box::new(NoTunnel),
+            DEFAULT_RECHECK,
+        ));
+
+        let reopened = reopen_through(chain)().await;
+
+        assert!(
+            reopened.is_ok(),
+            "the NAS answers directly, and that is a stream: {:?}",
+            reopened.err().map(|e| e.to_string())
+        );
+        assert!(
+            accepted.await.expect("the accept task ran").is_ok(),
+            "and the redial is what connected"
+        );
     }
 }
