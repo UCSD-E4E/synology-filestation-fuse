@@ -13,7 +13,7 @@ use clap::Parser;
 use tracing::{info, warn};
 
 use synology_filestation_core::client::SynologyClient;
-use synology_filestation_fuse::{is_otp_required, spawn_mount, MountOptions};
+use synology_filestation_fuse::{is_otp_required, reopen_through, spawn_mount, MountOptions};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -336,7 +336,10 @@ fn main() -> anyhow::Result<()> {
         Some(inside) => Endpoints::with_tunnel(&args.host, inside),
         None => Endpoints::public_only(&args.host),
     };
-    let chain = Chain::new(
+    // Shared rather than owned: the SMB transport keeps a handle to it so a
+    // dead tunnel can be asked for a new connection long after the mount
+    // started. See `SmbTransport::over_with_redial` below.
+    let chain = Arc::new(Chain::new(
         policy,
         endpoints,
         Box::new(TcpProber::new(probe_timeout(
@@ -344,7 +347,7 @@ fn main() -> anyhow::Result<()> {
         ))),
         tunnel_from(&args, &args.username, &password),
         DEFAULT_RECHECK,
-    );
+    ));
 
     // The profile is fetched before anything asks for a tunnel, over the
     // session just authenticated — which is what lets somebody outside the
@@ -383,7 +386,11 @@ fn main() -> anyhow::Result<()> {
             info!("Transport: SMB, through a tunnel to {host}");
             let mut cfg = SmbConfig::new(&host, &args.username, &password);
             cfg.domain = args.domain.clone().unwrap_or_default();
-            match rt.block_on(SmbTransport::over(connection, &cfg)) {
+            match rt.block_on(SmbTransport::over_with_redial(
+                connection,
+                &cfg,
+                reopen_through(chain.clone()),
+            )) {
                 Ok(smb) => synology_filestation_smb::attach(client, Arc::new(smb)),
                 // The tunnel carried a connection and SMB behind it would not
                 // talk. Not a reason to fail the mount: the HTTP leg is there,

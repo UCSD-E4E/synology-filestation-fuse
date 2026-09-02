@@ -16,12 +16,116 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use synology_filestation_connect::{Chain, SmbRoute};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
+use synology_filestation_smb::{BoxedStream, RedialFuture};
 
 /// Default umask for the synthetic mode the Linux backend reports, matching the
 /// 0o755 directories / 0o644 files a process with the usual umask creates.
 pub const DEFAULT_UMASK: u16 = 0o022;
+
+/// How the SMB transport gets a new stream when the one it is running on dies.
+///
+/// The tunnel leg is the one that cannot heal itself. Its stream belongs to a
+/// userspace TCP stack inside an in-process OpenVPN client, so `SmbClient` has
+/// nothing it could redial — the address at the far end is reachable only from
+/// inside the tunnel — and the transport was built unable to reconnect at all.
+/// One stream EOF then ended SMB for the life of the mount: the
+/// transport-selection breaker re-probed every 30 s, each probe met the same
+/// dead session, and every operation paid a guaranteed failure before falling
+/// back to the HTTP API.
+///
+/// [`Chain::reach_smb`] is what closes that hole. It opens a fresh connection
+/// through the tunnel, and brings the tunnel itself back up when that is what
+/// is missing — so the redial is one call, and it is the same call the mount
+/// made at startup.
+///
+/// It also answers a question the first stream's answer does not settle:
+/// **which leg** reaches the NAS now. A laptop carried back onto the network
+/// gets `Direct`, and a direct address is a stream too — dialling it here is
+/// what lets the mount that came up through a tunnel go on working over TCP,
+/// on the same transport, without a remount. Where the bytes come from is
+/// exactly what this layer exists to stop mattering.
+///
+/// Every reopening says how long the stream it is replacing lasted, and which
+/// leg answered. Those two numbers are the diagnosis: a stream that dies after
+/// the same round number every time is a server-side session or idle timeout,
+/// and one that dies at ragged intervals is the link under it. Without them a
+/// mount losing its stream hourly reported only "Disconnected from server",
+/// once per operation, which says that something ended but nothing about what.
+///
+/// Shared by the CLI and the FFI binding, which build the same transport.
+pub fn reopen_through(
+    chain: Arc<Chain>,
+) -> impl Fn() -> RedialFuture + Send + Sync + 'static + use<> {
+    // When the stream being replaced was opened. Advanced only when a new one
+    // is handed back, so a redial that fails and is retried still reports the
+    // age of the stream that actually died rather than the retry interval.
+    let opened_at = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    move || {
+        let chain = chain.clone();
+        let opened_at = opened_at.clone();
+        Box::pin(async move {
+            let lasted = opened_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .elapsed()
+                .as_secs();
+            let opened = |what: &str| {
+                *opened_at.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+                tracing::warn!("SMB: the stream lasted {lasted}s; reopened {what}");
+            };
+            match chain.reach_smb().await {
+                Ok(SmbRoute::Tunnelled { connection, .. }) => {
+                    opened("through the tunnel");
+                    Ok(Box::new(connection) as BoxedStream)
+                }
+                Ok(SmbRoute::Direct { host }) => {
+                    let stream = dial_direct(&host).await.inspect_err(|e| {
+                        tracing::warn!(
+                            "SMB: the stream lasted {lasted}s; {host} answers directly \
+                             but would not connect: {e}"
+                        );
+                    })?;
+                    opened(&format!("directly to {host}"));
+                    Ok(stream)
+                }
+                Ok(SmbRoute::Unavailable) => {
+                    tracing::warn!(
+                        "SMB: the stream lasted {lasted}s and cannot be reopened — \
+                         no leg reaches the NAS; staying on the HTTP API"
+                    );
+                    Err(SynoFsError::Io("SMB cannot be reached at all".into()))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "SMB: the stream lasted {lasted}s and cannot be reopened yet: {e}"
+                    );
+                    Err(SynoFsError::Io(format!("{e}")))
+                }
+            }
+        })
+    }
+}
+
+/// Dial the SMB port on a host the chain says answers directly.
+///
+/// The port is appended only when the host does not already carry one, the
+/// same rule `SmbConfig::addr` follows — a route naming `host:port` means that
+/// port, and appending 445 to it produces an address that resolves to nothing.
+async fn dial_direct(host: &str) -> Result<BoxedStream, SynoFsError> {
+    const SMB_PORT: u16 = 445;
+    let addr = if host.contains(':') {
+        host.to_string()
+    } else {
+        format!("{host}:{SMB_PORT}")
+    };
+    tokio::net::TcpStream::connect(&addr)
+        .await
+        .map(|stream| Box::new(stream) as BoxedStream)
+        .map_err(|e| SynoFsError::Io(format!("dialling {addr}: {e}")))
+}
 
 /// Default depth of the Linux backend's speculative read-ahead window, in
 /// 256 KiB blocks. Lives here rather than beside the prefetch logic because
@@ -793,5 +897,194 @@ mod tests {
         let without = session_config(false, &opts);
         assert_eq!(without.acl, SessionACL::Owner);
         assert!(!without.mount_options.contains(&MountOption::AutoUnmount));
+    }
+}
+
+#[cfg(test)]
+mod redial_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use synology_filestation_connect::{
+        Endpoints, NoTunnel, Prober, TransportPolicy, DEFAULT_RECHECK,
+    };
+
+    use crate::log_capture::LogCapture;
+
+    /// A NAS that answers, without dialling anything to find out — so the only
+    /// connection the listener below sees is the one the redial makes.
+    struct Answers;
+
+    #[async_trait]
+    impl Prober for Answers {
+        async fn smb_reachable(&self, _host: &str) -> bool {
+            true
+        }
+    }
+
+    /// Regression: a mount whose tunnel is gone, on a machine that can now
+    /// reach the NAS directly, refused to reopen at all. The redial reported
+    /// that the leg had changed and gave up, so SMB stayed dead for the life
+    /// of the mount — with the NAS one TCP connection away, and every
+    /// operation still paying a failed SMB attempt before falling back to
+    /// HTTP. A stream is a stream: where the bytes come from is exactly what
+    /// this layer exists to stop mattering.
+    #[tokio::test]
+    async fn a_tunnel_that_became_a_direct_route_still_reopens() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to answer on");
+        let host = listener.local_addr().expect("its address").to_string();
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let chain = Arc::new(Chain::new(
+            TransportPolicy::default(),
+            Endpoints::public_only(host),
+            Box::new(Answers),
+            Box::new(NoTunnel),
+            DEFAULT_RECHECK,
+        ));
+
+        let reopened = reopen_through(chain)().await;
+
+        assert!(
+            reopened.is_ok(),
+            "the NAS answers directly, and that is a stream: {:?}",
+            reopened.err().map(|e| e.to_string())
+        );
+        assert!(
+            accepted.await.expect("the accept task ran").is_ok(),
+            "and the redial is what connected"
+        );
+    }
+
+    /// Regression: a mount whose SMB stream kept dying said only
+    /// "Disconnected from server", once per operation, for an hour. Nothing
+    /// said how long the stream had lasted before it went, or which leg
+    /// brought it back — and those are the two facts that separate a periodic
+    /// server-side timeout (a round number, every time) from a tunnel that
+    /// keeps falling over (a ragged one). Which is the difference between
+    /// knowing what to fix and watching it happen again.
+    #[tokio::test]
+    async fn reopening_a_stream_says_how_long_the_last_one_lasted() {
+        let logs = LogCapture::at_the_default_level();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to answer on");
+        let host = listener.local_addr().expect("its address").to_string();
+        let accepting = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let chain = Arc::new(Chain::new(
+            TransportPolicy::default(),
+            Endpoints::public_only(host),
+            Box::new(Answers),
+            Box::new(NoTunnel),
+            DEFAULT_RECHECK,
+        ));
+        reopen_through(chain)().await.expect("a stream");
+        let _ = accepting.await;
+
+        let text = logs.text();
+        assert!(
+            text.contains("lasted"),
+            "how long the dead stream lived is the whole diagnostic: {text}"
+        );
+        assert!(
+            text.contains("directly"),
+            "and so is which leg brought it back: {text}"
+        );
+    }
+}
+
+/// Capturing what the process logs, so the lines a mount depends on can be
+/// asserted on.
+///
+/// Ported from the connect crate's own capture, and for its reason: which leg
+/// reaches the NAS, and why a stream had to be reopened, reach a user as log
+/// output and nothing else. The level an event is emitted at is behaviour.
+///
+/// A thread-local subscriber looks like the right tool and is not: `tracing`
+/// caches each callsite's *interest* globally, so a callsite first reached by
+/// a thread holding no subscriber is cached as uninteresting and the test that
+/// wants it then sees nothing. One subscriber, installed once and never
+/// removed, keeps every callsite permanently interesting; lines from tests
+/// running alongside land in the buffer too, which costs nothing, because the
+/// assertions ask what the log *contains*.
+#[cfg(test)]
+mod log_capture {
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    /// Only one capturing test at a time, and where its output goes.
+    static CAPTURING: Mutex<()> = Mutex::new(());
+    static ACTIVE: Mutex<Option<Sink>> = Mutex::new(None);
+
+    #[derive(Clone, Default)]
+    struct RouteToActiveCapture;
+
+    impl std::io::Write for RouteToActiveCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(sink) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                sink.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RouteToActiveCapture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            Self
+        }
+    }
+
+    pub(crate) struct LogCapture {
+        sink: Sink,
+        /// Held for the life of the capture, so two of these never overlap.
+        _capturing: MutexGuard<'static, ()>,
+    }
+
+    impl LogCapture {
+        /// Capture at `info` — what somebody gets without changing a setting,
+        /// which is the whole point of asserting on it.
+        pub(crate) fn at_the_default_level() -> Self {
+            // A panicking capture test must not stop the next one running.
+            let capturing = CAPTURING.lock().unwrap_or_else(|e| e.into_inner());
+            static INSTALLED: std::sync::Once = std::sync::Once::new();
+            INSTALLED.call_once(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(RouteToActiveCapture)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_ansi(false)
+                    .finish();
+                // Another test in this binary may have got there first; either
+                // way a subscriber is in place afterwards.
+                let _ = tracing::subscriber::set_global_default(subscriber);
+            });
+            let sink = Sink::default();
+            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.clone());
+            Self {
+                sink,
+                _capturing: capturing,
+            }
+        }
+
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.sink.0.lock().unwrap_or_else(|e| e.into_inner()))
+                .into_owned()
+        }
+    }
+
+    impl Drop for LogCapture {
+        fn drop(&mut self) {
+            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 }

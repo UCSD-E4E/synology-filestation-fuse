@@ -27,7 +27,7 @@ use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::SynoFileInfo;
 use synology_filestation_core::ThrottleConfig;
-use synology_filestation_fuse::{is_otp_required, spawn_mount, MountOptions};
+use synology_filestation_fuse::{is_otp_required, reopen_through, spawn_mount, MountOptions};
 use synology_filestation_smb::{SmbConfig, SmbTransport};
 use tokio::runtime::Runtime;
 use tracing::{info, warn};
@@ -366,13 +366,15 @@ async fn reach(client: SynologyClient, settings: Reachable<'_>) -> (SynologyClie
         )),
         None => Box::new(NoTunnel),
     };
-    let chain = Chain::new(
+    // Shared rather than owned: a tunnelled transport keeps a handle to it so
+    // a dead stream can be reopened long after this call returned.
+    let chain = Arc::new(Chain::new(
         TransportPolicy::default(),
         endpoints,
         Box::new(TcpProber::new(SMB_PROBE_TIMEOUT)),
         tunnel,
         DEFAULT_RECHECK,
-    );
+    ));
 
     match chain.reach_smb().await {
         Ok(SmbRoute::Direct { host }) => {
@@ -410,7 +412,9 @@ async fn reach(client: SynologyClient, settings: Reachable<'_>) -> (SynologyClie
             info!("Transport: SMB, through a tunnel to {host}");
             let mut cfg = SmbConfig::new(&host, settings.username, settings.password);
             cfg.domain = settings.domain.unwrap_or_default().to_string();
-            match SmbTransport::over(connection, &cfg).await {
+            match SmbTransport::over_with_redial(connection, &cfg, reopen_through(chain.clone()))
+                .await
+            {
                 Ok(smb) => (
                     synology_filestation_smb::attach(client, Arc::new(smb)),
                     SynoTransport::SmbOverVpn,
