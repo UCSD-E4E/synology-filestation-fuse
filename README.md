@@ -355,7 +355,7 @@ synology-filestation-fuse --host <NAS_HOST> -u <USERNAME> [OPTIONS] <MOUNTPOINT>
 | `-p, --password` | NAS account password (or `SYNO_PASSWORD` env var; prompted with hidden input if omitted) | *(optional)* |
 | `--otp <CODE>` | TOTP code for 2FA (or `SYNO_OTP` env var); prompted interactively if omitted and 2FA is enabled | *(optional)* |
 | `--port <PORT>` | API port | `5001` |
-| `--https` | Use HTTPS | `true` |
+| `--https` | Use HTTPS. Always on: the flag takes no value and there is no `--no-https`, so plain HTTP is not currently reachable from the CLI | `true` |
 | `--password-stdin` | Read the password from the first line of stdin. Prefer this in scripts: `--password` puts the password in argv, where any local account can read it with `ps`. | `false` |
 | `--insecure` | Accept any TLS certificate (self-signed, expired, wrong hostname). Needed for a stock DSM certificate; the connection is then encrypted but **not** authenticated. Env: `SYNO_INSECURE` | `false` |
 | `--cache-ttl <SECS>` | Metadata cache TTL in seconds *(Linux only)* | `30` |
@@ -365,6 +365,55 @@ synology-filestation-fuse --host <NAS_HOST> -u <USERNAME> [OPTIONS] <MOUNTPOINT>
 | `--gid <GID>` | Group reported for every mounted entry *(Linux only)* | *(mounting user's group)* |
 | `--umask <MASK>` | Octal umask for the permissions the mount reports; `022` gives `0755` directories and `0644` files *(Linux only)* | `022` |
 | `--log-level <LEVEL>` | Log level (`error`, `warn`, `info`, `debug`, `trace`) | `info` |
+| `--fuse-threads <N>` | FUSE event-loop threads; `0` picks a default from the CPU count. Bounds the callbacks that still hold a thread (a cache-missing read, a listing, a metadata call) — not file transfers, which run on the async runtime *(Linux only)* | `0` |
+
+Transport selection — see [Transports](#transports) for how these combine:
+
+| Argument | Description | Default |
+|---|---|---|
+| `--domain <DOMAIN>` | NetBIOS domain the account lives in (e.g. `KRG` for an AD user; omit for a local DSM account). Used by both legs that authenticate against the directory: SMB, and the VPN, whose DSM front end refuses a name that does not carry it. Env: `SYNOLOGY_FS_SMB_DOMAIN` | *(none)* |
+| `--vpn-profile <PATH>` | The OpenVPN profile **on this computer**. Supplying it is what makes the tunnel leg exist at all — without it the chain falls from direct SMB straight to HTTP. Used as-is if the file is present, otherwise fetched from `--vpn-profile-nas`. Written owner-only, since it embeds `ta.key` | *(none)* |
+| `--vpn-profile-nas <PATH>` | The same profile's path **on the NAS**, to fetch it from over the session just authenticated. Has no effect unless `--vpn-profile` also says where to put it | *(none)* |
+| `--vpn-host <ADDR>` | The NAS's address *inside* the tunnel. Required for the tunnel leg: the server pushes no DNS, so the NAS's public name does not resolve to it | *(none)* |
+| `--disable-smb` | Never try SMB. Disabling means *not probing*, so on a network that black-holes port 445 this also saves the probe timeout. Implies `--disable-vpn`. Env: `SYNOLOGY_FS_SMB_DISABLE` (any value) | `false` |
+| `--disable-vpn` | Never bring up the tunnel. Direct SMB is still tried, so a mount on a network where the NAS answers directly is unaffected | `false` |
+| `--disable-https` | Never fall back to the HTTP FileStation API. With SMB unreachable the mount then fails loudly instead of quietly using a transport that cannot resume an interrupted transfer | `false` |
+
+Environment variables with no flag of their own:
+
+| Variable | Description | Default |
+|---|---|---|
+| `SYNOLOGY_FS_SMB_TIMEOUT_MS` | How long the direct-SMB probe waits for port 445 before escalating | `2000` |
+| `SYNOLOGY_FS_SMB_PORT` | SMB port to dial | `445` |
+
+### Transports
+
+The mount does not always talk to the NAS the same way. At startup it walks a chain and keeps the first leg that answers:
+
+| Leg | How | When it wins |
+|---|---|---|
+| **SMB, direct** | Port 445 straight to `--host` | On a network with a route to the NAS |
+| **SMB, through a tunnel** | An OpenVPN tunnel this process raises itself — no `tun` device, no privileged helper, no effect on anything else the machine is doing — then SMB to `--vpn-host` inside it | Off the NAS's network, when a profile is configured |
+| **HTTP FileStation API** | The same DSM port the login used | Last resort; the only leg that cannot resume an interrupted transfer |
+
+SMB is the default and needs no flag: the chain probes it first and only falls onward when it does not answer. The `--disable-*` flags remove legs from consideration; nothing opts *in*.
+
+**Reaching SMB from off the network** needs three things, and quietly does nothing if any is missing:
+
+1. `--vpn-profile` — a local path for the `.ovpn`. **This is the flag that creates the tunnel leg.** Without it there is nothing to dial, and the chain falls from direct SMB straight to HTTP.
+2. `--vpn-host` — the NAS's address inside the tunnel. The server pushes no DNS, so its public name does not resolve there and the probe has nowhere to land.
+3. `--domain` — for an AD account. The VPN's DSM front end refuses a username that does not carry its domain.
+
+`--vpn-profile-nas` on its own is **not** enough. It only names where to fetch the profile *from*; the fetch is skipped unless `--vpn-profile` says where to put it. A run missing it logs:
+
+```
+WARN synology_filestation_connect: transport: no SMB through the tunnel (no tunnel is configured)
+INFO synology_filestation_connect: transport: falling back to the HTTP API
+```
+
+The first run downloads the profile over the session it has just authenticated — which is what lets somebody outside the NAS's network get the file that gets them inside it — and writes it readable only by its owner. Later runs use whatever is on disk, so `--vpn-profile-nas` can be dropped once the file is there.
+
+The chosen leg is logged at startup as `Transport: …`. Pass `--disable-https` to make a silent fall back to the API impossible, so a mount that expected SMB fails instead of running slowly.
 
 ### Examples
 
@@ -398,11 +447,41 @@ SYNO_OTP=123456 synology-filestation-fuse --host 192.168.1.100 -u admin /mnt/nas
 #   Two-factor authentication code: ______
 synology-filestation-fuse --host 192.168.1.100 -u admin /mnt/nas
 
-# Mount over plain HTTP (DSM default HTTP port)
-synology-filestation-fuse --host 192.168.1.100 --port 5000 --no-https -u admin /mnt/nas
-
 # Linux: larger read cache for smoother playback of large video files
 synology-filestation-fuse --host nas.local -u admin --read-cache-mb 512 /mnt/nas
+
+
+# SMB where the NAS answers directly — nothing to pass; the chain probes 445 first.
+# --domain is what an AD account needs; omit it for a local DSM account.
+synology-filestation-fuse --host nas.example.edu -u alice --domain KRG /mnt/nas
+
+# SMB from off the network, through a tunnel this process raises itself.
+# All three of --vpn-profile / --vpn-host / --domain are needed; the profile is
+# fetched from the NAS on the first run and reused from disk afterwards.
+synology-filestation-fuse \
+  --host nas.example.edu --port 6021 \
+  -u alice --domain KRG \
+  --vpn-host 10.90.24.1 \
+  --vpn-profile ~/.config/synology-filestation/nas-vpn.ovpn \
+  --vpn-profile-nas /installers/nas-vpn.ovpn \
+  /mnt/nas
+
+# Same, once the profile is on disk
+synology-filestation-fuse --host nas.example.edu --port 6021 \
+  -u alice --domain KRG --vpn-host 10.90.24.1 \
+  --vpn-profile ~/.config/synology-filestation/nas-vpn.ovpn /mnt/nas
+
+# Refuse to fall back to the HTTP API — fail loudly if SMB is unreachable
+synology-filestation-fuse --host nas.example.edu -u alice --domain KRG \
+  --vpn-host 10.90.24.1 --vpn-profile ~/.config/synology-filestation/nas-vpn.ovpn \
+  --disable-https /mnt/nas
+
+# Skip SMB entirely (also skips the 445 probe timeout, and implies --disable-vpn)
+synology-filestation-fuse --host nas.example.edu -u alice --disable-smb /mnt/nas
+
+# Shorten the direct-SMB probe on a network known to black-hole port 445
+SYNOLOGY_FS_SMB_TIMEOUT_MS=500 \
+  synology-filestation-fuse --host nas.example.edu -u alice /mnt/nas
 
 # Enable debug logging
 synology-filestation-fuse --host nas.local -u admin --log-level debug /mnt/nas
