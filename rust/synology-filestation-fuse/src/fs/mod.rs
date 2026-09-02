@@ -527,18 +527,24 @@ impl SynologyFS {
             } else if self.read_cache.claim_inflight(ino, block_idx) {
                 // We won the race — download synchronously.
                 debug!("read cache miss: ino={} block={}", ino, block_idx);
+                // The guard releases the claim on every way out of here, a
+                // panic included. That is what lets a waiter treat an
+                // unresolved claim as a download still running, rather than
+                // guessing with a timer whether its owner is dead.
+                let mut claim = InflightGuard::new(self.read_cache.clone(), ino, block_idx);
                 match self.block(self.client.download(path, block_start, block_size)) {
                     Ok(b) if !b.is_empty() => {
                         self.read_cache.insert(ino, block_idx, b.clone());
+                        claim.disarm();
                         b
                     }
                     Ok(empty) => {
                         // EOF — cache empty sentinel so any waiters know too.
                         self.read_cache.insert(ino, block_idx, empty);
+                        claim.disarm();
                         break;
                     }
                     Err(e) => {
-                        self.read_cache.cancel_inflight(ino, block_idx);
                         error!("read {}: {}", path, e);
                         return Err(e);
                     }
