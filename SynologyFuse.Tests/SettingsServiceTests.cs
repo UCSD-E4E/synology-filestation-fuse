@@ -167,6 +167,9 @@ public class SettingsServiceTests : IDisposable
         Assert.Equal("alice", root.GetProperty("Username").GetString());
         Assert.Equal(5001m, root.GetProperty("Port").GetDecimal());
         Assert.True(root.GetProperty("UseHttps").GetBoolean());
+        Assert.Equal(45m, root.GetProperty("CacheTtl").GetDecimal());
+        Assert.Equal(128m, root.GetProperty("ReadCacheMb").GetDecimal());
+        Assert.Equal(8m, root.GetProperty("PrefetchBlocks").GetDecimal());
         Assert.Equal("warn", root.GetProperty("LogLevel").GetString());
     }
 

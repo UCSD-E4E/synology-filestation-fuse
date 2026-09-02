@@ -111,10 +111,17 @@ impl<H> HandleCache<H> {
     }
 
     /// Forget everything, e.g. because the session behind the handles is gone.
+    ///
+    /// Parked handles go too. The caller that clears is the one whose session
+    /// has died, and a handle left parked would outlive it: `take_free` would
+    /// hand it back later to be closed against a connection that no longer
+    /// exists, and nothing would ever clear it if it never came free.
     pub(crate) fn clear(&self) -> Vec<Arc<H>> {
         let mut state = self.state.lock().unwrap();
         state.order.clear();
-        state.handles.drain().map(|(_, h)| h).collect()
+        let mut gone: Vec<Arc<H>> = state.handles.drain().map(|(_, h)| h).collect();
+        gone.append(&mut state.deferred);
+        gone
     }
 
     /// Park a handle the caller could not close because a read still held it.
@@ -317,6 +324,29 @@ mod tests {
         assert_eq!(c.clear().len(), 2);
         assert_eq!(c.len(), 0);
         assert!(c.get("/s/a").is_none());
+    }
+
+    /// Regression: `clear` drained the live handles and left the parked ones
+    /// sitting there. The one caller is reconnect, which clears *because the
+    /// session is gone* — so a parked handle survived its session, came back
+    /// from `take_free` later, and was closed against a connection that no
+    /// longer existed. Nothing owns them afterwards, so nothing would ever
+    /// clear them either.
+    #[test]
+    fn clearing_takes_the_parked_handles_too() {
+        let c = cache();
+        put(&c, "/s/a", "a");
+        c.defer(Arc::new(Handle("parked")));
+
+        let dropped = c.clear();
+
+        assert_eq!(dropped.len(), 2, "the live handle and the parked one");
+        assert_eq!(
+            c.deferred_len(),
+            0,
+            "nothing is left tied to the old session"
+        );
+        assert!(c.take_free().is_empty());
     }
 
     /// Capacity zero is caching switched off: a handle is handed straight back

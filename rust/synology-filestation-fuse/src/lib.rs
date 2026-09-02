@@ -23,7 +23,7 @@ use synology_filestation_core::error::SynoFsError;
 /// 0o755 directories / 0o644 files a process with the usual umask creates.
 pub const DEFAULT_UMASK: u16 = 0o022;
 
-/// Default depth of the Linux backend.s speculative read-ahead window, in
+/// Default depth of the Linux backend's speculative read-ahead window, in
 /// 256 KiB blocks. Lives here rather than beside the prefetch logic because
 /// [`MountOptions`] is cross-platform and that module is Linux-only.
 pub const DEFAULT_PREFETCH_BLOCKS: u64 = 16;

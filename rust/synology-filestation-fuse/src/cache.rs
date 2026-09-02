@@ -242,7 +242,7 @@ impl DirCache {
 /// Size of each cached block in bytes (256 KiB).
 pub const READ_BLOCK_SIZE: u64 = 256 * 1024;
 
-/// How long a reader waits on somebody else.s in-flight block before giving
+/// How long a reader waits on somebody else's in-flight block before giving
 /// up on it — a backstop against a wedged FUSE worker, not a judgement about
 /// the download.
 ///
@@ -250,7 +250,7 @@ pub const READ_BLOCK_SIZE: u64 = 256 * 1024;
 /// or a cancelled task included, so a waiter is woken the instant the download
 /// resolves either way. Reaching this deadline therefore means a download that
 /// is still genuinely running, and giving up **does not** take the claim away
-/// from it: freeing a live owner.s claim is what turned a slow mount into a
+/// from it: freeing a live owner's claim is what turned a slow mount into a
 /// stalled one, because the next reader started the same download again and
 /// made the queue longer.
 pub const BLOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
