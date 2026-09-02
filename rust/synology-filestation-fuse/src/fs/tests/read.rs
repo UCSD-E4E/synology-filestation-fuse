@@ -1,6 +1,7 @@
 //! Reads: block assembly out of the read cache, and directory listings.
 
 use super::*;
+use crate::fs::prefetch::TAIL_BLOCKS;
 
 // ── T1.4: block assembly ──────────────────────────────────────────────────
 
@@ -206,6 +207,24 @@ fn downloaded_starts(f: &Fixture) -> Vec<u64> {
         .collect()
 }
 
+/// The same requests as `downloaded_starts`, but keeping how much each one
+/// asked for: `(start, blocks)`. What bounds the mount is the bytes a request
+/// covers, not that it is one request.
+fn downloaded_spans(f: &Fixture) -> Vec<(u64, u64)> {
+    f.rt.block_on(f.server.received_requests())
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.query().is_some_and(|q| q.contains("method=download")))
+        .filter_map(|r| {
+            let h = r.headers.get("range")?.to_str().ok()?;
+            let (start, end) = h.trim_start_matches("bytes=").split_once('-')?;
+            let start: u64 = start.parse().ok()?;
+            let end: u64 = end.parse().ok()?;
+            Some((start, (end - start + 1).div_ceil(BLOCK)))
+        })
+        .collect()
+}
+
 fn body_with_magic(magic: &[u8], len: usize) -> Vec<u8> {
     let mut v = ramp(len);
     v[..magic.len()].copy_from_slice(magic);
@@ -373,33 +392,93 @@ fn closing_one_handle_leaves_another_handles_prefetch_alone() {
     );
 }
 
-/// The FUSE path is the highest-concurrency consumer in the codebase and had
-/// nothing bounding it: eight parallel opens meant ~160 simultaneous requests
-/// against `synoscgi`, the shared CGI backend the whole appliance runs on.
-#[test]
-fn prefetch_against_the_nas_is_capped() {
-    let f = fixture();
+/// Open eight media files at once against a mock that never answers, so that
+/// what it has received is exactly what is on the wire.
+fn eight_slow_opens(f: &Fixture) -> Vec<u64> {
     mount_download_slow(
-        &f,
+        f,
         body_with_magic(MP4_MAGIC, 200 * BLOCK as usize),
         Duration::from_secs(3),
     );
 
+    let mut inos = Vec::new();
     for i in 0..8u64 {
         let path = format!("/share/clip{i}.mp4");
-        let ino = seed_size(&f, &path, 200 * BLOCK);
-        seed_block0(&f, ino, MP4_MAGIC);
+        let ino = seed_size(f, &path, 200 * BLOCK);
+        seed_block0(f, ino, MP4_MAGIC);
         f.fs.prime_open(i, ino, &path);
+        inos.push(ino);
     }
     std::thread::sleep(Duration::from_millis(500));
+    inos
+}
 
-    // Nothing has had time to finish, so every request received is one that is
-    // still on the wire.
-    let on_the_wire = downloaded_starts(&f).len();
-    assert_eq!(
-        on_the_wire, MAX_CONCURRENT_PREFETCH,
-        "eight opens put {on_the_wire} speculative requests on the wire at once; \
-         the cap is {MAX_CONCURRENT_PREFETCH}"
+/// The FUSE path is the highest-concurrency consumer in the codebase and had
+/// nothing bounding it: eight parallel opens meant ~160 simultaneous requests
+/// against `synoscgi`, the shared CGI backend the whole appliance runs on.
+///
+/// The budget has to be counted in **blocks**, not requests. It was written
+/// when a speculative task was one block, so sixteen tasks meant sixteen
+/// blocks on the wire. Coalescing then made a task a run of up to
+/// `MAX_PREFETCH_SPAN` blocks without changing the constant, and the same
+/// sixteen came to permit sixteen times as many bytes — with the caller's own
+/// block queued behind all of them. Over a link that reaches the NAS through
+/// a VPN, that is how a 256 KiB read waits out `BLOCK_WAIT_TIMEOUT`.
+#[test]
+fn prefetch_against_the_nas_is_capped_in_blocks_not_requests() {
+    let f = fixture();
+    eight_slow_opens(&f);
+
+    let on_the_wire: u64 = downloaded_spans(&f).iter().map(|(_, blocks)| blocks).sum();
+    assert!(
+        on_the_wire <= MAX_INFLIGHT_PREFETCH_BLOCKS as u64,
+        "eight opens put {on_the_wire} speculative blocks on the wire at once; \
+         the budget is {MAX_INFLIGHT_PREFETCH_BLOCKS}"
+    );
+}
+
+/// The budget bounds the mount, but it still has to fit one file's whole open
+/// window. A window split into waves makes the case the window exists for — a
+/// video that will not play until its trailing index arrives — slower than
+/// having no window at all.
+#[test]
+fn one_files_whole_window_still_goes_out_at_once() {
+    let f = fixture();
+    eight_slow_opens(&f);
+
+    let head_blocks = DEFAULT_PREFETCH_BLOCKS - 1;
+    let tail_start = (200 - TAIL_BLOCKS) * BLOCK;
+    let spans = downloaded_spans(&f);
+    assert!(
+        spans.contains(&(BLOCK, head_blocks)),
+        "the first file's head window went out as one {head_blocks}-block run: {spans:?}"
+    );
+    assert!(
+        spans.contains(&(tail_start, TAIL_BLOCKS)),
+        "and its tail with it, as one more: {spans:?}"
+    );
+}
+
+/// A claim has to mean a download that is on the wire *now*.
+///
+/// The permit was acquired inside the spawned task, but the blocks were
+/// claimed before the task was ever spawned — so a run still queued for the
+/// budget held a claim on every block in it. A reader that wanted one of
+/// those blocks found the claim, went to sleep in `wait_for_block`, and
+/// waited out the whole minute behind speculation that had not started.
+/// That is why the mount's own log line insists the download "is still
+/// running": nothing on that path could tell the difference. Speculation that
+/// cannot start now claims nothing, and the reader just fetches the block.
+#[test]
+fn speculation_that_cannot_start_holds_no_claims() {
+    let f = fixture();
+    let inos = eight_slow_opens(&f);
+    let last = *inos.last().unwrap();
+
+    assert!(
+        f.fs.read_cache.claim_inflight(last, 1),
+        "the budget was long gone by the eighth open, so that file's window \
+         must have been dropped rather than left parked on its blocks' claims"
     );
 }
 

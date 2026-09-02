@@ -23,7 +23,7 @@ mod transfer;
 use attr::file_attr;
 pub use attr::Ownership;
 use prefetch::{
-    is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_CONCURRENT_PREFETCH,
+    is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_INFLIGHT_PREFETCH_BLOCKS,
     MAX_PREFETCH_SPAN,
 };
 use transfer::{Buffers, Transfers, WriteBuffer, WriteSink, MAX_CONCURRENT_TRANSFERS};
@@ -46,7 +46,8 @@ pub struct SynologyFS {
     transfer_limit: Arc<tokio::sync::Semaphore>,
     next_fh: AtomicU64,
     owner: Ownership,
-    /// Bounds speculative block downloads. See [`MAX_CONCURRENT_PREFETCH`].
+    /// Bounds speculative block downloads. One permit is one block on the
+    /// wire. See [`MAX_INFLIGHT_PREFETCH_BLOCKS`].
     prefetch_limit: Arc<tokio::sync::Semaphore>,
     /// Depth of the speculative window, in blocks. `0` switches it off.
     prefetch_blocks: u64,
@@ -103,7 +104,7 @@ impl SynologyFS {
             transfer_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
             next_fh: AtomicU64::new(1),
             owner,
-            prefetch_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PREFETCH)),
+            prefetch_limit: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PREFETCH_BLOCKS)),
             prefetch_blocks,
             read_ahead: Arc::new(Mutex::new(HashMap::new())),
             prefetch_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -425,28 +426,51 @@ impl SynologyFS {
     }
 
     /// Fetch one contiguous run of already-claimed blocks in a single request.
+    ///
+    /// The budget is taken here, before the task exists, and a run that cannot
+    /// have it is **dropped rather than queued**. Speculation is optional by
+    /// definition, and a queued run is worse than no run at all: the claims
+    /// were taken in `spawn_prefetch` before this point, so a run parked on
+    /// the budget holds a claim on every block in it, and a reader that wants
+    /// one of those blocks sleeps in `wait_for_block` behind a download that
+    /// has not started. Sixty seconds later it gives up, having been told the
+    /// download is still running — the wait path cannot tell a slow owner from
+    /// an idle one, so the owner must never be idle. Dropping the run leaves
+    /// the blocks unclaimed and the reader simply fetches what it needs; the
+    /// ramp in [`ReadAhead`] re-earns the window as the reader goes on.
     fn spawn_run(&self, ino: u64, path: &str, blocks: Vec<u64>) {
         let Some(&first) = blocks.first() else {
             return;
         };
         let block_size = self.read_cache.block_size;
         let span = blocks.len() as u64 * block_size;
+        // Built before the budget is asked for, so that giving up on the run
+        // releases every claim it took on the way in.
         let guards: Vec<InflightGuard> = blocks
             .iter()
             .map(|&idx| InflightGuard::new(self.read_cache.clone(), ino, idx))
             .collect();
+        let permit = self
+            .prefetch_limit
+            .clone()
+            .try_acquire_many_owned(blocks.len() as u32);
+        let Ok(permit) = permit else {
+            debug!(
+                "prefetch: budget full, dropping {} block(s) from {} at block {}",
+                blocks.len(),
+                path,
+                first
+            );
+            return; // the guards release every claim in the run
+        };
         let client = self.client.clone();
         let read_cache = self.read_cache.clone();
-        let limit = self.prefetch_limit.clone();
         let path = path.to_string();
 
         let task = self.rt.spawn(async move {
-            // Acquired inside the task, so the cap bounds what is on the wire
-            // rather than what has been queued — and so an abort while waiting
-            // for a permit costs nothing at all.
-            let Ok(_permit) = limit.acquire().await else {
-                return;
-            };
+            // Held for the life of the download and released by dropping it,
+            // so an abort gives the budget back with the claims.
+            let _permit = permit;
             let mut guards = guards;
             let Ok(data) = client.download(&path, first * block_size, span).await else {
                 return; // the guards release every claim in the run

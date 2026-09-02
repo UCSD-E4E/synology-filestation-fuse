@@ -34,7 +34,7 @@ use crate::DEFAULT_PREFETCH_BLOCKS;
 /// How much of a media container's tail to fetch eagerly. Enough for the
 /// `moov` of a typical recording; the index of a very long one will still
 /// take on-demand reads.
-const TAIL_BLOCKS: u64 = 4;
+pub(super) const TAIL_BLOCKS: u64 = 4;
 
 /// Where a sequential run's window starts before it begins doubling.
 const RAMP_START: u64 = 2;
@@ -156,14 +156,27 @@ impl ReadAhead {
     }
 }
 
-/// How many speculative block downloads may be on the wire at once.
+/// How many speculative **blocks** may be on the wire at once, mount-wide.
 ///
 /// Deliberately its own limit rather than sharing `MAX_CONCURRENT_TRANSFERS`:
 /// it has to be wide enough to hold one file's entire open window, or a video
 /// open serialises into waves and the case the window exists for gets slower.
+/// At the default depth that window is `depth - 1` head blocks plus
+/// [`TAIL_BLOCKS`], so the budget is comfortably above it and below twice it.
 /// Eight parallel opens used to mean ~160 simultaneous requests against
 /// `synoscgi`, the shared CGI backend the whole appliance runs on.
-pub(super) const MAX_CONCURRENT_PREFETCH: usize = 16;
+///
+/// Counted in blocks rather than in requests, which is what it used to be.
+/// That was the same thing when a speculative task fetched one block, but
+/// coalescing made a task a run of up to [`MAX_PREFETCH_SPAN`] blocks and
+/// silently multiplied what the number permitted by sixteen. The caller's own
+/// block then queued behind all of it, which over a link that reaches the NAS
+/// through a VPN is enough to spend a minute waiting on one 256 KiB read.
+///
+/// A run never exceeds [`MAX_PREFETCH_SPAN`], so a request can always be
+/// satisfied by an empty budget and no run can wait on permits it will never
+/// get.
+pub(super) const MAX_INFLIGHT_PREFETCH_BLOCKS: usize = 32;
 
 /// Releases a block's in-flight claim unless the download published it.
 ///
