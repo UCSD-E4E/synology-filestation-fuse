@@ -242,11 +242,39 @@ impl DirCache {
 /// Size of each cached block in bytes (256 KiB).
 pub const READ_BLOCK_SIZE: u64 = 256 * 1024;
 
-/// How long a reader waits on somebody else's in-flight block before giving up
-/// and reporting failure. Comfortably longer than a slow block download (the
-/// core's own request timeout is 30 s) but finite, so a claim that is never
-/// released cannot wedge a FUSE worker thread for the life of the mount.
+/// How long a reader waits on somebody else's in-flight block before giving
+/// up on it — a backstop against a wedged FUSE worker, not a judgement about
+/// the download.
+///
+/// Every path that claims a block releases the claim on the way out, a panic
+/// or a cancelled task included, so a waiter is woken the instant the download
+/// resolves either way. Reaching this deadline therefore means a download that
+/// is still genuinely running, and giving up **does not** take the claim away
+/// from it: freeing a live owner's claim is what turned a slow mount into a
+/// stalled one, because the next reader started the same download again and
+/// made the queue longer.
 pub const BLOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A block being downloaded, and the doorbell its waiters sleep on.
+///
+/// Readers used to poll for one every 5 ms, which cost a FUSE worker thread
+/// its CPU and still added latency to the block it was waiting for. They now
+/// sleep until the owner resolves it.
+struct BlockSlot {
+    /// `true` once the download finished, successfully or not. The bytes, if
+    /// there are any, are in `blocks` by then.
+    resolved: std::sync::Mutex<bool>,
+    ready: std::sync::Condvar,
+}
+
+impl BlockSlot {
+    fn new() -> Self {
+        Self {
+            resolved: std::sync::Mutex::new(false),
+            ready: std::sync::Condvar::new(),
+        }
+    }
+}
 
 /// A cache of file data split into fixed-size blocks.
 ///
@@ -258,10 +286,11 @@ pub struct ReadCache {
     /// Tracks which block indices are cached for each inode so we can do
     /// targeted invalidation when a file is written or deleted.
     ino_blocks: RwLock<HashMap<u64, HashSet<u64>>>,
-    /// Blocks currently being downloaded (prefetch or sync).  A block in this
-    /// set will appear in `blocks` once the download completes.  Used to avoid
-    /// issuing duplicate HTTP requests for the same block.
-    in_flight: std::sync::Mutex<HashSet<(u64, u64)>>,
+    /// Blocks currently being downloaded (prefetch or sync), each with the
+    /// handle its waiters block on. A block here will appear in `blocks` once
+    /// the download completes. Used to avoid issuing duplicate requests for
+    /// the same block, and to wake whoever is waiting the moment it lands.
+    in_flight: std::sync::Mutex<HashMap<(u64, u64), Arc<BlockSlot>>>,
     pub block_size: u64,
 }
 
@@ -275,7 +304,7 @@ impl ReadCache {
         Self {
             blocks,
             ino_blocks: RwLock::new(HashMap::new()),
-            in_flight: std::sync::Mutex::new(HashSet::new()),
+            in_flight: std::sync::Mutex::new(HashMap::new()),
             block_size,
         }
     }
@@ -292,7 +321,7 @@ impl ReadCache {
             .entry(ino)
             .or_default()
             .insert(block_idx);
-        self.in_flight.lock().unwrap().remove(&(ino, block_idx));
+        self.resolve(ino, block_idx);
     }
 
     pub fn contains(&self, ino: u64, block_idx: u64) -> bool {
@@ -303,12 +332,26 @@ impl ReadCache {
     /// Returns `false` if another task already claimed it — the caller should
     /// wait on [`wait_for_block`] instead.
     pub fn claim_inflight(&self, ino: u64, block_idx: u64) -> bool {
-        self.in_flight.lock().unwrap().insert((ino, block_idx))
+        let mut in_flight = self.in_flight.lock().unwrap();
+        if in_flight.contains_key(&(ino, block_idx)) {
+            return false;
+        }
+        in_flight.insert((ino, block_idx), Arc::new(BlockSlot::new()));
+        true
+    }
+
+    /// Finish a claim and wake everyone waiting on it, whatever the outcome.
+    fn resolve(&self, ino: u64, block_idx: u64) {
+        let slot = self.in_flight.lock().unwrap().remove(&(ino, block_idx));
+        if let Some(slot) = slot {
+            *slot.resolved.lock().unwrap() = true;
+            slot.ready.notify_all();
+        }
     }
 
     /// Mark a failed download so other waiters don't spin forever.
     pub fn cancel_inflight(&self, ino: u64, block_idx: u64) {
-        self.in_flight.lock().unwrap().remove(&(ino, block_idx));
+        self.resolve(ino, block_idx);
     }
 
     /// Spin-wait (5 ms polls) until the block appears in cache or the
@@ -328,28 +371,41 @@ impl ReadCache {
     /// [`wait_for_block`](Self::wait_for_block) with an explicit deadline, so
     /// the timeout path is testable without stalling the suite.
     fn wait_for_block_until(&self, ino: u64, block_idx: u64, timeout: Duration) -> Option<Bytes> {
+        // Take a reference to the doorbell and let go of the map: the owner
+        // needs that lock to resolve, and holding it here would deadlock.
+        let slot = self
+            .in_flight
+            .lock()
+            .unwrap()
+            .get(&(ino, block_idx))
+            .cloned();
+        // No claim means the download already finished — the block is either in
+        // the cache or it failed.
+        let Some(slot) = slot else {
+            return self.blocks.get(&(ino, block_idx));
+        };
+
         let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(data) = self.blocks.get(&(ino, block_idx)) {
-                return Some(data);
-            }
-            if !self.in_flight.lock().unwrap().contains(&(ino, block_idx)) {
-                // Download finished (or failed) without populating the cache.
-                return self.blocks.get(&(ino, block_idx));
-            }
-            if Instant::now() >= deadline {
-                // The claim owner never published a block and never released the
-                // claim. Drop the stale marker so the next reader re-downloads
-                // instead of inheriting the same dead wait.
-                self.in_flight.lock().unwrap().remove(&(ino, block_idx));
+        let mut resolved = slot.resolved.lock().unwrap();
+        while !*resolved {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // The claim is deliberately left alone. It belongs to a
+                // download that is still running — every path releases its
+                // claim on the way out — and taking it away would only start a
+                // second copy of the same work.
                 tracing::warn!(
-                    "read cache: abandoned in-flight block ino={ino} idx={block_idx} after {:?}",
-                    timeout
+                    "read cache: gave up waiting on in-flight block ino={ino} \
+                     idx={block_idx} after {timeout:?}; its download is still running"
                 );
+                drop(resolved);
                 return self.blocks.get(&(ino, block_idx));
             }
-            std::thread::sleep(Duration::from_millis(5));
+            let (guard, _) = slot.ready.wait_timeout(resolved, remaining).unwrap();
+            resolved = guard;
         }
+        drop(resolved);
+        self.blocks.get(&(ino, block_idx))
     }
 
     /// Evict a single cached block (e.g. a stale EOF sentinel).
@@ -366,8 +422,22 @@ impl ReadCache {
         if let Some(set) = indices {
             for idx in set {
                 self.blocks.invalidate(&(ino, idx));
-                self.in_flight.lock().unwrap().remove(&(ino, idx));
+                self.resolve(ino, idx);
             }
+        }
+        // `ino_blocks` only knows about blocks that arrived. A block still on
+        // its way has a claim and waiters but no entry there, and dropping the
+        // file underneath them must not leave them asleep for the deadline.
+        let claimed: Vec<u64> = self
+            .in_flight
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(i, _)| *i == ino)
+            .map(|(_, idx)| *idx)
+            .collect();
+        for idx in claimed {
+            self.resolve(ino, idx);
         }
     }
 }
@@ -596,19 +666,93 @@ mod tests {
         );
     }
 
-    /// Giving up must also clear the stale marker, otherwise the next reader
-    /// inherits the same dead claim and waits out the timeout all over again
-    /// instead of just downloading the block.
+    /// Regression: giving up used to *free* the claim, on the theory that the
+    /// owner must be dead. A timer cannot tell a dead owner from a slow one,
+    /// and under load every owner is slow — so the mount freed claims whose
+    /// downloads were merely queued, a second reader started the same download
+    /// again, and the duplicated work made the queue longer still. Eight video
+    /// thumbnails were enough to turn that into a mount that served nothing.
+    ///
+    /// The claim now stays. Every path that takes one releases it on the way
+    /// out — including a panic or an abort, via `InflightGuard` — so an
+    /// unresolved claim means a download still running, and the right thing to
+    /// do about a download still running is nothing.
     #[test]
-    fn abandoning_a_claim_frees_it_for_the_next_reader() {
+    fn giving_up_does_not_free_a_claim_whose_owner_is_still_working() {
         let rc = ReadCache::new(1024, 16);
         assert!(rc.claim_inflight(2, 7));
+
         assert!(rc
             .wait_for_block_until(2, 7, Duration::from_millis(50))
             .is_none());
+
         assert!(
-            rc.claim_inflight(2, 7),
-            "the abandoned claim must be released so a fresh download can start"
+            !rc.claim_inflight(2, 7),
+            "the owner still holds this block; a second download must not start"
+        );
+    }
+
+    /// The owner releasing its claim must wake the waiters, not leave them to
+    /// notice on the next poll — there are no polls any more.
+    #[test]
+    fn a_failed_download_releases_its_waiters_at_once() {
+        let rc = Arc::new(ReadCache::new(1024, 16));
+        assert!(rc.claim_inflight(4, 1));
+
+        let rc2 = rc.clone();
+        let waiter = std::thread::spawn(move || {
+            let start = Instant::now();
+            let got = rc2.wait_for_block_until(4, 1, Duration::from_secs(30));
+            (got, start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        rc.cancel_inflight(4, 1);
+
+        let (got, waited) = waiter.join().unwrap();
+        assert!(got.is_none(), "a failed download yields no data");
+        assert!(
+            waited < Duration::from_secs(5),
+            "the waiter must wake on the failure, not sit out the deadline: {waited:?}"
+        );
+    }
+
+    /// Dropping an inode's blocks must release anyone waiting on one, or a
+    /// file being written underneath a reader strands that reader.
+    #[test]
+    fn invalidating_an_inode_releases_its_waiters() {
+        let rc = Arc::new(ReadCache::new(1024, 16));
+        assert!(rc.claim_inflight(5, 2));
+
+        let rc2 = rc.clone();
+        let waiter = std::thread::spawn(move || {
+            let start = Instant::now();
+            let got = rc2.wait_for_block_until(5, 2, Duration::from_secs(30));
+            (got, start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        rc.invalidate_ino(5);
+
+        let (got, waited) = waiter.join().unwrap();
+        assert!(got.is_none());
+        assert!(
+            waited < Duration::from_secs(5),
+            "invalidation must wake the waiter: {waited:?}"
+        );
+    }
+
+    /// A reader arriving after the download already finished has no claim to
+    /// wait on, and must simply be handed the block.
+    #[test]
+    fn a_waiter_that_arrives_after_the_block_landed_still_gets_it() {
+        let rc = ReadCache::new(1024, 16);
+        assert!(rc.claim_inflight(6, 0));
+        rc.insert(6, 0, Bytes::from_static(b"already here"));
+
+        assert_eq!(
+            rc.wait_for_block_until(6, 0, Duration::from_millis(50)),
+            Some(Bytes::from_static(b"already here"))
         );
     }
 

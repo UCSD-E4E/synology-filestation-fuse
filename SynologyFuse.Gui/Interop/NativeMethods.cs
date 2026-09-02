@@ -118,7 +118,7 @@ internal static partial class NativeMethods
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
     internal static partial int syno_mount(
         IntPtr client, string mountpoint, ulong cacheTtl, ulong readCacheMb,
-        out IntPtr outMount, ref NativeError err);
+        ulong prefetchBlocks, out IntPtr outMount, ref NativeError err);
 
     [LibraryImport(Lib)]
     internal static partial void syno_unmount(IntPtr mount);

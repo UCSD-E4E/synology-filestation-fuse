@@ -160,7 +160,8 @@ The GUI path goes: MountService.cs / SynoClient.cs → P/Invoke (Interop/NativeM
 | `main.rs`   | CLI binary: parsing (clap), interactive prompts, login, then calls `lib.rs::spawn_mount` and parks on Ctrl-C |
 | `lib.rs`    | Library surface: `spawn_mount`/`MountHandle` (non-blocking, background mount) + `is_otp_required`, shared by the CLI and the FFI crate |
 | `fs.rs`     | Linux FUSE backend. Metadata callbacks use `runtime.block_on()`; **file transfers do not** — `flush`/`release` (upload), `setattr` (truncate) and cross-directory `rename` hand the transfer to the Tokio runtime via `start_*` and reply to the kernel from there, so no transfer ever occupies an event-loop thread. Transfers are capped at `MAX_CONCURRENT_TRANSFERS` (the event loop used to be that limit by accident) and each open handle has its own buffer lock. The session also runs a multi-threaded event loop (`MountOptions::io_threads`, `--fuse-threads`) for the remaining blocking callbacks |
-| `cache.rs`  | Linux only — `InodeCache` (TTL metadata), `ReadCache` (LRU block cache, 256 KiB blocks, prefetch) |
+| `cache.rs`  | Linux only — `InodeCache` (TTL metadata), `ReadCache` (LRU block cache, 256 KiB blocks) |
+| `prefetch.rs` | Linux only — what to speculate on and when: the container sniff that decides the open window, the sequential-detection ramp behind `read`, and `InflightGuard` |
 | `webdav.rs` | macOS WebDAV backend; directory moves are download→upload→delete |
 | `winfs.rs`  | Windows WinFsp backend; in-memory write buffers flushed atomically on close |
 
@@ -199,7 +200,7 @@ Who enables it:
 |---|---|---|
 | Python `Client`/`AsyncClient` | **on by default** (all levers, incl. the belt); tunable/disable via `login(..., throttle=…, max_concurrency=…, …)` | The bulk consumer (e.g. a Temporal pipeline staging `.ORF` files) — the one that saturated the NAS. |
 | FFI `syno_connect` (GUI) | **on**, concurrency + backoff + retry cap, **belt off** (`min_interval=0`) | The same client Arc also backs a GUI-initiated mount; spacing every ranged block read would stall interactive streaming. |
-| FUSE/CLI (`main.rs`) | **off** | Interactive mount; the 16-block prefetch fan-out must stay responsive. |
+| FUSE/CLI (`main.rs`) | **off** | Interactive mount; streaming must stay responsive. The prefetch fan-out — the thing that actually made this path the highest-concurrency consumer — is bounded separately by `MAX_CONCURRENT_PREFETCH`. |
 
 **Temporal / outer-retry contract:** this client caps retries and then raises — do **not** nest it under your own inner retry loop. Let the activity fail and let Temporal reschedule with its (longer, jittered) backoff. Two nested retry loops are what produced the 200–250×-per-file storm.
 
@@ -220,7 +221,17 @@ MVVM pattern (Avalonia). The GUI calls the Rust core **directly via the FFI cdyl
 ### Caching (Linux Only)
 
 - **`InodeCache`**: inode↔path bidirectional map with 30 s TTL (configurable via `--cache-ttl`)
-- **`ReadCache`**: fixed-size block cache (default 256 MiB, `--read-cache-mb`); background prefetch of next 16 blocks
+- **`ReadCache`**: fixed-size block cache (default 256 MiB, `--read-cache-mb`)
+- **Waiting on an in-flight block**: readers sleep on a per-block condvar rather than polling, and every path that claims a block releases the claim on the way out — a panic or an aborted prefetch task included, via `InflightGuard`. So an unresolved claim means a download still running, and `BLOCK_WAIT_TIMEOUT` giving up **leaves the claim alone**. It used to free it, on the theory that the owner must be dead; a timer cannot tell a dead owner from a slow one, so under load the mount freed live claims, a second reader restarted the same download, and the duplicated work lengthened the queue that caused the timeout
+- **Prefetch** (`--prefetch-blocks`, default 16, `0` disables): speculation is no longer unconditional. `open` fetches block 0 eagerly and the full head-plus-tail media window **only** when block 0 sniffs as a container that keeps its index at the end (MP4/MOV, Matroska/WebM, AVI, ASF) — a seek to EOF is by definition not sequential, so no access-pattern heuristic could ever predict that tail, which is why it has to be decided from the file itself. Everything else gets block 0 plus a ramp: `read` prefetches only when a read continues the last one on that handle, growing 2→4→8→16. Blocks past EOF are never requested, and `release` aborts a file's outstanding prefetch once its last handle closes. Concurrency is capped at `MAX_CONCURRENT_PREFETCH` (16), separately from `MAX_CONCURRENT_TRANSFERS` (4) — it has to be wide enough for one file's whole open window or a video open serialises into waves. Contiguous blocks are coalesced into a single ranged read (`MAX_PREFETCH_SPAN`), so a fifteen-block head is one request rather than fifteen
+
+### SMB read path
+
+The `smb2` crate is built for concurrent, pipelined use: `Connection` is an `Arc` over shared state with its own credit accounting and receiver task, and `FileReader::read_at` is `pread`-shaped and explicitly safe to call concurrently. The transport wrapper originally defeated both — it held one mutex across every read and issued a fresh CREATE/READ/CLOSE per 256 KiB block, so every block on the whole mount was three round trips, serialised. Now:
+
+- **The transport mutex is never held across a round trip.** It covers `ensure_ready` and cheap `Arc` clones of the connection and tree; the CREATE and the READ happen unlocked.
+- **Open read handles are cached** (`smb/src/handles.rs`, `MAX_CACHED_HANDLES`), so a block read is one READ on a handle that persists. Invalidated on write/truncate/delete/rename/`open_write`, and dropped wholesale on reconnect (the session those handles belonged to is gone).
+- **Closing is deferred, never skipped.** `FileReader::close` consumes the reader, and dropping one without closing leaks the handle on the appliance until session teardown — so an eviction that lands mid-read parks the handle until the last reader is done.
 
 ## Known Limitations
 

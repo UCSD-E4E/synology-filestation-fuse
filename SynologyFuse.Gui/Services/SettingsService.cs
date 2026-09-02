@@ -25,6 +25,11 @@ public sealed class PersistedSettings
     public string Mountpoint { get; set; } = "";
     public decimal CacheTtl { get; set; } = 30;
     public decimal ReadCacheMb { get; set; } = 256;
+
+    /// <summary>Speculative read-ahead depth in blocks; 0 disables it. Absent
+    /// from a settings file written before the knob existed, the initialiser
+    /// keeps the window the mount has always had.</summary>
+    public decimal PrefetchBlocks { get; set; } = 16;
     public string LogLevel { get; set; } = "info";
 
     /// <summary>NetBIOS domain the account lives in (`KRG` for an AD account).

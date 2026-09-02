@@ -23,6 +23,11 @@ use synology_filestation_core::error::SynoFsError;
 /// 0o755 directories / 0o644 files a process with the usual umask creates.
 pub const DEFAULT_UMASK: u16 = 0o022;
 
+/// Default depth of the Linux backend's speculative read-ahead window, in
+/// 256 KiB blocks. Lives here rather than beside the prefetch logic because
+/// [`MountOptions`] is cross-platform and that module is Linux-only.
+pub const DEFAULT_PREFETCH_BLOCKS: u64 = 16;
+
 #[cfg(target_os = "linux")]
 mod cache;
 #[cfg(target_os = "linux")]
@@ -63,6 +68,11 @@ pub struct MountOptions {
     /// Masked out of the synthetic mode (Linux only), as a process umask would
     /// be: the default 0o022 yields 0o755 directories and 0o644 files.
     pub umask: u16,
+    /// Depth of the speculative read-ahead window, in blocks (Linux/FUSE only).
+    /// `0` switches speculation off entirely, which is what a bulk consumer
+    /// walking a corpus wants: it reads each file once, in order, and every
+    /// speculative block is waste that competes with the next file.
+    pub prefetch_blocks: u64,
 }
 
 impl Default for MountOptions {
@@ -74,6 +84,7 @@ impl Default for MountOptions {
             uid: None,
             gid: None,
             umask: DEFAULT_UMASK,
+            prefetch_blocks: DEFAULT_PREFETCH_BLOCKS,
         }
     }
 }
@@ -326,7 +337,15 @@ pub fn spawn_mount(
         READ_BLOCK_SIZE / (1024 * 1024)
     );
 
-    let fs = SynologyFS::new(client.clone(), cache, dir_cache, read_cache, rt, owner);
+    let fs = SynologyFS::new(
+        client.clone(),
+        cache,
+        dir_cache,
+        read_cache,
+        rt,
+        owner,
+        opts.prefetch_blocks,
+    );
 
     // As a non-root user, allow_other requires `user_allow_other` in
     // /etc/fuse.conf; running as root always permits it.

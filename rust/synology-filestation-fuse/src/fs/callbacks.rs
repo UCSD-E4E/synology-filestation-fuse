@@ -258,7 +258,7 @@ impl Filesystem for SynologyFS {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         size: u32,
         _flags: OpenFlags,
@@ -301,23 +301,11 @@ impl Filesystem for SynologyFS {
             }
         };
 
-        // Background prefetch of the next 16 blocks to keep VLC's read-ahead buffer full.
-        for prefetch_idx in (last_block + 1)..=(last_block + 16) {
-            if !self.read_cache.contains(ino, prefetch_idx)
-                && self.read_cache.claim_inflight(ino, prefetch_idx)
-            {
-                let client = self.client.clone();
-                let rc = self.read_cache.clone();
-                let path_clone = path.clone();
-                self.rt.spawn(async move {
-                    let start = prefetch_idx * block_size;
-                    match client.download(&path_clone, start, block_size).await {
-                        Ok(data) => rc.insert(ino, prefetch_idx, data), // empty == EOF sentinel
-                        Err(_) => rc.cancel_inflight(ino, prefetch_idx),
-                    }
-                });
-            }
-        }
+        // Read-ahead, but only for a reader that has shown it is streaming.
+        // This used to fire on every read, unconditionally and unclamped: 16
+        // blocks of speculative HTTP behind a caller who may have wanted 48
+        // bytes and may be about to close the file.
+        self.read_ahead(fh.0, ino, &path, offset, size);
 
         reply.data(&result);
     }
@@ -333,80 +321,11 @@ impl Filesystem for SynologyFS {
         };
         debug!("open: ino={} path={} flags={:#o}", ino, path, flags.0);
 
-        let block_size = self.read_cache.block_size;
-        let file_size = self.cache.get_size_for_ino(ino).unwrap_or(0);
-        let total_blocks = if file_size > 0 {
-            file_size.div_ceil(block_size)
-        } else {
-            0
-        };
-
-        // If block 0 is cached as an empty EOF sentinel but the file is known to be
-        // non-empty, evict the stale sentinel so we re-download real data below.
-        // This can happen when a previous read attempt received an empty body or
-        // HTTP 416 for a block that should have content.
-        if total_blocks > 0 {
-            if let Some(b) = self.read_cache.get(ino, 0) {
-                if b.is_empty() {
-                    debug!("open: evicting stale EOF sentinel for ino={} block=0", ino);
-                    self.read_cache.invalidate_block(ino, 0);
-                }
-            }
-        }
-
-        // Block 0: download synchronously so VLC's very first read() is a guaranteed cache hit.
-        // If another task already claimed it, skip — it'll be in cache when read() runs.
-        if total_blocks > 0
-            && !self.read_cache.contains(ino, 0)
-            && self.read_cache.claim_inflight(ino, 0)
-        {
-            match self.block(self.client.download(&path, 0, block_size)) {
-                Ok(data) if !data.is_empty() => self.read_cache.insert(ino, 0, data),
-                _ => self.read_cache.cancel_inflight(ino, 0),
-            }
-        }
-
-        // Head: blocks 1-15 async — covers container headers and codec init data.
-        let head_end = 16u64.min(total_blocks);
-        for block_idx in 1..head_end {
-            if !self.read_cache.contains(ino, block_idx)
-                && self.read_cache.claim_inflight(ino, block_idx)
-            {
-                let client = self.client.clone();
-                let rc = self.read_cache.clone();
-                let p = path.clone();
-                self.rt.spawn(async move {
-                    let start = block_idx * block_size;
-                    match client.download(&p, start, block_size).await {
-                        Ok(data) => rc.insert(ino, block_idx, data), // empty == EOF sentinel
-                        Err(_) => rc.cancel_inflight(ino, block_idx),
-                    }
-                });
-            }
-        }
-
-        // Tail: last 4 blocks — MP4 MOOV boxes are often written at the end of the file.
-        if total_blocks > head_end {
-            let tail_start = total_blocks.saturating_sub(4).max(head_end);
-            for block_idx in tail_start..total_blocks {
-                if !self.read_cache.contains(ino, block_idx)
-                    && self.read_cache.claim_inflight(ino, block_idx)
-                {
-                    let client = self.client.clone();
-                    let rc = self.read_cache.clone();
-                    let p = path.clone();
-                    self.rt.spawn(async move {
-                        let start = block_idx * block_size;
-                        match client.download(&p, start, block_size).await {
-                            Ok(data) => rc.insert(ino, block_idx, data), // empty == EOF sentinel
-                            Err(_) => rc.cancel_inflight(ino, block_idx),
-                        }
-                    });
-                }
-            }
-        }
-
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        // Block 0 eagerly, and the rest of the window only if block 0 turns out
+        // to be a container that keeps its index at the end. A JPEG used to pay
+        // for a 20-block media window it could never use.
+        self.prime_open(fh, ino, &path);
         self.write_buffers.lock().unwrap().insert(
             fh,
             Arc::new(tokio::sync::Mutex::new(WriteBuffer {
@@ -485,7 +404,7 @@ impl Filesystem for SynologyFS {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
@@ -494,6 +413,11 @@ impl Filesystem for SynologyFS {
     ) {
         let fh = fh.0;
         debug!("release: fh={}", fh);
+        // Whatever this handle was still speculatively downloading is now work
+        // for a file nobody is reading. Dropping it here is what stops a
+        // file-at-a-time walk from having every closed file compete with its
+        // successors for the same appliance.
+        self.end_read(fh, ino.0);
         // Same treatment as flush, plus the handle teardown — which has to wait
         // for the upload, since the buffer owns the spill file being streamed.
         let buffers = self.write_buffers.clone();

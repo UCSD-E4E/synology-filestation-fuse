@@ -77,7 +77,7 @@ public sealed class MountService : IDisposable
                 vpnProfileRemote: Blank(config.VpnProfileNas));
             try
             {
-                c.Mount(mountpoint, config.CacheTtl, config.ReadCacheMb);
+                c.Mount(mountpoint, config.CacheTtl, config.ReadCacheMb, config.PrefetchBlocks);
             }
             catch (SynoException ex)
             {

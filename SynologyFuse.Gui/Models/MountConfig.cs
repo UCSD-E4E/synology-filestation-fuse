@@ -15,6 +15,13 @@ public sealed class MountConfig
     public string Mountpoint { get; init; } = "";
     public ulong CacheTtl { get; init; } = 30;
     public ulong ReadCacheMb { get; init; } = 256;
+
+    /// <summary>Speculative read-ahead depth in 256 KiB blocks; 0 switches it
+    /// off. Read-ahead only fires for a reader that is streaming, and the
+    /// window at open only for a container that keeps its index at the end --
+    /// but a bulk walk over a corpus reads each file once, and every
+    /// speculative block is then waste competing with the next file.</summary>
+    public ulong PrefetchBlocks { get; init; } = 16;
     public string LogLevel { get; init; } = "info";
 
     /// <summary>NetBIOS domain SMB authenticates in -- `KRG` for an AD account,

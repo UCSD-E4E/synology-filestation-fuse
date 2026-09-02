@@ -44,6 +44,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _mountpoint = s.Mountpoint;
         _cacheTtl = s.CacheTtl;
         _readCacheMb = s.ReadCacheMb;
+        _prefetchBlocks = s.PrefetchBlocks;
         _logLevel = s.LogLevel;
         _domain = s.Domain;
         _vpnProfile = s.VpnProfile;
@@ -110,6 +111,12 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 
     [ObservableProperty]
     private decimal _readCacheMb;
+
+    /// <summary>Speculative read-ahead depth in 256 KiB blocks; 0 switches it
+    /// off. Worth turning down for a bulk walk over a corpus, which reads each
+    /// file once and gets nothing back for the blocks fetched ahead.</summary>
+    [ObservableProperty]
+    private decimal _prefetchBlocks;
 
     [ObservableProperty]
     private string _logLevel = "info"; // overwritten by constructor; default satisfies nullable analysis
@@ -395,6 +402,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         Mountpoint = Mountpoint,
         CacheTtl = (ulong)CacheTtl,
         ReadCacheMb = (ulong)ReadCacheMb,
+        PrefetchBlocks = (ulong)PrefetchBlocks,
         LogLevel = LogLevel,
         Domain = Domain,
         VpnProfile = VpnProfile,
@@ -412,6 +420,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         Mountpoint = Mountpoint,
         CacheTtl = CacheTtl,
         ReadCacheMb = ReadCacheMb,
+        PrefetchBlocks = PrefetchBlocks,
         LogLevel = LogLevel,
         Domain = Domain,
         VpnProfile = VpnProfile,

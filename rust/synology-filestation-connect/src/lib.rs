@@ -1136,13 +1136,42 @@ mod tests {
 
     // ── What reaches the user ─────────────────────────────────────────────────
 
-    /// Somewhere to put log events so a test can read them back.
+    /// The buffer a capturing test reads its assertions out of.
     #[derive(Clone, Default)]
     struct Sink(Arc<StdMutex<Vec<u8>>>);
 
-    impl std::io::Write for Sink {
+    /// Only one log-capturing test at a time, and where its output goes.
+    static CAPTURING: StdMutex<()> = StdMutex::new(());
+    static ACTIVE: StdMutex<Option<Sink>> = StdMutex::new(None);
+
+    /// The writer the one global subscriber holds, forwarding to whichever
+    /// capture is running.
+    ///
+    /// A thread-local subscriber looks like the right tool and is not:
+    /// `tracing` caches each callsite's *interest* globally, so the first
+    /// thread to reach one decides for every thread whether anybody wants it.
+    /// With thirty-eight other tests running beside these two, a callsite
+    /// registered by a thread holding no subscriber is cached as
+    /// uninteresting, and the test that does want it then sees nothing —
+    /// roughly one run in twenty-five, and never when the test runs alone.
+    /// Serialising the captures does not help, because it is the *other*
+    /// tests doing the registering.
+    ///
+    /// One subscriber, installed globally and never removed, keeps every
+    /// callsite permanently interesting. Lines logged by tests running
+    /// alongside land in the buffer too, which costs nothing: the assertions
+    /// ask what the log *contains*.
+    #[derive(Clone, Default)]
+    struct RouteToActiveCapture;
+
+    impl std::io::Write for RouteToActiveCapture {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            if let Some(sink) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                sink.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+            }
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -1150,44 +1179,59 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RouteToActiveCapture {
         type Writer = Self;
         fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+            Self
         }
     }
 
-    /// Captures what this thread logs for as long as it is held.
+    /// Captures what the process logs for as long as it is held.
     ///
     /// Which leg the chain chose, and why the better ones were not available,
     /// reaches a user as log output and nothing else — so the level an event
     /// is emitted at is behaviour, not decoration, and belongs under test like
-    /// any other. The default is thread-local and `#[tokio::test]` polls on
-    /// the thread that set it, so this holds across await points without
-    /// disturbing the tests running beside it.
+    /// any other.
     struct LogCapture {
         sink: Sink,
-        _guard: tracing::subscriber::DefaultGuard,
+        /// Held for the life of the capture, so two of these never overlap.
+        _capturing: std::sync::MutexGuard<'static, ()>,
     }
 
     impl LogCapture {
         /// Capture at `info` — what somebody gets without changing a setting,
         /// which is the whole point of asserting on it.
         fn at_the_default_level() -> Self {
+            // A panicking capture test must not stop the next one running.
+            let capturing = CAPTURING.lock().unwrap_or_else(|e| e.into_inner());
+            static INSTALLED: std::sync::Once = std::sync::Once::new();
+            INSTALLED.call_once(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(RouteToActiveCapture)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_ansi(false)
+                    .finish();
+                // Another test binary in this process may have got there
+                // first; either way a subscriber is in place afterwards.
+                let _ = tracing::subscriber::set_global_default(subscriber);
+            });
             let sink = Sink::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(sink.clone())
-                .with_max_level(tracing::Level::INFO)
-                .with_ansi(false)
-                .finish();
+            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.clone());
             Self {
-                _guard: tracing::subscriber::set_default(subscriber),
                 sink,
+                _capturing: capturing,
             }
         }
 
         fn text(&self) -> String {
-            String::from_utf8_lossy(&self.sink.0.lock().unwrap()).into_owned()
+            String::from_utf8_lossy(&self.sink.0.lock().unwrap_or_else(|e| e.into_inner()))
+                .into_owned()
+        }
+    }
+
+    impl Drop for LogCapture {
+        fn drop(&mut self) {
+            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 

@@ -1063,6 +1063,10 @@ pub unsafe extern "C" fn syno_mount(
     mountpoint: *const c_char,
     cache_ttl: u64,
     read_cache_mb: u64,
+    // Speculative read-ahead depth in blocks; `0` switches it off. A bulk
+    // consumer walking a corpus reads each file once and every speculative
+    // block is waste, so this has to be reachable from the GUI too.
+    prefetch_blocks: u64,
     out: *mut *mut SynoMount,
     err: *mut SynoError,
 ) -> i32 {
@@ -1082,6 +1086,7 @@ pub unsafe extern "C" fn syno_mount(
         let opts = MountOptions {
             cache_ttl,
             read_cache_mb,
+            prefetch_blocks,
             ..MountOptions::default()
         };
         match spawn_mount(

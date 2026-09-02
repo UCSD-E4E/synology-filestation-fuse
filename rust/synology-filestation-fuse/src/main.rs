@@ -75,6 +75,13 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     read_cache_mb: u64,
 
+    /// Speculative read-ahead depth in 256 KiB blocks; 0 disables it.
+    /// Read-ahead only fires for a reader that is streaming, and the window
+    /// at open only for a container that keeps its index at the end. Bulk
+    /// consumers walking a corpus want 0 (Linux/FUSE only)
+    #[arg(long, default_value_t = synology_filestation_fuse::DEFAULT_PREFETCH_BLOCKS)]
+    prefetch_blocks: u64,
+
     /// FUSE event-loop threads; 0 picks a default from the CPU count.
     /// Bounds the callbacks that still hold a thread — a read that misses the
     /// cache, a listing, a metadata call — not file transfers, which run on the
@@ -398,6 +405,7 @@ fn main() -> anyhow::Result<()> {
         cache_ttl: args.cache_ttl,
         read_cache_mb: args.read_cache_mb,
         io_threads: args.fuse_threads,
+        prefetch_blocks: args.prefetch_blocks,
         uid: args.uid,
         gid: args.gid,
         umask: args.umask,
