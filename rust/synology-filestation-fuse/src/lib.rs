@@ -16,12 +16,58 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use synology_filestation_connect::{Chain, SmbRoute};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
+use synology_filestation_smb::{BoxedStream, RedialFuture};
 
 /// Default umask for the synthetic mode the Linux backend reports, matching the
 /// 0o755 directories / 0o644 files a process with the usual umask creates.
 pub const DEFAULT_UMASK: u16 = 0o022;
+
+/// How the SMB transport gets a new stream when the one it is running on dies.
+///
+/// The tunnel leg is the one that cannot heal itself. Its stream belongs to a
+/// userspace TCP stack inside an in-process OpenVPN client, so `SmbClient` has
+/// nothing it could redial — the address at the far end is reachable only from
+/// inside the tunnel — and the transport was built unable to reconnect at all.
+/// One stream EOF then ended SMB for the life of the mount: the
+/// transport-selection breaker re-probed every 30 s, each probe met the same
+/// dead session, and every operation paid a guaranteed failure before falling
+/// back to the HTTP API.
+///
+/// [`Chain::reach_smb`] is what closes that hole. It opens a fresh connection
+/// through the tunnel, and brings the tunnel itself back up when that is what
+/// is missing — so the redial is one call, and it is the same call the mount
+/// made at startup.
+///
+/// Shared by the CLI and the FFI binding, which build the same transport.
+pub fn reopen_through(
+    chain: Arc<Chain>,
+) -> impl Fn() -> RedialFuture + Send + Sync + 'static + use<> {
+    move || {
+        let chain = chain.clone();
+        Box::pin(async move {
+            match chain.reach_smb().await {
+                Ok(SmbRoute::Tunnelled { connection, .. }) => {
+                    Ok(Box::new(connection) as BoxedStream)
+                }
+                // The transport is stream-shaped and cannot change legs under
+                // itself: a machine carried back onto the network wants a
+                // whole new transport, not a new stream for this one. Saying
+                // so beats reporting the tunnel as merely unreachable.
+                Ok(SmbRoute::Direct { host }) => Err(SynoFsError::Io(format!(
+                    "the tunnel is gone and {host} now answers directly; \
+                     remount to use it"
+                ))),
+                Ok(SmbRoute::Unavailable) => {
+                    Err(SynoFsError::Io("SMB cannot be reached at all".into()))
+                }
+                Err(e) => Err(SynoFsError::Io(format!("{e}"))),
+            }
+        })
+    }
+}
 
 /// Default depth of the Linux backend's speculative read-ahead window, in
 /// 256 KiB blocks. Lives here rather than beside the prefetch logic because

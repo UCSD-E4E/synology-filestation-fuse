@@ -14,7 +14,11 @@
 //! and a whole-file pipelined read, and checks the two read paths agree on the
 //! leading bytes.
 
-use synology_filestation_smb::{SmbConfig, SmbTransport};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use synology_filestation_core::SynoFsError;
+use synology_filestation_smb::{BoxedStream, SmbConfig, SmbTransport};
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok()
@@ -240,4 +244,84 @@ async fn read_to_path_stream_over_smb() {
         "OK: streaming read ({} bytes) to disk matches whole-file read; cleaned up",
         meta.size
     );
+}
+
+/// The tunnelled mount's recovery, exercised on a plain TCP stream because the
+/// shape is what matters: a transport running on a stream somebody else opened.
+///
+/// Off campus that stream comes out of an in-process OpenVPN tunnel, and when
+/// it ended the mount had no way back — `SmbClient` will not dial the address
+/// at the far end of a tunnel behind the caller's back, so the transport was
+/// built unable to reconnect at all. Every later operation then failed
+/// `Disconnected` against a session nothing would rebuild, the
+/// transport-selection breaker re-probed the same corpse every 30 s, and the
+/// mount served the rest of its life off the HTTP fallback.
+///
+/// So: kill the socket underneath a live session and require the transport to
+/// come back on a stream the redial closure opens.
+///
+/// ```text
+/// SMB2_HOST=e4e-nas.ucsd.edu SMB2_DOMAIN=KRG SMB2_USER=… SMB2_PASS='…' \
+/// SMB2_LOGICAL='/fishsense_data/…/P8010001.ORF' \
+/// nix develop ../.. -c cargo test -p synology-filestation-smb -- --ignored --nocapture reopens
+/// ```
+#[tokio::test]
+#[ignore = "requires a reachable NAS + credentials; run with --ignored"]
+async fn a_dead_stream_reopens_itself() {
+    let (host, user, pass, logical) = require4("SMB2_LOGICAL");
+    let mut cfg = SmbConfig::new(host.clone(), user, pass);
+    cfg.domain = env("SMB2_DOMAIN").unwrap_or_default();
+    let addr = cfg.addr();
+
+    // The stream the session runs on, plus a second descriptor onto the same
+    // socket — the only way to end it from outside once the transport owns it.
+    let dialled = std::net::TcpStream::connect(&addr).expect("dial the NAS");
+    let killer = dialled.try_clone().expect("a second handle on the socket");
+    dialled
+        .set_nonblocking(true)
+        .expect("nonblocking for tokio");
+    let stream = tokio::net::TcpStream::from_std(dialled).expect("adopt the socket");
+
+    let redials = Arc::new(AtomicUsize::new(0));
+    let counted = redials.clone();
+    let redial_addr = addr.clone();
+    let smb = SmbTransport::over_with_redial(stream, &cfg, move || {
+        let counted = counted.clone();
+        let addr = redial_addr.clone();
+        Box::pin(async move {
+            counted.fetch_add(1, Ordering::SeqCst);
+            tokio::net::TcpStream::connect(&addr)
+                .await
+                .map(|s| Box::new(s) as BoxedStream)
+                .map_err(|e| SynoFsError::Io(format!("redial: {e}")))
+        })
+    })
+    .await
+    .expect("connect + auth over the supplied stream");
+
+    let before = smb.stat(&logical).await.expect("stat on the first session");
+    assert_eq!(redials.load(Ordering::SeqCst), 0, "nothing to redial yet");
+
+    // End the socket under the live session.
+    killer
+        .shutdown(std::net::Shutdown::Both)
+        .expect("close the socket out from under the session");
+
+    // The operation that meets the dead link fails and flags it. That failure
+    // is the ordinary one — what used to be wrong is everything after it.
+    let met_it = smb.stat(&logical).await;
+    assert!(met_it.is_err(), "the session it was using is gone");
+
+    // And the next one rebuilds on a stream the closure opened.
+    let after = smb
+        .stat(&logical)
+        .await
+        .expect("the transport reopened its own stream");
+    assert_eq!(
+        redials.load(Ordering::SeqCst),
+        1,
+        "recovery went through the caller's redial, once"
+    );
+    assert_eq!(after.size, before.size, "same file, rebuilt session");
+    println!("OK: a dead stream was reopened and the session rebuilt");
 }

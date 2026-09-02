@@ -11,7 +11,9 @@
 //! connection pool (future work).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,11 +80,16 @@ impl Default for ReconnectState {
 }
 
 impl ReconnectState {
-    /// For a transport with no way to reopen its own link.
-    fn never() -> Self {
+    /// For a transport running on a stream the caller supplied: it can come
+    /// back exactly when the caller left a way to reopen that stream.
+    ///
+    /// Without one it can never come back, which is what a tunnelled mount
+    /// used to get unconditionally — and why a single stream EOF put it on the
+    /// HTTP fallback for the rest of the session.
+    fn for_supplied_stream(can_redial: bool) -> Self {
         Self {
             needs: AtomicBool::new(false),
-            possible: false,
+            possible: can_redial,
         }
     }
 
@@ -135,6 +142,82 @@ fn local_fs_error(what: &str, e: &std::io::Error) -> SynoFsError {
         // Any other local FS failure is still definitive — don't fall back.
         _ => SynoFsError::InvalidArg,
     }
+}
+
+/// A byte stream SMB can run on, named so a reopened one can be handed back
+/// as a value rather than as a type parameter.
+pub trait SmbStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> SmbStream for T {}
+
+/// A stream a caller reopened for us.
+pub type BoxedStream = Box<dyn SmbStream>;
+
+/// What [`SmbTransport::over_with_redial`]'s closure returns: the work of
+/// reopening the stream, which for a tunnelled connection may mean bringing
+/// the tunnel back up first.
+pub type RedialFuture =
+    Pin<Box<dyn Future<Output = Result<BoxedStream, SynoFsError>> + Send + 'static>>;
+
+/// How to reopen the stream this transport runs on, and what to authenticate
+/// on the new one. The config is kept because rebuilding the session needs the
+/// same credentials and server name the first one used.
+#[derive(Clone)]
+struct Redialer {
+    open: Arc<dyn Fn() -> RedialFuture + Send + Sync>,
+    cfg: SmbConfig,
+}
+
+/// Negotiate and authenticate an SMB session on `stream`.
+///
+/// Shared by the first connection and every reconnection after it, so a
+/// rebuilt session is built the way the working one was rather than by a
+/// second implementation that has never been run.
+async fn client_over<S>(stream: S, cfg: &SmbConfig) -> Result<SmbClient, SynoFsError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    let framed = Arc::new(crate::framing::StreamTransport::new(stream));
+    // The host without its port: `Connection` names the server, and the
+    // port is not part of a server's name.
+    let server = cfg.host.split(':').next().unwrap_or(&cfg.host).to_string();
+
+    let conn = smb2::client::connection::Connection::from_transport(
+        Box::new(Arc::clone(&framed)),
+        Box::new(framed),
+        server,
+    );
+
+    SmbClient::from_connection(
+        ClientConfig {
+            addr: cfg.addr(),
+            timeout: cfg.timeout,
+            username: cfg.username.clone(),
+            password: cfg.password.clone(),
+            domain: cfg.domain.clone(),
+            // Not ours to arm: `SmbClient` would dial `addr` behind the
+            // caller's back, and for a tunnelled connection that address is
+            // reachable only from inside the tunnel.
+            auto_reconnect: false,
+            compression: true,
+            dfs_enabled: true,
+            dfs_target_overrides: HashMap::new(),
+        },
+        conn,
+    )
+    .await
+    .map_err(|e| to_syno_error(&e))
+}
+
+/// Carry a redial failure back as an `smb2::Error` so it flows through the
+/// same reconnect bookkeeping as any other.
+///
+/// `Io` rather than a connection-lost kind on purpose: the flag is re-set by
+/// `reconnect_if_needed` itself, and classifying this as a link failure would
+/// only re-flag what is already flagged. What it does buy is the reason —
+/// "reopening the stream: …" says the tunnel would not come back, where a
+/// bare `Disconnected` said only that the old one had gone.
+fn redial_failed(e: SynoFsError) -> smb2::Error {
+    smb2::Error::Io(std::io::Error::other(format!("reopening the stream: {e}")))
 }
 
 /// Connection parameters for [`SmbTransport::connect`].
@@ -209,7 +292,13 @@ impl SmbConfig {
         cfg
     }
 
-    fn addr(&self) -> String {
+    /// The address this config names, port included.
+    ///
+    /// Public because a caller writing a redial closure for
+    /// [`SmbTransport::over_with_redial`] needs the same address the transport
+    /// was built for, and reassembling `host` and `port` by hand is how the
+    /// two come to disagree.
+    pub fn addr(&self) -> String {
         if self.host.contains(':') {
             self.host.clone()
         } else {
@@ -360,6 +449,10 @@ pub struct SmbTransport {
     /// auto-reconnect, so without this a mount would degrade to HTTP permanently
     /// after one network flap.
     reconnect: Arc<ReconnectState>,
+    /// How to reopen the stream underneath, for a transport that runs on one
+    /// the caller supplied. `None` for a transport that dialled its own
+    /// address — `SmbClient::reconnect` redials that itself.
+    redial: Option<Redialer>,
 }
 
 impl SmbTransport {
@@ -385,6 +478,8 @@ impl SmbTransport {
             })),
             handles: Arc::new(HandleCache::new(MAX_CACHED_HANDLES)),
             reconnect: Arc::new(ReconnectState::default()),
+            // This one dialled its own address, so `SmbClient` can redial it.
+            redial: None,
         })
     }
 
@@ -413,12 +508,55 @@ impl SmbTransport {
     /// than recovered — `SmbClient` refuses to dial `host` behind the caller's
     /// back, which for a tunnelled connection would put the session on the
     /// open internet or on nothing at all. Recovery belongs to whoever owns
-    /// the tunnel: bring a new stream and build a new transport.
+    /// the tunnel, and a caller that can reopen the stream should say so with
+    /// [`over_with_redial`](Self::over_with_redial) — a mount built here
+    /// serves the rest of its life off the fallback transport once its stream
+    /// ends.
     pub async fn over<S>(stream: S, cfg: &SmbConfig) -> Result<Self, SynoFsError>
     where
         // `Send` and not `Sync`: the stream this exists for holds boxed
         // futures, so it is one and not the other, and the halves are behind
         // mutexes here anyway. Requiring `Sync` excluded the only caller.
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
+        Self::over_stream(stream, cfg, None).await
+    }
+
+    /// [`over`](Self::over), for a caller that can open the stream again.
+    ///
+    /// `reopen` is asked for a fresh stream to the same server when the
+    /// current one is found dead, and the session is rebuilt on it by exactly
+    /// the path that built the first one. That is the whole of what a
+    /// tunnelled mount was missing: the transport-selection breaker already
+    /// re-probes a failed backend every 30 s, but with nothing able to rebuild
+    /// the session the probe only ever rediscovered the same dead stream.
+    ///
+    /// The closure owns the question of *how* — reopening the tunnel if that
+    /// is what it takes — which is why it belongs to the caller and not here.
+    /// A redial that fails leaves the link flagged, so the next operation
+    /// tries again rather than giving up on SMB for good.
+    pub async fn over_with_redial<S, F>(
+        stream: S,
+        cfg: &SmbConfig,
+        reopen: F,
+    ) -> Result<Self, SynoFsError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+        F: Fn() -> RedialFuture + Send + Sync + 'static,
+    {
+        let redialer = Redialer {
+            open: Arc::new(reopen),
+            cfg: cfg.clone(),
+        };
+        Self::over_stream(stream, cfg, Some(redialer)).await
+    }
+
+    async fn over_stream<S>(
+        stream: S,
+        cfg: &SmbConfig,
+        redial: Option<Redialer>,
+    ) -> Result<Self, SynoFsError>
+    where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
     {
         if cfg.host.is_empty() {
@@ -431,34 +569,7 @@ impl SmbTransport {
             return Err(SynoFsError::InvalidArg);
         }
 
-        let framed = Arc::new(crate::framing::StreamTransport::new(stream));
-        // The host without its port: `Connection` names the server, and the
-        // port is not part of a server's name.
-        let server = cfg.host.split(':').next().unwrap_or(&cfg.host).to_string();
-
-        let conn = smb2::client::connection::Connection::from_transport(
-            Box::new(Arc::clone(&framed)),
-            Box::new(framed),
-            server,
-        );
-
-        let client = SmbClient::from_connection(
-            ClientConfig {
-                addr: cfg.addr(),
-                timeout: cfg.timeout,
-                username: cfg.username.clone(),
-                password: cfg.password.clone(),
-                domain: cfg.domain.clone(),
-                // Not ours to arm: see the note above.
-                auto_reconnect: false,
-                compression: true,
-                dfs_enabled: true,
-                dfs_target_overrides: HashMap::new(),
-            },
-            conn,
-        )
-        .await
-        .map_err(|e| to_syno_error(&e))?;
+        let client = client_over(stream, cfg).await?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -466,9 +577,10 @@ impl SmbTransport {
                 trees: HashMap::new(),
             })),
             handles: Arc::new(HandleCache::new(MAX_CACHED_HANDLES)),
-            // Nothing here knows how to reopen that stream, so nothing here
-            // will pretend it might.
-            reconnect: Arc::new(ReconnectState::never()),
+            // Only a caller that can reopen the stream makes recovery
+            // possible; without one, nothing here will pretend it might.
+            reconnect: Arc::new(ReconnectState::for_supplied_stream(redial.is_some())),
+            redial,
         })
     }
 
@@ -498,11 +610,34 @@ impl SmbTransport {
         trees: &mut HashMap<String, Tree>,
         share: &str,
     ) -> Result<(), SynoFsError> {
-        let reconnected = self
-            .reconnect
-            .reconnect_if_needed(|| client.reconnect())
-            .await
-            .map_err(|e| self.mark_and_map(&e))?;
+        // Two ways back, depending on who owns the link. A transport that
+        // dialled its own address lets `SmbClient` redial it; one running on a
+        // supplied stream asks the caller for a new stream and rebuilds the
+        // session on it, because the address at the far end of a tunnel is
+        // reachable only from inside that tunnel.
+        let reconnected = match &self.redial {
+            Some(redialer) => {
+                let redialer = redialer.clone();
+                // Reborrowed, so the session slot is only lent to the redial
+                // for as long as the redial runs.
+                let slot = &mut *client;
+                self.reconnect
+                    .reconnect_if_needed(move || async move {
+                        let stream = (redialer.open)().await.map_err(redial_failed)?;
+                        *slot = client_over(stream, &redialer.cfg)
+                            .await
+                            .map_err(redial_failed)?;
+                        Ok(())
+                    })
+                    .await
+            }
+            None => {
+                self.reconnect
+                    .reconnect_if_needed(|| client.reconnect())
+                    .await
+            }
+        }
+        .map_err(|e| self.mark_and_map(&e))?;
         if reconnected {
             trees.clear(); // the cached trees belonged to the dead session
                            // and so did every open file handle on it. Dropping rather than
@@ -999,7 +1134,7 @@ mod tests {
         // run: `reconnect_if_needed` re-sets it on failure, so one transient
         // timeout on a perfectly live tunnel would fail every operation from
         // then on. There is nothing to reconnect, so there is nothing to owe.
-        let state = ReconnectState::never();
+        let state = ReconnectState::for_supplied_stream(false);
         state.flag_if_lost(smb2::ErrorKind::ConnectionLost);
 
         let outcome = state
@@ -1007,6 +1142,30 @@ mod tests {
             .await;
 
         assert!(matches!(outcome, Ok(false)), "no attempt, and no error");
+    }
+
+    /// A mount that reaches the NAS through a tunnel runs on a stream this
+    /// crate did not open, and every such transport used to be built unable to
+    /// reconnect. The moment that stream ended, every later operation failed
+    /// `Disconnected` against a session nothing would rebuild: the
+    /// transport-selection breaker re-probed every 30 s, the probe hit the
+    /// same dead session, and the mount served the rest of its life off the
+    /// HTTP fallback. A caller that leaves a way to reopen the stream must get
+    /// a transport that uses it.
+    #[tokio::test]
+    async fn a_supplied_stream_that_can_be_reopened_comes_back() {
+        let state = ReconnectState::for_supplied_stream(true);
+        state.flag_if_lost(smb2::ErrorKind::ConnectionLost);
+
+        let ran = state
+            .reconnect_if_needed(|| async { Ok(()) })
+            .await
+            .expect("the redial is allowed to run");
+
+        assert!(
+            ran,
+            "the caller left a way to reopen the stream, so a dead link is reopened"
+        );
     }
 
     #[tokio::test]
